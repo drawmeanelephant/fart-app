@@ -12,6 +12,7 @@ const vorbis = @import("vorbis.zig");
 const logmod = @import("log.zig");
 const clock = @import("clock.zig");
 const audio = @import("audio.zig");
+const kujamba_out = @import("../ninjam_out.zig");
 
 const Fixed = bufmod.Fixed;
 const Buf = bufmod.Buf;
@@ -19,6 +20,17 @@ const Buf = bufmod.Buf;
 pub const Source = union(enum) {
     tone: struct { freq: f32, amp: f32 },
     silence,
+    /// Flatlophone instrument source: a pre-rendered phrase buffer read
+    /// sequentially across the interval (kujamba adaptation).
+    kujamba: *kujamba_out.Fill,
+};
+
+/// Per-interval broadcast plan for instrument sources (kujamba rest bars).
+/// Consulted at every interval start; returning false makes the interval a
+/// silence-marker bar — no audio is ever uploaded for it.
+pub const IntervalPlan = struct {
+    ctx: *anyopaque,
+    broadcastFor: *const fn (ctx: *anyopaque, interval_idx: u64) bool,
 };
 
 pub const Options = struct {
@@ -36,6 +48,17 @@ pub const Options = struct {
     chat_delay_ms: i64 = 1_500,
     /// libvorbis VBR quality (reference client uses 0.0 for 64 kbps mono)
     quality: f32 = 0.0,
+
+    // ---- instrument additions (kujamba adaptation) ----
+    /// deterministic id seed: guid + vorbis serial derive from (seed, interval)
+    id_seed: ?u64 = null,
+    /// per-interval broadcast plan; false = silence-marker bar (rest bar)
+    plan: ?IntervalPlan = null,
+    /// when set, each interval's concatenated 0x84 payload is dumped to
+    /// <dir>/interval_NNNN.ogg (byte-identical across runs for a fixed seed)
+    payload_dump_dir: ?[]const u8 = null,
+    /// stop after this many completed intervals (demo determinism aid)
+    stop_after_intervals: ?u64 = null,
 
     // ---- Phase B: live audio ----
     /// capture the local device instead of generating --source, and play the
@@ -65,6 +88,12 @@ pub const Stats = struct {
     upload_bytes: u64 = 0,
     /// local channels that actually streamed audio (max across intervals)
     upload_channels: u64 = 0,
+    /// intervals that broadcast real audio (rest bars excluded)
+    intervals_broadcast: u64 = 0,
+    /// silence markers sent (rest bars / non-broadcast intervals)
+    silence_markers: u64 = 0,
+    /// interval payload dumps written (payload_dump_dir)
+    payload_dumps: u64 = 0,
 
     intervals_downloaded: u64 = 0,
     download_bytes: u64 = 0,
@@ -169,6 +198,8 @@ const LocalChannel = struct {
     guid: [16]u8 = [_]u8{0} ** 16,
     begun: bool = false, // 0x83 sent
     pending: Buf,
+    /// per-interval concatenated 0x84 payload (payload_dump_dir evidence)
+    dump: Buf,
     produced: u64 = 0,
     interval_idx: u64 = 0,
 
@@ -214,6 +245,10 @@ pub fn encodeBlockFor(
         },
         .silence => {
             @memset(block, 0);
+        },
+        .kujamba => |fill| {
+            // offset = samples already produced in this interval
+            fill.copyInto(lc.produced, block);
         },
     }
 }
@@ -269,7 +304,7 @@ pub const Session = struct {
         for (&s.outputs) |*o| o.* = .{ .writer = wavmod.WavWriter.init(alloc, io, 0, 1) };
         s.locals = try alloc.alloc(LocalChannel, opts.channel_names.len);
         for (s.locals, 0..) |*lc, i| {
-            lc.* = .{ .pending = Buf.init(alloc) };
+            lc.* = .{ .pending = Buf.init(alloc), .dump = Buf.init(alloc) };
             lc.setName(opts.channel_names[i]);
         }
         return s;
@@ -281,6 +316,7 @@ pub const Session = struct {
         for (self.locals) |*lc| {
             if (lc.enc) |e| e.destroy();
             lc.pending.deinit();
+            lc.dump.deinit();
         }
         self.alloc.free(self.locals);
         for (&self.downloads) |*d| d.buf.deinit();
@@ -517,6 +553,10 @@ pub const Session = struct {
     // ---- upload path (§6.5) ---------------------------------------------------
 
     fn startIntervalEncoders(self: *Session) !void {
+        if (self.opts.plan) |pl| {
+            const bcast = pl.broadcastFor(pl.ctx, self.interval_idx);
+            for (self.locals) |*lc| lc.broadcast = bcast;
+        }
         for (self.locals) |*lc| {
             if (lc.enc) |e| {
                 e.destroy();
@@ -525,9 +565,16 @@ pub const Session = struct {
             lc.pending.clear();
             lc.begun = false;
             lc.produced = 0;
-            self.io.random(&lc.guid);
             var serial: u32 = 0;
-            self.io.random(std.mem.asBytes(&serial));
+            if (self.opts.id_seed) |seed| {
+                // deterministic ids: byte-identical payloads across runs
+                const ci = self.channelIndex(lc);
+                kujamba_out.deriveGuid(seed, self.interval_idx, ci, &lc.guid);
+                serial = kujamba_out.deriveSerial(seed, self.interval_idx, ci);
+            } else {
+                self.io.random(&lc.guid);
+                self.io.random(std.mem.asBytes(&serial));
+            }
             if (lc.broadcast) {
                 lc.enc = vorbis.Encoder.create(self.alloc, @intCast(self.opts.srate), self.opts.quality, serial) catch |e| {
                     return self.failSession("encoder init failed: {s}", .{@errorName(e)});
@@ -629,6 +676,9 @@ pub const Session = struct {
         while (remaining.len > 0) {
             const n = @min(remaining.len, cap);
             const is_last = (n == remaining.len);
+            if (self.opts.payload_dump_dir != null) {
+                try lc.dump.add(remaining[0..n]);
+            }
             var f = Fixed{};
             try proto.buildUploadIntervalWrite(.{
                 .guid = lc.guid,
@@ -644,6 +694,29 @@ pub const Session = struct {
             remaining = remaining[n..];
         }
         lc.pending.clear();
+    }
+
+    /// Write the interval's concatenated 0x84 payload bytes to
+    /// `<dump_dir>/interval_NNNN.ogg` (determinism evidence for the demo).
+    fn writePayloadDump(self: *Session, lc: *LocalChannel, dump_dir: []const u8) !void {
+        if (lc.dump.len == 0) return;
+        defer lc.dump.clear();
+        var name_buf: [512]u8 = undefined;
+        const path = std.fmt.bufPrint(&name_buf, "{s}/interval_{d:0>4}.ogg", .{ dump_dir, self.interval_idx }) catch return;
+        if (std.Io.Dir.cwd().createFile(self.io, path, .{})) |f| {
+            var wrote_ok = true;
+            f.writeStreamingAll(self.io, lc.dump.items()) catch |e| {
+                wrote_ok = false;
+                self.log.line("payload dump write failed ({s}): {s}", .{ path, @errorName(e) });
+            };
+            f.close(self.io);
+            if (wrote_ok) {
+                self.stats.payload_dumps += 1;
+                self.log.line("payload dump {s} bytes={d}", .{ path, lc.dump.len });
+            }
+        } else |e| {
+            self.log.line("payload dump open failed ({s}): {s}", .{ path, @errorName(e) });
+        }
     }
 
     fn finalizeInterval(self: *Session) !void {
@@ -668,12 +741,16 @@ pub const Session = struct {
                             .chidx = @intCast(self.channelIndex(lc)),
                         }, &f);
                         try self.send(proto.MSG_UPLOAD_INTERVAL_BEGIN, f.slice());
+                        self.stats.silence_markers += 1;
                         self.log.line("C>S 0x83 SILENCE_MARKER chidx={d}", .{self.channelIndex(lc)});
                     } else {
                         try self.sendUploadBegin(lc);
                     }
                 }
                 try self.sendUploadChunk(lc, true);
+                if (self.opts.payload_dump_dir) |dump_dir| {
+                    try self.writePayloadDump(lc, dump_dir);
+                }
             } else {
                 // channel not broadcasting: periodic silence marker (§6.5.4)
                 var f = Fixed{};
@@ -684,6 +761,7 @@ pub const Session = struct {
                     .chidx = @intCast(self.channelIndex(lc)),
                 }, &f);
                 try self.send(proto.MSG_UPLOAD_INTERVAL_BEGIN, f.slice());
+                self.stats.silence_markers += 1;
                 self.log.line("C>S 0x83 SILENCE_MARKER chidx={d}", .{self.channelIndex(lc)});
             }
         }
@@ -693,6 +771,7 @@ pub const Session = struct {
             if (lc.broadcast) streaming += 1;
         }
         self.stats.upload_channels = @max(self.stats.upload_channels, streaming);
+        self.stats.intervals_broadcast += streaming;
         self.log.line("interval {d} complete ({d} samples, {d}ms)", .{
             self.interval_idx, self.interval_len_samples, self.interval_len_samples * 1000 / self.opts.srate,
         });
@@ -700,6 +779,13 @@ pub const Session = struct {
         // re-anchor on the exact grid to avoid drift
         const interval_ns: i128 = @divTrunc(@as(i128, @intCast(self.interval_len_samples)) * 1_000_000_000, @as(i128, self.opts.srate));
         self.interval_start_ns += interval_ns;
+        if (self.opts.stop_after_intervals) |n_stop| {
+            if (self.interval_idx >= n_stop) {
+                self.stats.ok = true;
+                self.state = .done;
+                return;
+            }
+        }
         self.startIntervalEncoders() catch |e| return e;
     }
 
@@ -943,6 +1029,9 @@ pub const Session = struct {
 
     pub fn run(self: *Session) !Stats {
         std.Io.Dir.cwd().createDirPath(self.io, self.opts.out_dir) catch {};
+        if (self.opts.payload_dump_dir) |dump_dir| {
+            std.Io.Dir.cwd().createDirPath(self.io, dump_dir) catch {};
+        }
 
         self.openLive();
 
@@ -1018,9 +1107,9 @@ pub const Session = struct {
 };
 
 test "multi-channel live capture shares one block per step (channels stay aligned)" {
-    var a = LocalChannel{ .pending = Buf.init(std.testing.allocator) };
+    var a = LocalChannel{ .pending = Buf.init(std.testing.allocator), .dump = Buf.init(std.testing.allocator) };
     defer a.pending.deinit();
-    var b = LocalChannel{ .pending = Buf.init(std.testing.allocator) };
+    var b = LocalChannel{ .pending = Buf.init(std.testing.allocator), .dump = Buf.init(std.testing.allocator) };
     defer b.pending.deinit();
 
     var shared: [64]f32 = undefined;
@@ -1037,9 +1126,9 @@ test "multi-channel live capture shares one block per step (channels stay aligne
 }
 
 test "synthetic sources keep an independent phase per channel" {
-    var a = LocalChannel{ .pending = Buf.init(std.testing.allocator) };
+    var a = LocalChannel{ .pending = Buf.init(std.testing.allocator), .dump = Buf.init(std.testing.allocator) };
     defer a.pending.deinit();
-    var b = LocalChannel{ .pending = Buf.init(std.testing.allocator) };
+    var b = LocalChannel{ .pending = Buf.init(std.testing.allocator), .dump = Buf.init(std.testing.allocator) };
     defer b.pending.deinit();
     b.phase = 1.0; // start somewhere else in the cycle
 
