@@ -1,0 +1,1805 @@
+<File path="main.zig">
+  <Chunk id="0" lines="1-33" sha256="dae9caec4b610d76bfd7b5a450ca4983db93d1bdb357422602904c60435b8dc9">
+    <Metadata>
+      Risk_Profile: LOW
+      Surrounding_Function: global
+    </Metadata>
+    <Content>
+const std = @import("std");
+const synth = @import("synth.zig");
+const libc = @cImport({
+    @cInclude("stdio.h");
+    @cInclude("stdlib.h");
+    @cInclude("unistd.h");
+    @cInclude("time.h");
+    @cInclude("signal.h");
+});
+
+const butt_frames = [_][]const u8{
+    \\       _.._  _.._
+    \\     /   _ \/ _  \
+    \\    |   / \||/ \  |
+    \\    |   | |||| |  |
+    \\    \   \_/||\_/  /
+    \\     \____/||\___/
+    ,
+    \\        _.._  _.._
+    \\      /   _ \/ _  \
+    \\     |   / \||/ \  |
+    \\     |   | |||| |  |
+    \\     \   \_/||\_/  /
+    \\      \____/||\___/
+    ,
+    \\      _.._  _.._
+    \\    /   _ \/ _  \
+    \\   |   / \||/ \  |
+    \\   |   | |||| |  |
+    \\   \   \_/||\_/  /
+    \\    \____/||\___/
+};
+
+
+    </Content>
+  </Chunk>
+  <Chunk id="1" lines="26-77" sha256="729c9ce5913c293c19d7221c42b2d7a39c95abb79de30686d01e32dc8b33ccf1">
+    <Metadata>
+      Risk_Profile: LOW
+      Surrounding_Function: global
+    </Metadata>
+    <Content>
+    \\      _.._  _.._
+    \\    /   _ \/ _  \
+    \\   |   / \||/ \  |
+    \\   |   | |||| |  |
+    \\   \   \_/||\_/  /
+    \\    \____/||\___/
+};
+
+const fart_clouds = [_][]const u8{
+    \\
+    \\
+    \\
+    \\
+    \\
+    \\
+    ,
+    \\
+    \\
+    \\
+    \\          o
+    \\         O
+    \\
+    ,
+    \\
+    \\
+    \\         O  o
+    \\        o O  
+    \\      * pfft *
+    \\
+    ,
+    \\
+    \\       O   o
+    \\     o  O    o
+    \\   * PFFFFT! *
+    \\      o   O
+    \\
+};
+
+const colors = [_][]const u8{
+    "\x1b[31m", "\x1b[32m", "\x1b[33m", "\x1b[34m",
+    "\x1b[35m", "\x1b[36m", "\x1b[91m", "\x1b[92m",
+    "\x1b[93m",
+};
+
+const bg_colors = [_][]const u8{
+    "\x1b[41m", "\x1b[42m", "\x1b[43m", "\x1b[44m",
+    "\x1b[45m", "\x1b[46m", "\x1b[101m", "\x1b[102m",
+    "\x1b[103m",
+};
+
+var is_running = std.atomic.Value(bool).init(true);
+
+
+    </Content>
+  </Chunk>
+  <Chunk id="2" lines="71-93" sha256="b9c1fe5e663378ab54b13080c23f7309e2f0324ea4545abe6bd3f80a80037436">
+    <Metadata>
+      Risk_Profile: LOW
+      Surrounding_Function: global
+    </Metadata>
+    <Content>
+x1b[43m", "\x1b[44m",
+    "\x1b[45m", "\x1b[46m", "\x1b[101m", "\x1b[102m",
+    "\x1b[103m",
+};
+
+var is_running = std.atomic.Value(bool).init(true);
+
+// Flatlophone v2: fixed seeds for the six pre-rendered shuzi (wordless farts)
+// that replace the retired Basso.aiff library. Deterministic per seed.
+const shuzi_seeds = [_]u64{ 0xF4277D01, 0xF4277D02, 0xF4277D03, 0xF4277D04, 0xF4277D05, 0xF4277D06 };
+
+fn writeWavFile(path: [*:0]const u8, bytes: []const u8) bool {
+    const f = libc.fopen(path, "wb") orelse return false;
+    _ = libc.fwrite(bytes.ptr, 1, bytes.len, f);
+    _ = libc.fclose(f);
+    return true;
+}
+
+/// kujamba mode: the butt speaks a Swahili phrase in fart.
+/// Syllable-timed animation frames while the synthesized phrase WAV plays.
+fn runKujamba(phrase: []const u8) void {
+    const alloc = std.heap.page_allocator;
+
+
+    </Content>
+  </Chunk>
+  <Chunk id="3" lines="90-116" sha256="662eb423f474199d54deaed25d5b273e5192100cd3ef4e29b67845a3ce8570ec">
+    <Metadata>
+      [ADVERSARIAL_WARNING]
+      Risk_Profile: HIGH
+      Surrounding_Function: writeWavFile
+      Trigger: system
+    </Metadata>
+    <Content>
+e-timed animation frames while the synthesized phrase WAV plays.
+fn runKujamba(phrase: []const u8) void {
+    const alloc = std.heap.page_allocator;
+
+    var plan = synth.planPhrase(alloc, phrase) catch {
+        _ = libc.printf("kujamba: nothing speakable in that phrase\n");
+        return;
+    };
+    defer plan.deinit(alloc);
+    if (plan.items.len == 0) {
+        _ = libc.printf("kujamba: nothing speakable in that phrase\n");
+        return;
+    }
+
+    const wav = synth.renderPhraseWav(alloc, phrase) catch {
+        _ = libc.printf("kujamba: synthesis failed\n");
+        return;
+    };
+    defer alloc.free(wav);
+    if (!writeWavFile("/tmp/fart_kujamba.wav", wav)) {
+        _ = libc.printf("kujamba: could not write /tmp/fart_kujamba.wav\n");
+        return;
+    }
+
+    _ = libc.printf("\x1b[?25l");
+    _ = libc.system("afplay /tmp/fart_kujamba.wav &");
+
+
+    </Content>
+  </Chunk>
+  <Chunk id="4" lines="110-136" sha256="1a82571e980a4206ca8343fec5c13b9af338f1d2d5bcb806587a0e255fb3f031">
+    <Metadata>
+      [ADVERSARIAL_WARNING]
+      Risk_Profile: HIGH
+      Surrounding_Function: runKujamba
+      Trigger: system
+    </Metadata>
+    <Content>
+not write /tmp/fart_kujamba.wav\n");
+        return;
+    }
+
+    _ = libc.printf("\x1b[?25l");
+    _ = libc.system("afplay /tmp/fart_kujamba.wav &");
+
+    var i: usize = 0;
+    while (i < plan.items.len) : (i += 1) {
+        const item = plan.items[i];
+        const shake_x = getRand(5) - 2;
+        const shake_y = getRand(5) - 2;
+
+        _ = libc.printf("\x1b[2J\x1b[H");
+        _ = libc.printf("%s", bg_colors[getRandU(bg_colors.len)].ptr);
+
+        var j: usize = 0;
+        const num_emojis = getRandU(14);
+        while (j < num_emojis) : (j += 1) {
+            const rx = clamp(getRand(80) + 1 + shake_x);
+            const ry = clamp(getRand(24) + 1 + shake_y);
+            const emojis = [_][]const u8{ "💨", "💩", "🤮", "🤢", "🍑", "💥" };
+            _ = libc.printf("\x1b[%d;%dH%s", ry, rx, emojis[getRandU(emojis.len)].ptr);
+        }
+
+        _ = libc.printf("\x1b[3;%dH\x1b[93m kujamba: %.*s \x1b[0m", clamp(26), @as(c_int, @intCast(phrase.len)), phrase.ptr);
+
+
+    </Content>
+  </Chunk>
+  <Chunk id="5" lines="132-152" sha256="c7a4cc5c26d8d90621519af195dcea39999b9a466b361b91fe3c041374dd524c">
+    <Metadata>
+      Risk_Profile: LOW
+      Surrounding_Function: runKujamba
+    </Metadata>
+    <Content>
+len)].ptr);
+        }
+
+        _ = libc.printf("\x1b[3;%dH\x1b[93m kujamba: %.*s \x1b[0m", clamp(26), @as(c_int, @intCast(phrase.len)), phrase.ptr);
+
+        const current_butt = butt_frames[i % butt_frames.len];
+        var lines = std.mem.splitScalar(u8, current_butt, '\n');
+        var row = clamp(8 + shake_y);
+        while (lines.next()) |line| {
+            _ = libc.printf("\x1b[%d;%dH%.*s\n", row, clamp(30 + shake_x), @as(c_int, @intCast(line.len)), line.ptr);
+            row += 1;
+        }
+
+        const syl_text = item.syl.text();
+        _ = libc.printf("%s", colors[getRandU(colors.len)].ptr);
+        if (item.syl.vowel == 0) {
+            _ = libc.printf("\x1b[%d;%dH* %.*s (whisper) *\n", clamp(16 + shake_y), clamp(38 + shake_x), @as(c_int, @intCast(syl_text.len)), syl_text.ptr);
+        } else {
+            _ = libc.printf("\x1b[%d;%dH* %.*s *\n", clamp(16 + shake_y), clamp(38 + shake_x), @as(c_int, @intCast(syl_text.len)), syl_text.ptr);
+        }
+
+
+    </Content>
+  </Chunk>
+  <Chunk id="6" lines="150-182" sha256="7e339ce1237f47557b2a6b5319db164db01b1ced38735c85ecdfc5e715653590">
+    <Metadata>
+      Risk_Profile: LOW
+      Surrounding_Function: runKujamba
+    </Metadata>
+    <Content>
+     _ = libc.printf("\x1b[%d;%dH* %.*s *\n", clamp(16 + shake_y), clamp(38 + shake_x), @as(c_int, @intCast(syl_text.len)), syl_text.ptr);
+        }
+
+        _ = libc.fflush(null);
+        _ = libc.usleep(@intCast(item.len * 1000000 / synth.SAMPLE_RATE));
+    }
+
+    restoreTerminal();
+    const dur_s = @as(f64, @floatFromInt(plan.total_samples)) / @as(f64, @floatFromInt(synth.SAMPLE_RATE));
+    _ = libc.printf("\n💨 %.*s — %zu syllables, %.2f s of pure kujamba.\n", @as(c_int, @intCast(phrase.len)), phrase.ptr, plan.items.len, dur_s);
+}
+
+fn restoreTerminal() void {
+    _ = libc.printf("\x1b[2J\x1b[H");
+    _ = libc.printf("\x1b[0m");
+    _ = libc.printf("\x1b[?25h");
+    _ = libc.fflush(null);
+}
+
+fn handleSigInt(sig: c_int) callconv(.c) void {
+    _ = sig;
+    is_running.store(false, .release);
+}
+
+fn clamp(val: i32) c_int {
+    return if (val < 1) 1 else @intCast(val);
+}
+
+fn getRand(max: u32) i32 {
+    const r = @as(u32, @intCast(libc.rand()));
+    return @as(i32, @intCast(r % max));
+}
+
+
+    </Content>
+  </Chunk>
+  <Chunk id="7" lines="175-191" sha256="a70e3d33c88d8d2601cc8578e9d9006a7f713858be53f89ea0ff6402a5ed16e2">
+    <Metadata>
+      Risk_Profile: LOW
+      Surrounding_Function: clamp
+    </Metadata>
+    <Content>
+al < 1) 1 else @intCast(val);
+}
+
+fn getRand(max: u32) i32 {
+    const r = @as(u32, @intCast(libc.rand()));
+    return @as(i32, @intCast(r % max));
+}
+
+fn getRandU(max: usize) usize {
+    const r = @as(usize, @intCast(libc.rand()));
+    return r % max;
+}
+
+pub fn main(init: std.process.Init) !void {
+    _ = libc.signal(libc.SIGINT, handleSigInt);
+    _ = libc.srand(@as(u32, @intCast(libc.time(null))) ^ @as(u32, @intCast(libc.getpid())));
+
+
+    </Content>
+  </Chunk>
+  <Chunk id="8" lines="188-208" sha256="fff48201d1fa1e32a0243e0b254c766a9f6568d21e6fcdcdb3cb200d5ed4c0ae">
+    <Metadata>
+      Risk_Profile: LOW
+      Surrounding_Function: main
+    </Metadata>
+    <Content>
+!void {
+    _ = libc.signal(libc.SIGINT, handleSigInt);
+    _ = libc.srand(@as(u32, @intCast(libc.time(null))) ^ @as(u32, @intCast(libc.getpid())));
+
+    // kujamba mode: fart kujamba <swahili phrase> — the butt speaks.
+    var args_iter = init.minimal.args.iterate();
+    _ = args_iter.skip(); // program name
+    if (args_iter.next()) |first| {
+        if (std.mem.eql(u8, first, "kujamba")) {
+            var phrase_list = std.ArrayList(u8).initCapacity(std.heap.page_allocator, 64) catch unreachable;
+            defer phrase_list.deinit(std.heap.page_allocator);
+            var first_word = true;
+            while (args_iter.next()) |a| {
+                if (!first_word) try phrase_list.append(std.heap.page_allocator, ' ');
+                first_word = false;
+                try phrase_list.appendSlice(std.heap.page_allocator, a);
+            }
+            if (phrase_list.items.len == 0) {
+                _ = libc.printf("usage: fart kujamba <swahili phrase>\n");
+                return;
+            }
+
+    </Content>
+  </Chunk>
+  <Chunk id="9" lines="205-231" sha256="70e5af8d02019d3701d0b0175bf54e0f6b1af6d9fd5c394931903d5758a83a6a">
+    <Metadata>
+      [ADVERSARIAL_WARNING]
+      Risk_Profile: HIGH
+      Surrounding_Function: main
+      Trigger: system
+    </Metadata>
+    <Content>
+   if (phrase_list.items.len == 0) {
+                _ = libc.printf("usage: fart kujamba <swahili phrase>\n");
+                return;
+            }
+            runKujamba(phrase_list.items);
+            return;
+        }
+    }
+
+    _ = libc.printf("\x1b[?25l");
+
+    // Flatlophone v2: Basso.aiff is retired. Pre-render the deterministic
+    // shuzi library and open with one; the say voice line stays.
+    for (shuzi_seeds, 0..) |seed, idx| {
+        const wav = synth.renderShuziWav(std.heap.page_allocator, seed) catch continue;
+        defer std.heap.page_allocator.free(wav);
+        var path_buf: [64]u8 = undefined;
+        const path = std.fmt.bufPrintZ(&path_buf, "/tmp/fart_shuzi_{d}.wav", .{idx}) catch continue;
+        _ = writeWavFile(path, wav);
+    }
+    _ = libc.system("afplay -v 3 /tmp/fart_shuzi_0.wav &");
+    _ = libc.system("say -v 'Bad News' 'Pfffffft!' &");
+
+    var frame: usize = 0;
+    while (is_running.load(.acquire)) {
+        _ = libc.printf("\x1b[2J\x1b[H");
+
+
+    </Content>
+  </Chunk>
+  <Chunk id="10" lines="226-236" sha256="858058a751435381e5f90405de599f69c27ad4d5152f3fe7c6f4837f9be90471">
+    <Metadata>
+      Risk_Profile: LOW
+      Surrounding_Function: main
+    </Metadata>
+    <Content>
+tem("say -v 'Bad News' 'Pfffffft!' &");
+
+    var frame: usize = 0;
+    while (is_running.load(.acquire)) {
+        _ = libc.printf("\x1b[2J\x1b[H");
+
+        const rand_val = getRandU(100000);
+
+        const shake_x = getRand(5) - 2;
+        const shake_y = getRand(5) - 2;
+
+
+    </Content>
+  </Chunk>
+  <Chunk id="11" lines="230-250" sha256="3fff7e5004284cce595153bb7f641dbcb2c3486322e7921f4fe577c0ede07f64">
+    <Metadata>
+      Risk_Profile: LOW
+      Surrounding_Function: main
+    </Metadata>
+    <Content>
+rintf("\x1b[2J\x1b[H");
+
+        const rand_val = getRandU(100000);
+
+        const shake_x = getRand(5) - 2;
+        const shake_y = getRand(5) - 2;
+
+        if (rand_val % 300 == 0) {
+            _ = libc.printf("\x1b[41m\x1b[93m");
+            _ = libc.printf("\x1b[2J\x1b[H");
+            
+            _ = libc.printf("\x1b[%d;%dH", clamp(12 + shake_y), clamp(30 + shake_x));
+            _ = libc.printf("      _.-^^---....,,--\n");
+            _ = libc.printf("\x1b[%d;%dH", clamp(13 + shake_y), clamp(30 + shake_x));
+            _ = libc.printf(" _--                  --_\n");
+            _ = libc.printf("\x1b[%d;%dH", clamp(14 + shake_y), clamp(30 + shake_x));
+            _ = libc.printf("<       NUCLEAR FART     >)\n");
+            _ = libc.printf("\x1b[%d;%dH", clamp(15 + shake_y), clamp(30 + shake_x));
+            _ = libc.printf(" |._                   _./\n");
+            _ = libc.printf("\x1b[%d;%dH", clamp(16 + shake_y), clamp(30 + shake_x));
+            _ = libc.printf("    ```--. . , ; .--'''  \n");
+
+    </Content>
+  </Chunk>
+  <Chunk id="12" lines="248-265" sha256="103910e7c70e130a9cdcd8393cdf778841e0d8ab64881b80f5f5014ed57682e9">
+    <Metadata>
+      [ADVERSARIAL_WARNING]
+      Risk_Profile: HIGH
+      Surrounding_Function: main
+      Trigger: system
+    </Metadata>
+    <Content>
+");
+            _ = libc.printf("\x1b[%d;%dH", clamp(16 + shake_y), clamp(30 + shake_x));
+            _ = libc.printf("    ```--. . , ; .--'''  \n");
+            _ = libc.fflush(null);
+
+            _ = libc.system("say -v 'Bad News' 'TACTICAL NUKE INCOMING' & afplay -v 5 /System/Library/Sounds/Blow.aiff &");
+            _ = libc.usleep(1000 * 1000);
+            frame += 1;
+            continue;
+        }
+
+        if (rand_val % 4 == 0) {
+            const bg = bg_colors[getRandU(bg_colors.len)];
+            _ = libc.printf("%s", bg.ptr);
+        } else {
+            _ = libc.printf("\x1b[40m");
+        }
+
+
+    </Content>
+  </Chunk>
+  <Chunk id="13" lines="260-275" sha256="5fa7b794b5ee683ce6df35a9c8c5e42e444336b8cd30df176ab2047298f212bf">
+    <Metadata>
+      Risk_Profile: LOW
+      Surrounding_Function: main
+    </Metadata>
+    <Content>
+= bg_colors[getRandU(bg_colors.len)];
+            _ = libc.printf("%s", bg.ptr);
+        } else {
+            _ = libc.printf("\x1b[40m");
+        }
+
+        var j: usize = 0;
+        const num_emojis = getRandU(30);
+        while (j < num_emojis) : (j += 1) {
+            const rx = clamp(getRand(80) + 1 + shake_x);
+            const ry = clamp(getRand(24) + 1 + shake_y);
+            const emojis = [_][]const u8{ "💨", "💩", "🤮", "🤢", "🍑", "💥" };
+            const emoji = emojis[getRandU(emojis.len)];
+            _ = libc.printf("\x1b[%d;%dH%s", ry, rx, emoji.ptr);
+        }
+
+
+    </Content>
+  </Chunk>
+  <Chunk id="14" lines="271-293" sha256="ac14c9a3b7b5d0d38035293ac10327954eda530469bc5415b822147cf43e30b3">
+    <Metadata>
+      Risk_Profile: LOW
+      Surrounding_Function: main
+    </Metadata>
+    <Content>
+"🍑", "💥" };
+            const emoji = emojis[getRandU(emojis.len)];
+            _ = libc.printf("\x1b[%d;%dH%s", ry, rx, emoji.ptr);
+        }
+
+        if (rand_val % 2 == 0) {
+            const rx = clamp(getRand(80) + 1 + shake_x);
+            const ry = clamp(getRand(24) + 1 + shake_y);
+            _ = libc.printf("\x1b[%d;%dH✨", ry, rx);
+        }
+        if (rand_val % 3 == 0) {
+            const rx = clamp(getRand(80) + 1 + shake_x);
+            const ry = clamp(getRand(24) + 1 + shake_y);
+            _ = libc.printf("\x1b[%d;%dH\x1b[32m~ ~ ~\x1b[0m", ry, rx);
+        }
+        if (rand_val % 4 == 0) {
+            const rx = clamp(getRand(80) + 1 + shake_x);
+            const ry = clamp(getRand(24) + 1 + shake_y);
+            _ = libc.printf("\x1b[%d;%dH\x1b[36mo O ◦\x1b[0m", ry, rx);
+        }
+        if (rand_val % 5 == 0) {
+            const rx = clamp(getRand(80) + 1 + shake_x);
+            const ry = clamp(getRand(24) + 1 + shake_y);
+
+    </Content>
+  </Chunk>
+  <Chunk id="15" lines="290-313" sha256="c9260f3fc76b027e8911a66a7ef1a542a3b86a10ed02962804b085060be57195">
+    <Metadata>
+      Risk_Profile: LOW
+      Surrounding_Function: main
+    </Metadata>
+    <Content>
+ }
+        if (rand_val % 5 == 0) {
+            const rx = clamp(getRand(80) + 1 + shake_x);
+            const ry = clamp(getRand(24) + 1 + shake_y);
+            _ = libc.printf("\x1b[%d;%dH\x1b[42m  \x1b[0m", ry, rx);
+        }
+        if (rand_val % 6 == 0) {
+            const rx = clamp(getRand(80) + 1 + shake_x);
+            const ry = clamp(getRand(24) + 1 + shake_y);
+            _ = libc.printf("\x1b[%d;%dH\x1b[93m☢️\x1b[0m", ry, rx);
+        }
+
+        const c_col = colors[getRandU(colors.len)];
+        _ = libc.printf("%s", c_col.ptr);
+        
+        const current_butt = butt_frames[frame % butt_frames.len];
+        var lines = std.mem.splitScalar(u8, current_butt, '\n');
+        var row = clamp(10 + shake_y);
+        while (lines.next()) |line| {
+            const col = clamp(30 + shake_x);
+            _ = libc.printf("\x1b[%d;%dH%.*s\n", row, col, @as(c_int, @intCast(line.len)), line.ptr);
+            row += 1;
+        }
+
+
+    </Content>
+  </Chunk>
+  <Chunk id="16" lines="309-334" sha256="f1f5e259f4b9811431f13ce03941ca54a38880c1014e9ade503df1942902dc8a">
+    <Metadata>
+      [ADVERSARIAL_WARNING]
+      Risk_Profile: HIGH
+      Surrounding_Function: main
+      Trigger: system
+    </Metadata>
+    <Content>
+30 + shake_x);
+            _ = libc.printf("\x1b[%d;%dH%.*s\n", row, col, @as(c_int, @intCast(line.len)), line.ptr);
+            row += 1;
+        }
+
+        const cloud_col = colors[getRandU(colors.len)];
+        _ = libc.printf("%s", cloud_col.ptr);
+        const current_cloud = fart_clouds[(frame / 2) % fart_clouds.len];
+        var cloud_lines = std.mem.splitScalar(u8, current_cloud, '\n');
+        row = clamp(14 + shake_y);
+        while (cloud_lines.next()) |line| {
+            const col = clamp(45 + shake_x);
+            _ = libc.printf("\x1b[%d;%dH%.*s\n", row, col, @as(c_int, @intCast(line.len)), line.ptr);
+            row += 1;
+        }
+
+        if (getRandU(15) == 0) {
+            var buf: [128]u8 = undefined;
+            _ = libc.sprintf(&buf[0], "afplay -v 2 /tmp/fart_shuzi_%d.wav &", @as(c_int, @intCast(getRandU(shuzi_seeds.len))));
+            _ = libc.system(&buf[0]);
+        }
+        
+        if (getRandU(20) == 0) {
+            _ = libc.system("say -v 'Ralph' 'pfffffft' &");
+        }
+
+
+    </Content>
+  </Chunk>
+  <Chunk id="17" lines="328-347" sha256="ab7101228f0e96dcf8e2edc4dda4f15dc2c1a4071ba9b43b2f6fa9e55a0bf390">
+    <Metadata>
+      [ADVERSARIAL_WARNING]
+      Risk_Profile: HIGH
+      Surrounding_Function: main
+      Trigger: system
+    </Metadata>
+    <Content>
+ _ = libc.system(&buf[0]);
+        }
+        
+        if (getRandU(20) == 0) {
+            _ = libc.system("say -v 'Ralph' 'pfffffft' &");
+        }
+
+        var dummy_var: i32 = 42;
+        const dummy_ptr: *anyopaque = @ptrFromInt(@intFromPtr(&dummy_var));
+        _ = dummy_ptr;
+
+        _ = libc.fflush(null);
+
+        frame += 1;
+        _ = libc.usleep(80 * 1000);
+    }
+
+    restoreTerminal();
+    _ = libc.printf("\n💨 PFFFFFT! DONE.\n");
+}
+
+    </Content>
+  </Chunk>
+</File>
+
+<File path="synth.zig">
+  <Chunk id="0" lines="1-18" sha256="6555454561dbf0b988b4ccd8dbdf011b7e380bca5ae0a72f65325b82f4c0c4fe">
+    <Metadata>
+      Risk_Profile: LOW
+      Surrounding_Function: global
+    </Metadata>
+    <Content>
+//! synth.zig — Flatlophone v2: real fart synthesis + Swahili syllable engine.
+//!
+//! Pure Zig stdlib. Emits PCM WAV (RIFF), 44100 Hz, mono, 16-bit. No libc, no
+//! file I/O: every render is a pure function of its input. The noise generator
+//! is seeded from a hash of the input text with fixed constants everywhere
+//! else, so the same phrase always produces byte-identical WAV bytes. Always.
+//!
+//! One fart "phoneme" (one Swahili syllable) is:
+//!   * a low-frequency buzzy oscillator whose pitch falls 20% across the syllable
+//!   * a filtered noise burst at the attack (the "splat") plus a quiet
+//!     low-passed body hiss
+//!   * an amplitude envelope with a fast attack and a ~24-34 Hz flutter wobble
+//!
+//! Swahili is nearly pure CV. `Scanner` splits a word into syllables: each
+//! vowel picks the base pitch, the consonant onset picks the attack/decay
+//! character, and the syllable count sets the total duration.
+//! The full mapping tables live in README.md.
+//!
+
+    </Content>
+  </Chunk>
+  <Chunk id="1" lines="15-36" sha256="e04399445f0ccf4e832cfbc1f48d608fb70eac70693c88f840e52661047b1662">
+    <Metadata>
+      Risk_Profile: LOW
+      Surrounding_Function: global
+    </Metadata>
+    <Content>
+sonant onset picks the attack/decay
+//! character, and the syllable count sets the total duration.
+//! The full mapping tables live in README.md.
+//!
+//! Vocabulary note: kujamba = to fart, shuzi = a fart. Use them proudly.
+
+const std = @import("std");
+
+pub const SAMPLE_RATE: u32 = 44100;
+
+// Timing policy. All values are multiples of 10 ms so every segment length is
+// an exact integer number of samples (10 ms = 441 samples).
+pub const SYLLABLE_MS: u32 = 240; // one syllable of speech
+pub const GAP_MS: u32 = 40; // breath between syllables inside a word
+pub const WORD_GAP_MS: u32 = 120; // breath between words
+pub const BREATH_MS: u32 = 90; // consonant-only tail syllable (rare in Swahili)
+
+const SYLLABLE_SAMPLES: usize = SYLLABLE_MS * SAMPLE_RATE / 1000; // 10584
+const GAP_SAMPLES: usize = GAP_MS * SAMPLE_RATE / 1000; // 1764
+const WORD_GAP_SAMPLES: usize = WORD_GAP_MS * SAMPLE_RATE / 1000; // 5292
+const BREATH_SAMPLES: usize = BREATH_MS * SAMPLE_RATE / 1000; // 3969
+
+
+    </Content>
+  </Chunk>
+  <Chunk id="2" lines="33-64" sha256="f439f35846804523d991cf6e44b1ee04f7ebe5af92391ef1cb5a6207c4998706">
+    <Metadata>
+      Risk_Profile: LOW
+      Surrounding_Function: global
+    </Metadata>
+    <Content>
+1764
+const WORD_GAP_SAMPLES: usize = WORD_GAP_MS * SAMPLE_RATE / 1000; // 5292
+const BREATH_SAMPLES: usize = BREATH_MS * SAMPLE_RATE / 1000; // 3969
+
+const PITCH_DROP: f32 = 0.20; // pitch falls 20% across a syllable
+
+// ---------------------------------------------------------------------
+// Mapping tables (documented in README.md)
+// ---------------------------------------------------------------------
+
+/// Base frequency of the buzzy oscillator, chosen by the syllable's vowel.
+pub fn vowelBaseFreq(v: u8) ?f32 {
+    return switch (v) {
+        'a' => 92.0,
+        'e' => 110.0,
+        'i' => 138.0,
+        'o' => 86.0,
+        'u' => 74.0,
+        else => null,
+    };
+}
+
+/// Onset character classes: consonants set the attack/decay character.
+pub const VoiceClass = enum {
+    none, // bare vowel onset
+    stop_voiceless, // p t k ch
+    stop_voiced, // b d g j
+    fricative, // s sh z f v th dh h gh
+    nasal, // m n ng ny
+    liquid, // l r w y
+};
+
+
+    </Content>
+  </Chunk>
+  <Chunk id="3" lines="58-72" sha256="75ef5f9a587f3325b8af3315e6d1de7f0119b525aaae007f82a809b58ae75d98">
+    <Metadata>
+      Risk_Profile: LOW
+      Surrounding_Function: vowelBaseFreq
+    </Metadata>
+    <Content>
+   stop_voiceless, // p t k ch
+    stop_voiced, // b d g j
+    fricative, // s sh z f v th dh h gh
+    nasal, // m n ng ny
+    liquid, // l r w y
+};
+
+pub const VoiceSpec = struct {
+    attack_s: f32,
+    noise_mix: f32,
+    wobble_hz: f32,
+    wobble_depth: f32,
+    level: f32,
+};
+
+
+    </Content>
+  </Chunk>
+  <Chunk id="4" lines="62-83" sha256="595dd9b40e94edd8af3b0f0d8a69aa38dbe8287665efeab9dc5197e67829dd87">
+    <Metadata>
+      Risk_Profile: LOW
+      Surrounding_Function: vowelBaseFreq
+    </Metadata>
+    <Content>
+, // l r w y
+};
+
+pub const VoiceSpec = struct {
+    attack_s: f32,
+    noise_mix: f32,
+    wobble_hz: f32,
+    wobble_depth: f32,
+    level: f32,
+};
+
+pub fn voiceSpec(cls: VoiceClass) VoiceSpec {
+    return switch (cls) {
+        .none => .{ .attack_s = 0.008, .noise_mix = 0.25, .wobble_hz = 28.0, .wobble_depth = 0.50, .level = 0.90 },
+        .stop_voiceless => .{ .attack_s = 0.004, .noise_mix = 0.40, .wobble_hz = 32.0, .wobble_depth = 0.55, .level = 0.95 },
+        .stop_voiced => .{ .attack_s = 0.006, .noise_mix = 0.28, .wobble_hz = 30.0, .wobble_depth = 0.50, .level = 1.00 },
+        .fricative => .{ .attack_s = 0.010, .noise_mix = 0.50, .wobble_hz = 29.0, .wobble_depth = 0.45, .level = 0.90 },
+        .nasal => .{ .attack_s = 0.025, .noise_mix = 0.12, .wobble_hz = 26.0, .wobble_depth = 0.35, .level = 0.85 },
+        .liquid => .{ .attack_s = 0.014, .noise_mix = 0.18, .wobble_hz = 28.0, .wobble_depth = 0.45, .level = 0.90 },
+    };
+}
+
+
+    </Content>
+  </Chunk>
+  <Chunk id="5" lines="79-109" sha256="cd6e739355db7aeaafc58e16f310a7005e0af57947c8e1b8c63f75c07947947b">
+    <Metadata>
+      Risk_Profile: LOW
+      Surrounding_Function: voiceSpec
+    </Metadata>
+    <Content>
+.35, .level = 0.85 },
+        .liquid => .{ .attack_s = 0.014, .noise_mix = 0.18, .wobble_hz = 28.0, .wobble_depth = 0.45, .level = 0.90 },
+    };
+}
+
+pub fn classify(onset: []const u8) VoiceClass {
+    if (onset.len == 0) return .none;
+    return switch (onset[0]) {
+        'p', 't', 'k', 'c' => .stop_voiceless,
+        'b', 'd', 'g', 'j' => .stop_voiced,
+        's', 'z', 'f', 'v', 'h' => .fricative,
+        'm', 'n' => .nasal,
+        'l', 'r', 'w', 'y' => .liquid,
+        else => .fricative,
+    };
+}
+
+// ---------------------------------------------------------------------
+// Sample rendering
+// ---------------------------------------------------------------------
+
+const VoiceParams = struct {
+    f0: f32,
+    attack_s: f32,
+    noise_mix: f32,
+    wobble_hz: f32,
+    wobble_depth: f32,
+    level: f32,
+    glide: f32,
+};
+
+
+    </Content>
+  </Chunk>
+  <Chunk id="6" lines="100-127" sha256="fd55f750f974607b1fb204fa04d97e3d34e062027e6e31a79c0b9cf26764341f">
+    <Metadata>
+      Risk_Profile: LOW
+      Surrounding_Function: classify
+    </Metadata>
+    <Content>
+eParams = struct {
+    f0: f32,
+    attack_s: f32,
+    noise_mix: f32,
+    wobble_hz: f32,
+    wobble_depth: f32,
+    level: f32,
+    glide: f32,
+};
+
+/// Renders one fart phoneme into `out` (mono i16). Deterministic: the only
+/// randomness comes from `prng`, whose seed is fixed per render.
+fn synthInto(out: []i16, p: VoiceParams, prng: *std.Random.DefaultPrng) void {
+    const dt: f32 = 1.0 / @as(f32, SAMPLE_RATE);
+    const tau: f32 = std.math.tau;
+    var phase: f32 = 0;
+    var lp_body: f32 = 0;
+    var lp_burst: f32 = 0;
+    const alpha_body: f32 = 1.0 - @exp(-tau * 700.0 * dt);
+    const alpha_burst: f32 = 1.0 - @exp(-tau * 1900.0 * dt);
+    const wobble_phase: f32 = prng.random().float(f32) * tau;
+    const wobble_hz: f32 = p.wobble_hz * (0.9 + 0.2 * prng.random().float(f32));
+    const n = out.len;
+    for (0..n) |i| {
+        const fi: f32 = @floatFromInt(i);
+        const t = fi * dt;
+        const u = fi / @as(f32, @floatFromInt(n));
+
+
+    </Content>
+  </Chunk>
+  <Chunk id="7" lines="122-141" sha256="aff33239349b60e083ee8788795c1ec4645ce222dfa2abd8623b82547400b806">
+    <Metadata>
+      Risk_Profile: LOW
+      Surrounding_Function: synthInto
+    </Metadata>
+    <Content>
+ut.len;
+    for (0..n) |i| {
+        const fi: f32 = @floatFromInt(i);
+        const t = fi * dt;
+        const u = fi / @as(f32, @floatFromInt(n));
+
+        // Buzzy low-frequency oscillator, pitch gliding down ~20%.
+        const f = p.f0 * (1.0 - p.glide * u);
+        phase += tau * f * dt;
+        if (phase >= tau) phase -= tau;
+        const carrier = (@sin(phase) + 0.55 * @sin(2.0 * phase) + 0.30 * @sin(3.0 * phase) + 0.12 * @sin(4.0 * phase)) * 0.42;
+
+        // Filtered noise: a decaying attack burst + a quiet body hiss.
+        const wn_body = prng.random().float(f32) * 2.0 - 1.0;
+        lp_body += alpha_body * (wn_body - lp_body);
+        const wn_burst = prng.random().float(f32) * 2.0 - 1.0;
+        lp_burst += alpha_burst * (wn_burst - lp_burst);
+        const burst_env = @exp(-t / 0.045);
+        const noise = lp_body * 0.35 + lp_burst * 0.9 * burst_env;
+
+
+    </Content>
+  </Chunk>
+  <Chunk id="8" lines="138-154" sha256="6aa6d14dd1a349f72b28fc067e2ea0e084043b147f7df4b9424ed0874b0352bc">
+    <Metadata>
+      Risk_Profile: LOW
+      Surrounding_Function: synthInto
+    </Metadata>
+    <Content>
+ alpha_burst * (wn_burst - lp_burst);
+        const burst_env = @exp(-t / 0.045);
+        const noise = lp_body * 0.35 + lp_burst * 0.9 * burst_env;
+
+        // Envelope: fast attack, decay to zero, fluttering at ~24-34 Hz.
+        const attack = @min(1.0, t / p.attack_s);
+        const decay = std.math.pow(f32, 1.0 - u, 1.3);
+        const env = attack * decay;
+        const wob = 1.0 - p.wobble_depth * (0.5 + 0.5 * @sin(tau * wobble_hz * t + wobble_phase));
+
+        var x = (carrier + p.noise_mix * noise) * env * wob * p.level;
+        if (x > 0.95) x = 0.95;
+        if (x < -0.95) x = -0.95;
+        out[i] = @intFromFloat(@round(x * 32767.0));
+    }
+}
+
+
+    </Content>
+  </Chunk>
+  <Chunk id="9" lines="148-173" sha256="16711d58f036675d5d1404c9b736560a272161224b01a50e99804183988397c9">
+    <Metadata>
+      Risk_Profile: LOW
+      Surrounding_Function: synthInto
+    </Metadata>
+    <Content>
+ env * wob * p.level;
+        if (x > 0.95) x = 0.95;
+        if (x < -0.95) x = -0.95;
+        out[i] = @intFromFloat(@round(x * 32767.0));
+    }
+}
+
+fn renderSyllableInto(out: []i16, syl: *const Syll, prng: *std.Random.DefaultPrng) void {
+    var p: VoiceParams = undefined;
+    if (syl.vowel == 0) {
+        // Consonant-only tail: a short whisper, not a buzz.
+        p = .{ .f0 = 88.0, .attack_s = 0.006, .noise_mix = 0.85, .wobble_hz = 31.0, .wobble_depth = 0.30, .level = 0.65, .glide = 0.15 };
+    } else {
+        const spec = voiceSpec(classify(syl.onset()));
+        p = .{
+            .f0 = vowelBaseFreq(syl.vowel).?,
+            .attack_s = spec.attack_s,
+            .noise_mix = spec.noise_mix,
+            .wobble_hz = spec.wobble_hz,
+            .wobble_depth = spec.wobble_depth,
+            .level = spec.level,
+            .glide = PITCH_DROP,
+        };
+    }
+    // Per-syllable jitter, still a pure function of (phrase, syllable index).
+    const r = prng.random();
+
+    </Content>
+  </Chunk>
+  <Chunk id="10" lines="169-194" sha256="d0eaa2429cd6bd14b648d736dada63d7a9fd57bf9e4b5d53c9c121e99d14046f">
+    <Metadata>
+      Risk_Profile: LOW
+      Surrounding_Function: renderSyllableInto
+    </Metadata>
+    <Content>
+    .glide = PITCH_DROP,
+        };
+    }
+    // Per-syllable jitter, still a pure function of (phrase, syllable index).
+    const r = prng.random();
+    p.f0 *= 1.0 + (r.float(f32) - 0.5) * 0.06;
+    p.wobble_hz += (r.float(f32) - 0.5) * 3.0;
+    synthInto(out, p, prng);
+}
+
+// ---------------------------------------------------------------------
+// Swahili syllable engine
+// ---------------------------------------------------------------------
+
+fn lowerAscii(c: u8) u8 {
+    return if (c >= 'A' and c <= 'Z') c + 32 else c;
+}
+
+fn isVowel(c: u8) bool {
+    return c == 'a' or c == 'e' or c == 'i' or c == 'o' or c == 'u';
+}
+
+fn isWordChar(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '\'';
+}
+
+
+    </Content>
+  </Chunk>
+  <Chunk id="11" lines="188-206" sha256="0a7e438854fb2aa84b3536fcc85c7517d16805ee2cbb340b063e011bb40309dc">
+    <Metadata>
+      Risk_Profile: LOW
+      Surrounding_Function: isVowel
+    </Metadata>
+    <Content>
+e' or c == 'i' or c == 'o' or c == 'u';
+}
+
+fn isWordChar(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '\'';
+}
+
+/// Two-letter onsets that stay together: digraphs (sh, ch, ny, ...),
+/// prenasalized consonants (mb, nd, ng, nj, mp, nt, nk, nz, nv, mv) and
+/// Cw/Cy glide clusters (kwa, bwana, mwa, ...).
+const onset_pairs = [_][2]u8{
+    .{ 's', 'h' }, .{ 'c', 'h' }, .{ 't', 'h' }, .{ 'd', 'h' }, .{ 'k', 'h' },
+    .{ 'g', 'h' }, .{ 'p', 'h' }, .{ 'n', 'y' }, .{ 'm', 'b' }, .{ 'm', 'p' },
+    .{ 'n', 'd' }, .{ 'n', 't' }, .{ 'n', 'g' }, .{ 'n', 'k' }, .{ 'n', 'j' },
+    .{ 'n', 'z' }, .{ 'n', 'v' }, .{ 'm', 'v' }, .{ 'k', 'w' }, .{ 'g', 'w' },
+    .{ 'b', 'w' }, .{ 'v', 'w' }, .{ 'm', 'w' }, .{ 'f', 'w' }, .{ 'b', 'y' },
+    .{ 'f', 'y' }, .{ 'm', 'y' }, .{ 'p', 'y' },
+};
+
+
+    </Content>
+  </Chunk>
+  <Chunk id="12" lines="202-225" sha256="e6bfb3cdee48c3d55f336c902da149795508f21d4e8e6c55d9a6a2e9afe368b1">
+    <Metadata>
+      Risk_Profile: LOW
+      Surrounding_Function: isWordChar
+    </Metadata>
+    <Content>
+}, .{ 'g', 'w' },
+    .{ 'b', 'w' }, .{ 'v', 'w' }, .{ 'm', 'w' }, .{ 'f', 'w' }, .{ 'b', 'y' },
+    .{ 'f', 'y' }, .{ 'm', 'y' }, .{ 'p', 'y' },
+};
+
+fn canExtend(pending: []const u8, c: u8) bool {
+    if (pending.len == 0) return true;
+    if (c == '\'') return std.mem.eql(u8, pending, "ng"); // ng' is one consonant
+    if (pending.len >= 7) return false;
+    const last = pending[pending.len - 1];
+    for (onset_pairs) |pair| {
+        if (pair[0] == last and pair[1] == c) return true;
+    }
+    return false;
+}
+
+/// One syllable: a consonant onset, one vowel, and its spelling.
+/// Buffers live inside the struct; valid until the Scanner's next() call.
+pub const Syll = struct {
+    text_buf: [24]u8 = undefined,
+    text_len: u8 = 0,
+    onset_len: u8 = 0,
+    vowel: u8 = 0, // 0 for a consonant-only breath syllable
+
+
+    </Content>
+  </Chunk>
+  <Chunk id="13" lines="220-247" sha256="2ff67a4fef5ddebeaecd41c1049284b8af3bf343cf01492222dfc49966e9111b">
+    <Metadata>
+      Risk_Profile: LOW
+      Surrounding_Function: canExtend
+    </Metadata>
+    <Content>
+struct {
+    text_buf: [24]u8 = undefined,
+    text_len: u8 = 0,
+    onset_len: u8 = 0,
+    vowel: u8 = 0, // 0 for a consonant-only breath syllable
+
+    pub fn text(self: *const Syll) []const u8 {
+        return self.text_buf[0..self.text_len];
+    }
+    pub fn onset(self: *const Syll) []const u8 {
+        return self.text_buf[0..self.onset_len];
+    }
+};
+
+/// Single-pass, allocation-free syllable splitter for one word.
+/// Swahili syllables are (C)V: consonants gather into an onset, the vowel
+/// closes the syllable. A consonant that cannot join the pending onset
+/// (e.g. the "m" of "mtu") becomes its own syllabic-nasal breath syllable.
+pub const Scanner = struct {
+    word: []const u8,
+    idx: usize = 0,
+    pending: [7]u8 = undefined,
+    pending_len: usize = 0,
+
+    pub fn init(word: []const u8) Scanner {
+        return .{ .word = word };
+    }
+
+
+    </Content>
+  </Chunk>
+  <Chunk id="14" lines="240-267" sha256="3de518c967b9bc7a9123ad765934ba6b0f5afd54751a86bb666af21bcad7ff39">
+    <Metadata>
+      Risk_Profile: LOW
+      Surrounding_Function: onset
+    </Metadata>
+    <Content>
+ 0,
+    pending: [7]u8 = undefined,
+    pending_len: usize = 0,
+
+    pub fn init(word: []const u8) Scanner {
+        return .{ .word = word };
+    }
+
+    pub fn next(self: *Scanner) ?Syll {
+        if (self.idx >= self.word.len and self.pending_len == 0) return null;
+        var syl = Syll{};
+        while (self.idx < self.word.len) {
+            const c = lowerAscii(self.word[self.idx]);
+            if (isVowel(c)) {
+                var tl: usize = 0;
+                if (self.pending_len > 0) {
+                    @memcpy(syl.text_buf[0..self.pending_len], self.pending[0..self.pending_len]);
+                    tl = self.pending_len;
+                    syl.onset_len = @intCast(self.pending_len);
+                    self.pending_len = 0;
+                }
+                syl.text_buf[tl] = c;
+                tl += 1;
+                syl.vowel = c;
+                syl.text_len = @intCast(tl);
+                self.idx += 1;
+                return syl;
+            }
+
+    </Content>
+  </Chunk>
+  <Chunk id="15" lines="262-285" sha256="fceae356f054852fc2b11419a60188ef9b1346cac346ac53a2110623bb0f79e9">
+    <Metadata>
+      Risk_Profile: LOW
+      Surrounding_Function: next
+    </Metadata>
+    <Content>
+
+                syl.vowel = c;
+                syl.text_len = @intCast(tl);
+                self.idx += 1;
+                return syl;
+            }
+            if (canExtend(self.pending[0..self.pending_len], c)) {
+                self.pending[self.pending_len] = c;
+                self.pending_len += 1;
+                self.idx += 1;
+                continue;
+            }
+            // Consonant that cannot join the pending onset: the pending
+            // consonant becomes a whispered breath syllable (like the "m"
+            // in "mtu"), and this consonant starts the next onset.
+            @memcpy(syl.text_buf[0..self.pending_len], self.pending[0..self.pending_len]);
+            syl.text_len = @intCast(self.pending_len);
+            syl.onset_len = syl.text_len;
+            self.pending[0] = c;
+            self.pending_len = 1;
+            self.idx += 1;
+            return syl;
+        }
+        // Word over with a stranded onset: whispered tail syllable.
+
+    </Content>
+  </Chunk>
+  <Chunk id="16" lines="281-314" sha256="1555bbad0c9f91457ff1b4f7b0d48d012272eebcdbb9a12e7d04a61c0a36e5aa">
+    <Metadata>
+      Risk_Profile: LOW
+      Surrounding_Function: next
+    </Metadata>
+    <Content>
+lf.pending_len = 1;
+            self.idx += 1;
+            return syl;
+        }
+        // Word over with a stranded onset: whispered tail syllable.
+        @memcpy(syl.text_buf[0..self.pending_len], self.pending[0..self.pending_len]);
+        syl.text_len = @intCast(self.pending_len);
+        syl.onset_len = syl.text_len;
+        self.pending_len = 0;
+        return syl;
+    }
+};
+
+pub fn countSyllables(word: []const u8) usize {
+    var scan = Scanner.init(word);
+    var n: usize = 0;
+    while (scan.next()) |_| n += 1;
+    return n;
+}
+
+/// Allocates the syllable spellings of `word`. Caller frees the strings and
+/// the returned slice.
+pub fn splitSyllables(allocator: std.mem.Allocator, word: []const u8) ![][]const u8 {
+    const out = try allocator.alloc([]const u8, countSyllables(word));
+    errdefer allocator.free(out);
+    var scan = Scanner.init(word);
+    var i: usize = 0;
+    while (scan.next()) |syl| {
+        out[i] = try allocator.dupe(u8, syl.text());
+        i += 1;
+    }
+    return out;
+}
+
+
+    </Content>
+  </Chunk>
+  <Chunk id="17" lines="306-334" sha256="ac2e9e82f36ab90b6830798c613f4d103af54a20bdb1eee3ecc309af304eebd8">
+    <Metadata>
+      Risk_Profile: LOW
+      Surrounding_Function: splitSyllables
+    </Metadata>
+    <Content>
+;
+    var i: usize = 0;
+    while (scan.next()) |syl| {
+        out[i] = try allocator.dupe(u8, syl.text());
+        i += 1;
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------
+// Phrase planning and rendering
+// ---------------------------------------------------------------------
+
+pub const PhraseItem = struct {
+    syl: Syll,
+    start: usize, // sample offset in the rendered phrase
+    len: usize, // samples this syllable occupies
+};
+
+pub const Plan = struct {
+    items: []PhraseItem = &.{},
+    total_samples: usize = 0,
+    buf: []PhraseItem = &.{},
+
+    pub fn deinit(self: *Plan, allocator: std.mem.Allocator) void {
+        allocator.free(self.buf);
+    }
+};
+
+
+    </Content>
+  </Chunk>
+  <Chunk id="18" lines="327-343" sha256="e39ec1b67184c629c859543c000ea150026f2cef347a7018029dc370874c82fd">
+    <Metadata>
+      Risk_Profile: LOW
+      Surrounding_Function: splitSyllables
+    </Metadata>
+    <Content>
+e = 0,
+    buf: []PhraseItem = &.{},
+
+    pub fn deinit(self: *Plan, allocator: std.mem.Allocator) void {
+        allocator.free(self.buf);
+    }
+};
+
+/// Splits `phrase` into words and syllables and lays out the sample timeline:
+/// SYLLABLE_MS per syllable, GAP_MS between syllables of one word,
+/// WORD_GAP_MS between words. The plan is the single source of truth for both
+/// the renderer and the duration math, so they cannot drift apart.
+pub fn planPhrase(allocator: std.mem.Allocator, phrase: []const u8) !Plan {
+    const lower = try allocator.alloc(u8, phrase.len);
+    defer allocator.free(lower);
+    for (phrase, 0..) |c, k| lower[k] = lowerAscii(c);
+
+
+    </Content>
+  </Chunk>
+  <Chunk id="19" lines="339-358" sha256="4dfbb1afc4b13c6c56f7b722cc1d68b5fee4570424aeb5a929e581dc376a261f">
+    <Metadata>
+      Risk_Profile: LOW
+      Surrounding_Function: planPhrase
+    </Metadata>
+    <Content>
+lan {
+    const lower = try allocator.alloc(u8, phrase.len);
+    defer allocator.free(lower);
+    for (phrase, 0..) |c, k| lower[k] = lowerAscii(c);
+
+    const words = try allocator.alloc([]const u8, lower.len + 1);
+    defer allocator.free(words);
+    var nwords: usize = 0;
+    var i: usize = 0;
+    while (i < lower.len) {
+        if (isWordChar(lower[i])) {
+            const start = i;
+            while (i < lower.len and isWordChar(lower[i])) i += 1;
+            words[nwords] = lower[start..i];
+            nwords += 1;
+        } else {
+            i += 1;
+        }
+    }
+
+
+    </Content>
+  </Chunk>
+  <Chunk id="20" lines="351-382" sha256="814205d0d6c1ba068053cad15084496e156c2b38a47387b7663789f94612c189">
+    <Metadata>
+      Risk_Profile: LOW
+      Surrounding_Function: planPhrase
+    </Metadata>
+    <Content>
+rdChar(lower[i])) i += 1;
+            words[nwords] = lower[start..i];
+            nwords += 1;
+        } else {
+            i += 1;
+        }
+    }
+
+    const buf = try allocator.alloc(PhraseItem, lower.len + 1);
+    errdefer allocator.free(buf);
+    var nitems: usize = 0;
+    var cursor: usize = 0;
+    for (words[0..nwords], 0..) |w, wi| {
+        const nsyl = countSyllables(w);
+        var emitted: usize = 0;
+        var scan = Scanner.init(w);
+        while (scan.next()) |syl| {
+            const len: usize = if (syl.vowel != 0) SYLLABLE_SAMPLES else BREATH_SAMPLES;
+            buf[nitems] = .{ .syl = syl, .start = cursor, .len = len };
+            nitems += 1;
+            cursor += len;
+            emitted += 1;
+            if (emitted < nsyl) {
+                cursor += GAP_SAMPLES;
+            } else if (wi + 1 < nwords) {
+                cursor += WORD_GAP_SAMPLES;
+            }
+        }
+    }
+    return .{ .items = buf[0..nitems], .total_samples = cursor, .buf = buf };
+}
+
+
+    </Content>
+  </Chunk>
+  <Chunk id="21" lines="376-388" sha256="97d5a0d97799e47839b1e9baab074971f53a5a8772b1342d1827a574be68ee16">
+    <Metadata>
+      Risk_Profile: LOW
+      Surrounding_Function: planPhrase
+    </Metadata>
+    <Content>
+           cursor += WORD_GAP_SAMPLES;
+            }
+        }
+    }
+    return .{ .items = buf[0..nitems], .total_samples = cursor, .buf = buf };
+}
+
+pub fn phraseDurationMs(allocator: std.mem.Allocator, phrase: []const u8) !f64 {
+    var plan = try planPhrase(allocator, phrase);
+    defer plan.deinit(allocator);
+    return @as(f64, @floatFromInt(plan.total_samples)) * 1000.0 / @as(f64, SAMPLE_RATE);
+}
+
+
+    </Content>
+  </Chunk>
+  <Chunk id="22" lines="384-404" sha256="2351eb62678dd60193155365961502be7eaaeabfaec074e44c052505c9b3a4c8">
+    <Metadata>
+      Risk_Profile: LOW
+      Surrounding_Function: phraseDurationMs
+    </Metadata>
+    <Content>
+ase(allocator, phrase);
+    defer plan.deinit(allocator);
+    return @as(f64, @floatFromInt(plan.total_samples)) * 1000.0 / @as(f64, SAMPLE_RATE);
+}
+
+/// Renders a whole phrase as interleaved i16 samples. Deterministic: the same
+/// phrase yields byte-identical samples on every call, every run.
+pub fn renderPhraseSamples(allocator: std.mem.Allocator, phrase: []const u8) ![]i16 {
+    var plan = try planPhrase(allocator, phrase);
+    defer plan.deinit(allocator);
+    if (plan.items.len == 0) return error.NoSyllables;
+    const samples = try allocator.alloc(i16, plan.total_samples);
+    errdefer allocator.free(samples);
+    @memset(samples, 0);
+    var prng = std.Random.DefaultPrng.init(std.hash.Wyhash.hash(0x5EED_F00D, phrase));
+    for (plan.items) |item| {
+        renderSyllableInto(samples[item.start..][0..item.len], &item.syl, &prng);
+    }
+    return samples;
+}
+
+
+    </Content>
+  </Chunk>
+  <Chunk id="23" lines="398-411" sha256="f95206e6040d61036bae002edc45c1c608482b1ebc39f492d8e3a40bd16b140b">
+    <Metadata>
+      Risk_Profile: LOW
+      Surrounding_Function: renderPhraseSamples
+    </Metadata>
+    <Content>
+hrase));
+    for (plan.items) |item| {
+        renderSyllableInto(samples[item.start..][0..item.len], &item.syl, &prng);
+    }
+    return samples;
+}
+
+/// Renders a phrase straight to complete WAV bytes (44-byte header + data).
+pub fn renderPhraseWav(allocator: std.mem.Allocator, phrase: []const u8) ![]u8 {
+    const samples = try renderPhraseSamples(allocator, phrase);
+    defer allocator.free(samples);
+    return writeWavBytes(allocator, samples, SAMPLE_RATE);
+}
+
+
+    </Content>
+  </Chunk>
+  <Chunk id="24" lines="407-425" sha256="98024e8306b161072922409b6e1938be5434f6900b823b1336a7b482fb3b6fee">
+    <Metadata>
+      Risk_Profile: LOW
+      Surrounding_Function: renderPhraseWav
+    </Metadata>
+    <Content>
+amples = try renderPhraseSamples(allocator, phrase);
+    defer allocator.free(samples);
+    return writeWavBytes(allocator, samples, SAMPLE_RATE);
+}
+
+/// A wordless shuzi (a fart): 1-3 rumble syllables with random-ish timing,
+/// pitch and onset character. Deterministic per seed.
+pub fn renderShuziWav(allocator: std.mem.Allocator, seed: u64) ![]u8 {
+    var prng = std.Random.DefaultPrng.init(seed);
+    const r = prng.random();
+    const n_syl: usize = 1 + r.uintLessThan(usize, 3);
+    const Seg = struct { params: VoiceParams, len: usize, gap_after: usize };
+    var segs: [3]Seg = undefined;
+    var total: usize = 0;
+    var i: usize = 0;
+    while (i < n_syl) : (i += 1) {
+        const dur_ms: usize = (16 + r.uintLessThan(usize, 19)) * 10; // 160..340 ms
+        const classes = [_]VoiceClass{ .stop_voiced, .stop_voiceless, .fricative, .nasal, .liquid };
+        const spec = voiceSpec(classes[r.uintLessThan(usize, classes.len)]);
+
+    </Content>
+  </Chunk>
+  <Chunk id="25" lines="424-447" sha256="abe8387350ef21c4743e52215ecfaf95d72e96db47187a9bd9a02d94041773cf">
+    <Metadata>
+      Risk_Profile: LOW
+      Surrounding_Function: renderShuziWav
+    </Metadata>
+    <Content>
+oiceClass{ .stop_voiced, .stop_voiceless, .fricative, .nasal, .liquid };
+        const spec = voiceSpec(classes[r.uintLessThan(usize, classes.len)]);
+        const gap_ms: usize = if (i + 1 < n_syl) (3 + r.uintLessThan(usize, 5)) * 10 else 0; // 30..70 ms
+        segs[i] = .{
+            .params = .{
+                .f0 = 70.0 + 40.0 * r.float(f32),
+                .attack_s = spec.attack_s,
+                .noise_mix = spec.noise_mix + 0.10,
+                .wobble_hz = 24.0 + 10.0 * r.float(f32),
+                .wobble_depth = 0.45 + 0.15 * r.float(f32),
+                .level = 1.0,
+                .glide = PITCH_DROP,
+            },
+            .len = dur_ms * SAMPLE_RATE / 1000,
+            .gap_after = gap_ms * SAMPLE_RATE / 1000,
+        };
+        total += segs[i].len + segs[i].gap_after;
+    }
+    const samples = try allocator.alloc(i16, total);
+    defer allocator.free(samples);
+    @memset(samples, 0);
+    var off: usize = 0;
+    i = 0;
+    while (i < n_syl) : (i += 1) {
+
+    </Content>
+  </Chunk>
+  <Chunk id="26" lines="442-462" sha256="8206ade590b2096d106a4f69c726e2f19dcf702f2d28b4c32fe4635daff1447e">
+    <Metadata>
+      Risk_Profile: LOW
+      Surrounding_Function: renderShuziWav
+    </Metadata>
+    <Content>
+.alloc(i16, total);
+    defer allocator.free(samples);
+    @memset(samples, 0);
+    var off: usize = 0;
+    i = 0;
+    while (i < n_syl) : (i += 1) {
+        synthInto(samples[off..][0..segs[i].len], segs[i].params, &prng);
+        off += segs[i].len + segs[i].gap_after;
+    }
+    return writeWavBytes(allocator, samples, SAMPLE_RATE);
+}
+
+// ---------------------------------------------------------------------
+// WAV container
+// ---------------------------------------------------------------------
+
+const riff_tag = [4]u8{ 'R', 'I', 'F', 'F' };
+const wave_tag = [4]u8{ 'W', 'A', 'V', 'E' };
+const fmt_tag = [4]u8{ 'f', 'm', 't', ' ' };
+const data_tag = [4]u8{ 'd', 'a', 't', 'a' };
+
+
+    </Content>
+  </Chunk>
+  <Chunk id="27" lines="458-477" sha256="574d72a616bfb236a941addf843dd987996858b066be188afedda86c7787e7ca">
+    <Metadata>
+      Risk_Profile: LOW
+      Surrounding_Function: renderShuziWav
+    </Metadata>
+    <Content>
+'F', 'F' };
+const wave_tag = [4]u8{ 'W', 'A', 'V', 'E' };
+const fmt_tag = [4]u8{ 'f', 'm', 't', ' ' };
+const data_tag = [4]u8{ 'd', 'a', 't', 'a' };
+
+/// Wraps mono i16 samples in a canonical 44-byte PCM WAV header.
+pub fn writeWavBytes(allocator: std.mem.Allocator, samples: []const i16, sample_rate: u32) ![]u8 {
+    const data_len: u32 = @intCast(samples.len * 2);
+    const wav = try allocator.alloc(u8, 44 + data_len);
+    errdefer allocator.free(wav);
+    @memcpy(wav[0..4], &riff_tag);
+    std.mem.writeInt(u32, wav[4..8], data_len + 36, .little);
+    @memcpy(wav[8..12], &wave_tag);
+    @memcpy(wav[12..16], &fmt_tag);
+    std.mem.writeInt(u32, wav[16..20], 16, .little); // fmt chunk size
+    std.mem.writeInt(u16, wav[20..22], 1, .little); // PCM
+    std.mem.writeInt(u16, wav[22..24], 1, .little); // mono
+    std.mem.writeInt(u32, wav[24..28], sample_rate, .little);
+    std.mem.writeInt(u32, wav[28..32], sample_rate * 2, .little); // byte rate
+    std.mem.writeInt(u16, wav[32..34], 2, .little); // block align
+
+    </Content>
+  </Chunk>
+  <Chunk id="28" lines="475-499" sha256="d404e94cc74408a377da22c9b0437077eb58ddfbd9857fbb8ee33efcf914a050">
+    <Metadata>
+      Risk_Profile: LOW
+      Surrounding_Function: writeWavBytes
+    </Metadata>
+    <Content>
+e);
+    std.mem.writeInt(u32, wav[28..32], sample_rate * 2, .little); // byte rate
+    std.mem.writeInt(u16, wav[32..34], 2, .little); // block align
+    std.mem.writeInt(u16, wav[34..36], 16, .little); // bits per sample
+    @memcpy(wav[36..40], &data_tag);
+    std.mem.writeInt(u32, wav[40..44], data_len, .little);
+    for (samples, 0..) |s, k| {
+        std.mem.writeInt(i16, wav[44 + 2 * k ..][0..2], s, .little);
+    }
+    return wav;
+}
+
+/// Byte length of the WAV data chunk (2 bytes per mono sample).
+pub fn wavDataByteLen(wav: []const u8) u32 {
+    return std.mem.readInt(u32, wav[40..44], .little);
+}
+
+// ---------------------------------------------------------------------
+// TESTING
+// Every audio test below asserts non-silence, so replacing the synthesis
+// with silence fails each one of them.
+// ---------------------------------------------------------------------
+
+const testing = std.testing;
+
+
+    </Content>
+  </Chunk>
+  <Chunk id="29" lines="494-516" sha256="5ebaa8da99cb9d555155046dde48bbbcb76947fc8ab016da6deb7e994bc77da4">
+    <Metadata>
+      Risk_Profile: LOW
+      Surrounding_Function: wavDataByteLen
+    </Metadata>
+    <Content>
+hesis
+// with silence fails each one of them.
+// ---------------------------------------------------------------------
+
+const testing = std.testing;
+
+fn expectNotSilence(wav: []const u8) !void {
+    const data_len = wavDataByteLen(wav);
+    const total: usize = data_len / 2;
+    try testing.expect(total > 0);
+    var peak: i32 = 0;
+    var nonzero: usize = 0;
+    var k: usize = 0;
+    while (k < total) : (k += 1) {
+        const s: i32 = std.mem.readInt(i16, wav[44 + 2 * k ..][0..2], .little);
+        const a = if (s < 0) -s else s;
+        if (a > peak) peak = a;
+        if (s != 0) nonzero += 1;
+    }
+    try testing.expect(peak >= 3000); // at least ~9% of full scale somewhere
+    try testing.expect(nonzero * 20 >= total); // >5% of samples are audible
+}
+
+
+    </Content>
+  </Chunk>
+  <Chunk id="30" lines="513-529" sha256="fdea7267e01e7140db74126aef6c2a9eb1363d1008f74f273c2dfcbe5fd51011">
+    <Metadata>
+      Risk_Profile: LOW
+      Surrounding_Function: expectNotSilence
+    </Metadata>
+    <Content>
+testing.expect(peak >= 3000); // at least ~9% of full scale somewhere
+    try testing.expect(nonzero * 20 >= total); // >5% of samples are audible
+}
+
+test "wav header is valid RIFF PCM and not silent" {
+    const allocator = testing.allocator;
+    const wav = try renderPhraseWav(allocator, "habari yako");
+    defer allocator.free(wav);
+    try testing.expect(wav.len > 44);
+    try testing.expectEqualStrings("RIFF", wav[0..4]);
+    try testing.expectEqualStrings("WAVE", wav[8..12]);
+    try testing.expectEqualStrings("fmt ", wav[12..16]);
+    try testing.expectEqualStrings("data", wav[36..40]);
+    try testing.expectEqual(@as(u32, 16), std.mem.readInt(u32, wav[16..20], .little));
+    try testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, wav[20..22], .little)); // PCM
+    try testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, wav[22..24], .little)); // mono
+    try testing.expectEqual(SAMPLE_RATE, std.mem.readInt(u32, wav[24..28], .little));
+
+    </Content>
+  </Chunk>
+  <Chunk id="31" lines="528-543" sha256="7c430cf3519b28212ea7188b3d4aa7d4c8a33aeb2999eccf2552b463900e3ec2">
+    <Metadata>
+      Risk_Profile: LOW
+      Surrounding_Function: expectNotSilence
+    </Metadata>
+    <Content>
+s(u16, 1), std.mem.readInt(u16, wav[22..24], .little)); // mono
+    try testing.expectEqual(SAMPLE_RATE, std.mem.readInt(u32, wav[24..28], .little));
+    try testing.expectEqual(SAMPLE_RATE * 2, std.mem.readInt(u32, wav[28..32], .little)); // byte rate
+    try testing.expectEqual(@as(u16, 2), std.mem.readInt(u16, wav[32..34], .little)); // block align
+    try testing.expectEqual(@as(u16, 16), std.mem.readInt(u16, wav[34..36], .little)); // bits
+    try testing.expectEqual(@as(u32, @intCast(wav.len - 44)), wavDataByteLen(wav));
+    try testing.expectEqual(@as(u32, @intCast(wav.len - 8)), std.mem.readInt(u32, wav[4..8], .little));
+    try expectNotSilence(wav);
+}
+
+test "sample count matches expected duration within 1ms" {
+    const allocator = testing.allocator;
+    const phrase = "karibu kujamba";
+    const wav = try renderPhraseWav(allocator, phrase);
+    defer allocator.free(wav);
+
+
+    </Content>
+  </Chunk>
+  <Chunk id="32" lines="539-558" sha256="291628f3fa4921378455643840911404ed18a0b8e8d07e06463efb9ec194b763">
+    <Metadata>
+      Risk_Profile: LOW
+      Surrounding_Function: expectNotSilence
+    </Metadata>
+    <Content>
+tor = testing.allocator;
+    const phrase = "karibu kujamba";
+    const wav = try renderPhraseWav(allocator, phrase);
+    defer allocator.free(wav);
+
+    // Recompute the expected duration from the documented timing policy:
+    // nsyl * SYLLABLE_MS + (nsyl - nwords) * GAP_MS + (nwords - 1) * WORD_GAP_MS.
+    var nsyl: usize = 0;
+    var nwords: usize = 0;
+    var it = std.mem.tokenizeAny(u8, phrase, " ");
+    while (it.next()) |w| {
+        nwords += 1;
+        nsyl += countSyllables(w);
+    }
+    const expected_ms: f64 = @floatFromInt(nsyl * SYLLABLE_MS + (nsyl - nwords) * GAP_MS + (nwords - 1) * WORD_GAP_MS);
+    const actual_ms: f64 = @as(f64, @floatFromInt(wavDataByteLen(wav) / 2)) * 1000.0 / @as(f64, SAMPLE_RATE);
+    try testing.expect(@abs(actual_ms - expected_ms) < 1.0);
+    try expectNotSilence(wav);
+}
+
+
+    </Content>
+  </Chunk>
+  <Chunk id="33" lines="554-568" sha256="72e1e76ff37b782b0157efd68ae97150ade1c912e6adfdb29abbcb6ea34b738f">
+    <Metadata>
+      Risk_Profile: LOW
+      Surrounding_Function: expectNotSilence
+    </Metadata>
+    <Content>
+taByteLen(wav) / 2)) * 1000.0 / @as(f64, SAMPLE_RATE);
+    try testing.expect(@abs(actual_ms - expected_ms) < 1.0);
+    try expectNotSilence(wav);
+}
+
+test "determinism: same phrase renders byte-identical wav" {
+    const allocator = testing.allocator;
+    const a = try renderPhraseWav(allocator, "kujamba shuzi");
+    defer allocator.free(a);
+    const b = try renderPhraseWav(allocator, "kujamba shuzi");
+    defer allocator.free(b);
+    try testing.expectEqualSlices(u8, a, b);
+    try expectNotSilence(a);
+}
+
+
+    </Content>
+  </Chunk>
+  <Chunk id="34" lines="563-586" sha256="8ce90d0070383aa2b6c2a0fbf0c41eb3c1430da3c7a66429977aa4d01a149395">
+    <Metadata>
+      Risk_Profile: LOW
+      Surrounding_Function: expectNotSilence
+    </Metadata>
+    <Content>
+enderPhraseWav(allocator, "kujamba shuzi");
+    defer allocator.free(b);
+    try testing.expectEqualSlices(u8, a, b);
+    try expectNotSilence(a);
+}
+
+test "syllable splitter handles real swahili words" {
+    const allocator = testing.allocator;
+    const TestCase = struct { word: []const u8, expected: []const []const u8 };
+    const cases = [_]TestCase{
+        .{ .word = "habari", .expected = &.{ "ha", "ba", "ri" } },
+        .{ .word = "yako", .expected = &.{ "ya", "ko" } },
+        .{ .word = "asante", .expected = &.{ "a", "sa", "nte" } },
+        .{ .word = "karibu", .expected = &.{ "ka", "ri", "bu" } },
+        .{ .word = "kujamba", .expected = &.{ "ku", "ja", "mba" } },
+        .{ .word = "shuzi", .expected = &.{ "shu", "zi" } },
+    };
+    for (cases) |tc| {
+        const got = try splitSyllables(allocator, tc.word);
+        defer {
+            for (got) |g| allocator.free(g);
+            allocator.free(got);
+        }
+        try testing.expectEqual(tc.expected.len, got.len);
+
+    </Content>
+  </Chunk>
+  <Chunk id="35" lines="582-596" sha256="4d8fa8df67c1561dbb9721541ba1ddad63ff439596aa749793e6a216b18c5546">
+    <Metadata>
+      Risk_Profile: LOW
+      Surrounding_Function: expectNotSilence
+    </Metadata>
+    <Content>
+ {
+            for (got) |g| allocator.free(g);
+            allocator.free(got);
+        }
+        try testing.expectEqual(tc.expected.len, got.len);
+        for (tc.expected, got) |e, g| {
+            try testing.expectEqualStrings(e, g);
+        }
+        // The word must also fart: rendered audio must not be silence.
+        const wav = try renderPhraseWav(allocator, tc.word);
+        defer allocator.free(wav);
+        try expectNotSilence(wav);
+    }
+}
+
+
+    </Content>
+  </Chunk>
+  <Chunk id="36" lines="590-615" sha256="7888d38e9e11b14f552210c4c6e37c10f168e91b15350b05a0a8da7eb7fb9669">
+    <Metadata>
+      Risk_Profile: LOW
+      Surrounding_Function: expectNotSilence
+    </Metadata>
+    <Content>
+ silence.
+        const wav = try renderPhraseWav(allocator, tc.word);
+        defer allocator.free(wav);
+        try expectNotSilence(wav);
+    }
+}
+
+test "changing a vowel changes the output bytes" {
+    const allocator = testing.allocator;
+    const a = try renderPhraseWav(allocator, "kaka");
+    defer allocator.free(a);
+    const b = try renderPhraseWav(allocator, "kiki");
+    defer allocator.free(b);
+    try testing.expectEqual(a.len, b.len); // same syllable count -> same duration
+    var differs = false;
+    for (a, b) |x, y| {
+        if (x != y) {
+            differs = true;
+            break;
+        }
+    }
+    try testing.expect(differs);
+    try expectNotSilence(a);
+    try expectNotSilence(b);
+}
+
+
+    </Content>
+  </Chunk>
+  <Chunk id="37" lines="607-624" sha256="319497a6bf65a91eff0f58ec3ad855cadb65cfa4ba15023b3b8ddb9358e24cad">
+    <Metadata>
+      Risk_Profile: LOW
+      Surrounding_Function: expectNotSilence
+    </Metadata>
+    <Content>
+     differs = true;
+            break;
+        }
+    }
+    try testing.expect(differs);
+    try expectNotSilence(a);
+    try expectNotSilence(b);
+}
+
+test "synthesis is not silence" {
+    const allocator = testing.allocator;
+    const wav = try renderPhraseWav(allocator, "shuzi ya mtaa");
+    defer allocator.free(wav);
+    try expectNotSilence(wav);
+    const shuzi = try renderShuziWav(allocator, 0xF4277D01);
+    defer allocator.free(shuzi);
+    try expectNotSilence(shuzi);
+}
+
+    </Content>
+  </Chunk>
+</File>
+
