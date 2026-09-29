@@ -1,0 +1,4 @@
+REFPEER RESULT ok=1 remote_channels_seen=279 remote_peak=0.160370 rx_energy=83888.721296 chat_lines=3 primary_user=0 primary_channels=1 primary_ch_peaks=0.160370
+chat: TOPIC |  | kujamba (Flatlophone) instrument demo |  | 
+chat: JOIN | kujamba |  |  | 
+chat: PART | kujamba |  |  | 

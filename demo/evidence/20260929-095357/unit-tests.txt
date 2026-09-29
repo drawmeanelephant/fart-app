@@ -1,0 +1,10 @@
+Build Summary: 8/8 steps succeeded; 57/57 tests passed
+test success
++- run test 5 pass (5 total) 98ms MaxRSS:13M
+|  +- compile test Debug native cached 80ms MaxRSS:35M
++- run test 9 pass (9 total) 418ms MaxRSS:8M
+|  +- compile test Debug native cached 82ms MaxRSS:35M
++- run test 43 pass (43 total) 829ms MaxRSS:11M
+   +- compile test Debug native success 2s MaxRSS:342M
+      +- options cached
+

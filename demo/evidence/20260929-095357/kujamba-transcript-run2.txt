@@ -1,0 +1,55 @@
+[    0.000] connecting to 127.0.0.1:20531 as kujamba
+[    0.001] connected
+[    0.003] S>C 0x00 CHALLENGE challenge=4e8199f44f82d924 caps=0x00000300 ver=0x00020000 keepalive=3s license=0b
+[    0.003] C>S 0x80 AUTH_USER user=kujamba hash=7e818ca7385e8c6c99130664dbd646660bbeee40 caps=0
+[    0.015] S>C 0x01 AUTH_OK user=kujamba maxchan=8
+[    0.015] C>S 0x82 SET_CHANNEL_INFO n=1
+[    3.029] C>S KEEPALIVE (idle 3014ms)
+[    3.178] S>C 0x02 CONFIG bpm=100 bpi=8
+[    3.179] interval clock started: 211680 samples (4800ms)
+[    3.179] S>C 0x03 USERINFO nrecords=0
+[    3.179] S>C 0xC0 CHAT TOPIC:  | kujamba (Flatlophone) instrument demo |  | 
+[    3.201] C>S 0x83 UPLOAD_BEGIN guid=3b2e1b88d5771a125a511d8b5c413a2f chidx=0 interval=0
+[    3.201] C>S 0x84 WRITE guid=3b2e1b88d5771a125a511d8b5c413a2f flags=0 bytes=3552
+[    3.983] C>S 0x84 WRITE guid=3b2e1b88d5771a125a511d8b5c413a2f flags=0 bytes=4232
+[    4.852] C>S 0x84 WRITE guid=3b2e1b88d5771a125a511d8b5c413a2f flags=0 bytes=4234
+[    7.852] C>S KEEPALIVE (idle 3000ms)
+[    7.999] C>S 0x84 WRITE guid=3b2e1b88d5771a125a511d8b5c413a2f flags=1 bytes=1441
+[    7.999] payload dump payloads-run2/interval_0000.ogg bytes=13459
+[    7.999] interval 0 complete (211680 samples, 4800ms)
+[    8.022] C>S 0x83 UPLOAD_BEGIN guid=d55dc9ea5f7977c472f2c9cb3712748e chidx=0 interval=1
+[    8.023] C>S 0x84 WRITE guid=d55dc9ea5f7977c472f2c9cb3712748e flags=0 bytes=3552
+[    8.782] C>S 0x84 WRITE guid=d55dc9ea5f7977c472f2c9cb3712748e flags=0 bytes=4232
+[    9.664] C>S 0x84 WRITE guid=d55dc9ea5f7977c472f2c9cb3712748e flags=0 bytes=4234
+[   12.669] C>S KEEPALIVE (idle 3005ms)
+[   12.796] C>S 0x84 WRITE guid=d55dc9ea5f7977c472f2c9cb3712748e flags=1 bytes=1441
+[   12.796] payload dump payloads-run2/interval_0001.ogg bytes=13459
+[   12.796] interval 1 complete (211680 samples, 4800ms)
+[   12.820] C>S 0x83 UPLOAD_BEGIN guid=2b75e07e771f0b7da31f0d97c4c6e8da chidx=0 interval=2
+[   12.820] C>S 0x84 WRITE guid=2b75e07e771f0b7da31f0d97c4c6e8da flags=0 bytes=3552
+[   13.582] C>S 0x84 WRITE guid=2b75e07e771f0b7da31f0d97c4c6e8da flags=0 bytes=4232
+[   14.468] C>S 0x84 WRITE guid=2b75e07e771f0b7da31f0d97c4c6e8da flags=0 bytes=4234
+[   17.486] C>S KEEPALIVE (idle 3018ms)
+[   17.592] C>S 0x84 WRITE guid=2b75e07e771f0b7da31f0d97c4c6e8da flags=1 bytes=1441
+[   17.592] payload dump payloads-run2/interval_0002.ogg bytes=13459
+[   17.592] interval 2 complete (211680 samples, 4800ms)
+[   20.609] C>S KEEPALIVE (idle 3018ms)
+[   22.389] C>S 0x83 SILENCE_MARKER chidx=0
+[   22.389] interval 3 complete (211680 samples, 4800ms)
+[   22.414] C>S 0x83 UPLOAD_BEGIN guid=a1b1476baa7c4ae85212c50cdd8698cb chidx=0 interval=4
+[   22.414] C>S 0x84 WRITE guid=a1b1476baa7c4ae85212c50cdd8698cb flags=0 bytes=3552
+[   23.182] C>S 0x84 WRITE guid=a1b1476baa7c4ae85212c50cdd8698cb flags=0 bytes=4232
+[   24.067] C>S 0x84 WRITE guid=a1b1476baa7c4ae85212c50cdd8698cb flags=0 bytes=4234
+[   27.067] C>S KEEPALIVE (idle 3001ms)
+[   27.182] C>S 0x84 WRITE guid=a1b1476baa7c4ae85212c50cdd8698cb flags=1 bytes=1441
+[   27.183] payload dump payloads-run2/interval_0004.ogg bytes=13459
+[   27.183] interval 4 complete (211680 samples, 4800ms)
+[   27.205] C>S 0x83 UPLOAD_BEGIN guid=47bd838d0e2b425f28428dd694112703 chidx=0 interval=5
+[   27.205] C>S 0x84 WRITE guid=47bd838d0e2b425f28428dd694112703 flags=0 bytes=3552
+[   27.983] C>S 0x84 WRITE guid=47bd838d0e2b425f28428dd694112703 flags=0 bytes=4232
+[   28.864] C>S 0x84 WRITE guid=47bd838d0e2b425f28428dd694112703 flags=0 bytes=4234
+[   31.872] C>S KEEPALIVE (idle 3008ms)
+[   31.999] C>S 0x84 WRITE guid=47bd838d0e2b425f28428dd694112703 flags=1 bytes=1441
+[   32.000] payload dump payloads-run2/interval_0005.ogg bytes=13459
+[   32.000] interval 5 complete (211680 samples, 4800ms)
+[   32.000] session end: ok=true
