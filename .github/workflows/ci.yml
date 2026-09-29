@@ -1,0 +1,49 @@
+# CI: build + test the fart-app / kujamba instrument.
+#
+# Pins Zig via a direct tarball download from ziglang.org (checksum-verified) —
+# no third-party setup action. The check produced is named `build-test`; once
+# this workflow has run green at least once, `main`'s ruleset can require it:
+#   {"type":"required_status_checks","parameters":{"required_checks":[{"context":"build-test"}],"strict_required_status_checks_policy":false}}
+# (verify the exact context name from a real run before adding it).
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  ZIG_VERSION: "0.16.0"
+  # zig-x86_64-linux-0.16.0.tar.xz — from https://ziglang.org/download/index.json
+  ZIG_TARBALL_SHA256: "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00"
+
+jobs:
+  build-test:
+    name: build-test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Zig (direct tarball from ziglang.org)
+        run: |
+          set -euo pipefail
+          tarball="zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          url="https://ziglang.org/download/${ZIG_VERSION}/${tarball}"
+          echo "downloading $url"
+          curl -fsSL "$url" -o "$tarball"
+          echo "${ZIG_TARBALL_SHA256}  ${tarball}" | sha256sum -c -
+          tar -xJf "$tarball"
+          echo "${GITHUB_WORKSPACE}/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
+
+      - name: zig version
+        run: zig version
+
+      - name: zig build
+        run: zig build
+
+      - name: zig build test
+        run: zig build test
