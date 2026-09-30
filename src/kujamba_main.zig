@@ -51,6 +51,8 @@ fn printUsage(io: std.Io) void {
         \\                       can pick live with !kujamba <n|name>. Mutually
         \\                       exclusive with --phrase. Every phrase is
         \\                       rendered once at startup, so switching is instant
+        \\                       -- and so the whole bank is resident in memory at
+        \\                       once (64 MiB of audio, ~6 min, is the ceiling)
         \\    --seed N           determinism seed: ids + payloads derive from it
         \\    --pattern P        bar pattern, e.g. 3+1 = 3 fart bars + 1 rest bar
         \\                       (default 3+1)
@@ -379,7 +381,24 @@ fn cmdJoin(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: [
             error.Rejected => fail(io, "refusing to read {s} as a phrase bank", .{path}),
             error.ReadFailed => fail(io, "cannot read phrases file '{s}'", .{path}),
         };
-        bank.parse(text, s.knobs) catch |e| fail(io, "phrase bank '{s}' failed: {s}", .{ path, @errorName(e) });
+        bank.parse(text, s.knobs) catch |e| switch (e) {
+            // The budget is on rendered audio, not file size, so this is the
+            // one failure a user reaches by having *too many good phrases* —
+            // worth saying what to do about it rather than naming an error set.
+            error.BankTooLarge => fail(io, "phrase bank '{s}' renders to more than {d} MiB of audio across {d} phrases — split the file or drop some", .{
+                path,
+                // Ceiling division: a budget that is not a whole number of MiB
+                // would otherwise floor to "0 MiB" and name no limit at all.
+                (kujamba_out.max_bank_samples * @sizeOf(f32) + 1024 * 1024 - 1) / (1024 * 1024),
+                bank.entries.items.len,
+            }),
+            // Anything else is attributable to a line, the same way a config
+            // error is: `file:line: why` is the convention the loader sets.
+            else => if (bank.fail_line) |ln|
+                fail(io, "{s}:{d}: {s}", .{ path, ln, @errorName(e) })
+            else
+                fail(io, "phrase bank '{s}' failed: {s}", .{ path, @errorName(e) }),
+        };
         if (bank.entries.items.len == 0)
             fail(io, "phrases file '{s}' has no phrases (only comments or blank lines?)", .{path});
     } else {

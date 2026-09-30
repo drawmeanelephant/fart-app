@@ -266,10 +266,32 @@ pub const Phrase = struct {
     cursor: u64 = 0,
 };
 
+/// Ceiling on the audio one bank may hold, in samples. 16 Mi samples of f32 is
+/// 64 MiB, which at the synth's 44.1 kHz is about six minutes of phrases — far
+/// more than anyone picks between in a chat room, while still being a number a
+/// file cannot blow past.
+///
+/// The cap on the *phrases file* does not do this job. That cap is on bytes of
+/// text, and the bank renders each line to f32: a one-word line is ~8 bytes and
+/// ~0.5 s of audio, so the text-to-audio ratio runs past 20 000:1. A 900 KB file
+/// of short lines clears a 1 MiB text cap and then asks for gigabytes.
+pub const max_bank_samples: usize = 16 * 1024 * 1024;
+
 pub const PhraseBank = struct {
     /// owns the rendered buffers; the `Phrase` structs themselves borrow.
     alloc: std.mem.Allocator,
     entries: std.ArrayList(Phrase) = .empty,
+    /// samples this bank has rendered and owns. Tracked incrementally so the
+    /// budget check stays O(1). Adopted buffers (`initBorrowed`) are not
+    /// counted: nothing was allocated, so they cost no memory.
+    rendered: usize = 0,
+    /// ceiling on `rendered`. A field rather than a bare constant so a test can
+    /// shrink it instead of synthesizing six minutes of audio to reach it.
+    budget: usize = max_bank_samples,
+    /// 1-based line of the phrases file that failed to load, or null if the
+    /// failure was not tied to a line (`add` has none to report). Set by
+    /// `parse` so the CLI can say `file:line: why` like the config loader does.
+    fail_line: ?usize = null,
     /// index the plan is currently selecting
     current: usize = 0,
     /// index a chat command asked for, consumed at the next bar boundary.
@@ -329,7 +351,13 @@ pub const PhraseBank = struct {
     pub fn add(self: *PhraseBank, phrase: []const u8, knobs: synth.VoiceKnobs) !void {
         const samples = try renderPhraseF32With(self.alloc, phrase, knobs);
         errdefer self.alloc.free(samples);
+        // Checked after the render, because the length is only known then: a
+        // pre-flight estimate would have to model syllable timing, and being
+        // wrong in the permissive direction is the failure we are here to stop.
+        // One wasted render at the boundary costs less than being wrong.
+        if (self.rendered + samples.len > self.budget) return error.BankTooLarge;
         try self.entries.append(self.alloc, .{ .name = phrase, .samples = samples });
+        self.rendered += samples.len;
     }
 
     /// Parse a bank file: one phrase per line, `#` comments and blank lines
@@ -343,10 +371,17 @@ pub const PhraseBank = struct {
     /// vocabulary to keep in sync.
     pub fn parse(self: *PhraseBank, text: []const u8, knobs: synth.VoiceKnobs) !void {
         var lines = std.mem.splitScalar(u8, text, '\n');
+        var lineno: usize = 0;
         while (lines.next()) |raw| {
+            lineno += 1;
             const line = std.mem.trim(u8, raw, " \t\r");
             if (line.len == 0 or line[0] == '#') continue;
-            try self.add(line, knobs);
+            self.add(line, knobs) catch |e| {
+                // A 500-line bank that fails on one phrase is unusable without
+                // the line: `failed: BankTooLarge` says nothing about where.
+                self.fail_line = lineno;
+                return e;
+            };
         }
     }
 
@@ -1340,6 +1375,43 @@ test "a phrases file renders every phrase once, up front, deterministically (#10
         @intFromPtr(bank.entries.items[1].samples.ptr),
         @intFromPtr(bank.active().?.samples.ptr),
     );
+}
+
+test "a bank renders up to its audio budget and no further (#8, #10)" {
+    const alloc = testing.allocator;
+    var bank = PhraseBank.init(alloc);
+    defer bank.deinit();
+
+    try bank.add("kujamba karibu", .{});
+    const first = bank.entries.items[0].samples.len;
+    try testing.expectEqual(first, bank.rendered);
+
+    // Room for exactly what is already loaded, so the *next* phrase is the one
+    // that has to be refused. This is what makes the budget cumulative: a cap
+    // checked per entry would let this through.
+    bank.budget = first;
+    try testing.expectError(error.BankTooLarge, bank.add("asante sana", .{}));
+
+    // The refused phrase leaves nothing behind: no entry to play, no allocation
+    // to leak, and the running total untouched.
+    try testing.expectEqual(@as(usize, 1), bank.entries.items.len);
+    try testing.expectEqual(first, bank.rendered);
+}
+
+test "a phrases file that overruns the budget reports the line that did it" {
+    const alloc = testing.allocator;
+    var bank = PhraseBank.init(alloc);
+    defer bank.deinit();
+    bank.budget = 1; // any real phrase is over this
+
+    try testing.expectError(
+        error.BankTooLarge,
+        bank.parse("# a comment\nkujamba karibu\nasante sana\n", .{}),
+    );
+    // Line 2, not line 1: comments and blank lines still consume a line, so the
+    // number is the one the user sees in their editor.
+    try testing.expectEqual(@as(usize, 2), bank.fail_line.?);
+    try testing.expectEqual(@as(usize, 0), bank.entries.items.len);
 }
 
 test "a phrases file with CRLF endings parses the same as one with LF" {
