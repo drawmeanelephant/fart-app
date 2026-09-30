@@ -374,6 +374,33 @@ nothing about the guard it meant to break.
   values (`kujamba_out.intervalNsFor`) has no such error. Small, systematic, and
   entirely invisible: the kind of thing #13 exists to notice.
 
+- **A bar shorter than the run loop's poll cannot be sustained, and #13's slew
+  cannot rescue it.** Found by choosing a 10 ms bar (6000 bpm, 1 bpi) to make a
+  test faster: the run loop spends up to 20 ms per pass in `pollReadable(20)`,
+  and `advanceAudio` finalizes **at most one interval per pass**, so a bar
+  shorter than the poll can never be caught up. Measured: 126 bars in a 4 s run
+  against ~400 available, **2231 ms of accumulated drift**, and a bounded slew
+  firing on every single one of them and still losing ground — which is correct
+  behaviour, since a 1%-of-a-bar correction is *supposed* to be small, and
+  closing a 2.2 s gap at 1 ms per bar would take 2200 bars. Worth knowing, not
+  fixed here: no musical tempo has a sub-20 ms bar, and doing it properly means
+  restructuring `advanceAudio` to generate *and* finalize several intervals per
+  pass, which is a bigger change than #13/#14 should carry. If it ever matters,
+  it is a fresh issue with this measurement already in it.
+
+- **A test that asserts a wall-clock count is a test that measures the machine.**
+  The M5 timing harness asserted "at least 3 bars in a 4 s session", CI failed
+  it, it became "at least 2", CI failed it again with 1, then with 0 — same
+  code, three runners. The bar count is the machine's encode throughput, not the
+  client's behaviour, and no floor fixes that. The harness now asserts what is
+  machine-independent (the handshake completed, the upload section stayed
+  bounded, the session *came back* inside a generous cap) and **reports** the
+  bar count, while the claim it was reaching for — the clock keeps walking
+  through refused uploads — is asserted deterministically by driving
+  `finalizeInterval` twelve times against a blocked socket and counting. Same
+  lesson as the `sendMessageBounded` literal, one level up: prefer a test whose
+  result depends on the code to one whose result depends on the weather.
+
 - **An encode lead longer than the bar is a silent, permanent stall.** If the
   encoder is asked to run more than one bar ahead, then `produced < target` in
   `advanceAudio` is false before the bar begins, `finalizeInterval` never fires,
