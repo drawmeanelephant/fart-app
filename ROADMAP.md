@@ -46,7 +46,7 @@ real instrument is **control while it runs**.
 - [ ] **Phrase bank + live selection.** (#8) `--phrases FILE` loads many phrases;
       `!kujamba <n>` in room chat selects the next one (the client already
       receives `0xC0` chat — parse it and act on it). Blocked by #10 and #11.
-- [ ] **Chat-driven transport.** (#9) `!kujamba play|rest|loop|repeat|once|stop`
+- [x] **Chat-driven transport.** (#9) ✅ **Landed.** `!kujamba play|rest|loop|repeat|once|stop`
       lets a bandleader shape the performance from the room without restarting
       the process. Blocked by #11.
 
