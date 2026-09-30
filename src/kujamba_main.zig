@@ -90,11 +90,12 @@ fn printUsage(io: std.Io) void {
         \\                       [--pattern P] [--bars N] [--bar-ms MS] [--seed N]
         \\      render a phrase offline, shaped as join would play it. A rest bar
         \\      is exact silence and freezes the phrase cursor, matching the room.
-        \\  kujamba play <phrase> [--config FILE] [--play MODE] [--pattern P]
-        \\                       [--bars N] [--bar-ms MS] [--seed N] [--voice SPEC]
-        \\                       [--device NAME|INDEX]
+        \\  kujamba play [<phrase>|--phrase TEXT] [--config FILE] [--play MODE]
+        \\                       [--pattern P] [--bars N] [--bar-ms MS] [--seed N]
+        \\                       [--voice SPEC] [--device NAME|INDEX]
         \\      render like `render` and play it on the local output device
-        \\      (#20, vendored miniaudio — no afplay shell-out). Exits 1 with a
+        \\      (#20, vendored miniaudio — no afplay shell-out). A bare phrase
+        \\      is shorthand for --phrase; give one, not both. Exits 1 with a
         \\      clear message when no output device is available.
         \\  kujamba trigger [--config FILE] [--device NAME|INDEX] [--script FILE]
         \\      the #21 sampler: stdin lines drive it — `on <N>` plays the sound
@@ -692,6 +693,8 @@ fn cmdPlay(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: [
         fail(io, "play: this build has live audio disabled — rebuild with -Dlive", .{});
     }
     var phrase: []const u8 = "kujamba karibu";
+    var phrase_flagged = false;
+    var positional: ?[]const u8 = null;
     var pattern: kujamba_out.Pattern = .{ .play = 1, .rest = 0 };
     var pattern_label: []const u8 = "1";
     var play_mode = kujamba_out.Mode.repeat;
@@ -716,6 +719,7 @@ fn cmdPlay(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: [
         const next = if (i + 1 < argv.len) argv[i + 1] else null;
         if (std.mem.eql(u8, a, "--phrase")) {
             phrase = next orelse fail(io, "--phrase needs a value", .{});
+            phrase_flagged = true;
             i += 1;
         } else if (std.mem.eql(u8, a, "--config")) {
             i += 1; // consumed by loadConfigFile
@@ -747,9 +751,18 @@ fn cmdPlay(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: [
         } else if (std.mem.eql(u8, a, "--device")) {
             device = next orelse fail(io, "--device needs a name or index", .{});
             i += 1;
-        } else {
+        } else if (std.mem.startsWith(u8, a, "-")) {
             fail(io, "play: unexpected argument '{s}'", .{a});
+        } else if (positional != null) {
+            fail(io, "play: unexpected argument '{s}' (the phrase is already '{s}')", .{ a, positional.? });
+        } else {
+            positional = a;
         }
+    }
+    if (positional) |p| {
+        if (phrase_flagged)
+            fail(io, "play: both '{s}' and --phrase given — use one", .{p});
+        phrase = p;
     }
 
     const opts = kujamba_out.OfflineOpts{

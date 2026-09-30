@@ -149,9 +149,12 @@ real instrument is **control while it runs**.
       disk, with `--play`/`--pattern`/`--bars`/`--bar-ms`/`--seed`, so people can
       use the synth outside a server. Drives the same `Fill`/`Pattern` the
       session plays, so the file is what a listener would have heard.
-- [ ] **Local audition** (#20) — `kujamba play <phrase>` renders and plays through
-      the platform audio path (reuse the compiled-out miniaudio `live` path in
-      `src/ninjam/audio.zig` instead of `afplay`).
+- [x] **Local audition** (#20) — ✅ **landed** (PR #48 + close-out): `kujamba play
+      <phrase>` renders like `render` and plays through the vendored miniaudio
+      device in `src/ninjam/audio.zig` — no `afplay` shell-out. `--device
+      NAME|INDEX` picks the output; a missing device (or a build without
+      `-Dlive`) exits 1 with a clear message. The bare positional phrase the
+      issue names parses now too (`--phrase` still works, one or the other).
 - [ ] **Real-time trigger input** (#21) — a keyboard/MIDI note maps to a phrase or a
       single syllable (`shuzi`) so it can be played like a sampler.
 - [ ] **Config file** (#22) — `kujamba.toml`-style presets for host/user/pattern/
