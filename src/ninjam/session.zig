@@ -59,6 +59,14 @@ pub const Options = struct {
     id_seed: ?u64 = null,
     /// per-interval broadcast plan; false = silence-marker bar (rest bar)
     plan: ?IntervalPlan = null,
+    /// kujamba (#9): called with the verb when a `!kujamba <verb>` transport
+    /// command arrives in room chat, so the app can reshape its plan without
+    /// the session understanding phrases or modes. A mode change lands at the
+    /// next interval boundary (the selection is applied there, not here).
+    /// null = room chat is logged but never acted on.
+    chat_command: ?*const fn (ctx: *anyopaque, verb: kujamba_out.ChatCommand) void = null,
+    /// opaque pointer handed back to `chat_command`
+    chat_ctx: *anyopaque = undefined,
     /// when set, each interval's concatenated 0x84 payload is dumped to
     /// <dir>/interval_NNNN.ogg (byte-identical across runs for a fixed seed)
     payload_dump_dir: ?[]const u8 = null,
@@ -1065,6 +1073,21 @@ pub const Session = struct {
         self.log.line("S>C 0xC0 CHAT {s}: {s} | {s} | {s} | {s}", .{
             p.get(0), p.get(1), p.get(2), p.get(3), p.get(4),
         });
+        // kujamba (#9): route a `!kujamba <verb>` transport command to the app.
+        // The server's 0xC0 layout varies by chat kind, so scan every param for
+        // the command prefix rather than assume an index; the first match wins.
+        // An unrecognized verb is `.none` and simply does nothing, so unknown
+        // commands and ordinary chat are ignored safely.
+        if (self.opts.chat_command) |cb| {
+            var i: usize = 0;
+            while (i < 5) : (i += 1) {
+                const verb = kujamba_out.parseChatCommand(p.get(i));
+                if (verb != .none) {
+                    cb(self.opts.chat_ctx, verb);
+                    break;
+                }
+            }
+        }
     }
 
     // ---- main loop -------------------------------------------------------------------
@@ -1397,4 +1420,112 @@ test "kujamba: a rest bar still rebinds the mode, so a switch while resting land
     try s.startIntervalEncoders();
     // the rest bar applied the new mode even though it uploads no audio
     try std.testing.expectEqual(kujamba_out.Mode.once, fill.mode);
+}
+
+// ---- #9 chat-driven transport ------------------------------------------------
+
+test "kujamba: a !kujamba mode command over 0xC0 lands at the next bar, not mid-bar" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var phrase: [4096]f32 = undefined;
+    for (&phrase, 0..) |*o, i| o.* = @as(f32, @floatFromInt(i % 97)) / 97.0;
+    var fill = kujamba_out.Fill{ .samples = &phrase, .mode = .repeat };
+    const pattern = try kujamba_out.parsePattern("1");
+    var adapter = kujamba_out.PlanAdapter{ .pattern = &pattern, .mode = .repeat, .samples = &phrase };
+
+    // The handler the CLI installs: reshape the plan, let the session apply it.
+    const Handler = struct {
+        fn apply(ctx: *anyopaque, verb: kujamba_out.ChatCommand) void {
+            const a: *kujamba_out.PlanAdapter = @ptrCast(@alignCast(ctx));
+            switch (verb) {
+                .play => a.rest = false,
+                .rest => a.rest = true,
+                .loop => a.mode = .loop,
+                .repeat => a.mode = .repeat,
+                .once => a.mode = .once,
+                .stop => kujamba_out.requestStop(),
+                .none => {},
+            }
+        }
+    };
+
+    var s = try Session.init(alloc, io, .{
+        .srate = @intCast(kujamba_out.sample_rate),
+        .channel_names = &.{"kujamba"},
+        .source = .{ .kujamba = &fill },
+        .id_seed = 42,
+        .plan = .{ .ctx = @ptrCast(&adapter), .selectFor = kujamba_out.PlanAdapter.selectForFn },
+        .chat_command = Handler.apply,
+        .chat_ctx = @ptrCast(&adapter),
+    });
+    defer s.deinit();
+    s.log.quiet = true;
+
+    // Bar 0 is in flight in repeat mode.
+    s.index.grid = 0;
+    try s.startIntervalEncoders();
+    try std.testing.expectEqual(kujamba_out.Mode.repeat, fill.mode);
+
+    // The bandleader types `!kujamba loop` while bar 0 is still going. The 0xC0
+    // layout is chat-kind dependent, so the command sits in the message slot.
+    var chat = Fixed{};
+    try proto.buildChat(&[_][]const u8{ "PRIVMSG", "bandleader", "#band", "!kujamba loop" }, &chat);
+    try s.dispatch(.{ .mtype = proto.MSG_CHAT_MESSAGE, .payload = chat.slice() });
+
+    // The command reached the plan, but the in-flight bar is untouched: this is
+    // the "never mid-bar" property.
+    try std.testing.expectEqual(kujamba_out.Mode.repeat, fill.mode);
+    try std.testing.expectEqual(kujamba_out.Mode.loop, adapter.mode);
+
+    // Bar 1 starts: the selection now carries loop, and it is applied.
+    s.index.grid = 1;
+    try s.startIntervalEncoders();
+    try std.testing.expectEqual(kujamba_out.Mode.loop, fill.mode);
+}
+
+test "kujamba: !kujamba play/rest overrides the pattern at the next bar" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var phrase: [2048]f32 = undefined;
+    for (&phrase, 0..) |*o, i| o.* = @as(f32, @floatFromInt(i % 31)) / 31.0;
+    var fill = kujamba_out.Fill{ .samples = &phrase, .mode = .repeat };
+    // pattern that always plays, so any rest we see comes from the override
+    const pattern = try kujamba_out.parsePattern("1");
+    var adapter = kujamba_out.PlanAdapter{ .pattern = &pattern, .mode = .repeat, .samples = &phrase };
+
+    var s = try Session.init(alloc, io, .{
+        .srate = @intCast(kujamba_out.sample_rate),
+        .channel_names = &.{"kujamba"},
+        .source = .{ .kujamba = &fill },
+        .id_seed = 7,
+        .plan = .{ .ctx = @ptrCast(&adapter), .selectFor = kujamba_out.PlanAdapter.selectForFn },
+        .chat_command = null, // command parsing only; no handler wired
+        .chat_ctx = undefined,
+    });
+    defer s.deinit();
+    s.log.quiet = true;
+
+    // With no handler, a command is logged and ignored — it cannot crash or act.
+    var chat = Fixed{};
+    try proto.buildChat(&[_][]const u8{ "MSG", "!kujamba rest" }, &chat);
+    try s.dispatch(.{ .mtype = proto.MSG_CHAT_MESSAGE, .payload = chat.slice() });
+    try std.testing.expect(adapter.rest == null);
+    try std.testing.expectEqual(@as(u64, 1), s.stats.chat_received);
+
+    // Now the override itself, applied through the plan directly.
+    adapter.rest = true;
+    s.index.grid = 0;
+    try s.startIntervalEncoders();
+    try std.testing.expect(!s.locals[0].broadcast); // forced rest bar
+
+    adapter.rest = false;
+    s.index.grid = 1;
+    try s.startIntervalEncoders();
+    try std.testing.expect(s.locals[0].broadcast); // forced play bar
 }

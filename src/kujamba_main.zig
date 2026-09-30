@@ -222,6 +222,23 @@ const JoinSettings = struct {
     }
 };
 
+/// Apply a `!kujamba <verb>` transport command from room chat to the plan (#9).
+/// Mode/rest changes reshape the plan here; the session picks them up at the next
+/// bar boundary (the selection is applied there), so nothing splices mid-bar.
+/// `stop` reuses the same cooperative-stop path as Ctrl+C.
+fn applyChatCommand(ctx: *anyopaque, verb: kujamba_out.ChatCommand) void {
+    const adapter: *kujamba_out.PlanAdapter = @ptrCast(@alignCast(ctx));
+    switch (verb) {
+        .play => adapter.rest = false,
+        .rest => adapter.rest = true,
+        .loop => adapter.mode = .loop,
+        .repeat => adapter.mode = .repeat,
+        .once => adapter.mode = .once,
+        .stop => kujamba_out.requestStop(),
+        .none => {},
+    }
+}
+
 fn cmdJoin(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: []const []const u8) !void {
     var s = JoinSettings{};
 
@@ -315,6 +332,8 @@ fn cmdJoin(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: [
         .source = .{ .kujamba = &fill },
         .id_seed = s.seed,
         .plan = .{ .ctx = @ptrCast(&adapter), .selectFor = kujamba_out.PlanAdapter.selectForFn },
+        .chat_command = applyChatCommand,
+        .chat_ctx = @ptrCast(&adapter),
         .out_dir = s.out_dir,
         .payload_dump_dir = s.dump_dir,
         .stop_after_intervals = s.intervals,

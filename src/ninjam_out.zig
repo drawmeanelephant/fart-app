@@ -200,12 +200,16 @@ pub const PlanAdapter = struct {
     /// the phrase buffer this plan currently selects. One buffer today; #8
     /// resolves an index into a bank here.
     samples: []const f32 = &.{},
+    /// live broadcast override (#9). null = follow the bar pattern; true =
+    /// force a rest bar (silence markers); false = force a play bar. Set by a
+    /// `!kujamba play|rest` chat command and consumed at the next bar boundary.
+    rest: ?bool = null,
 
     /// Matches `session.IntervalPlan.selectFor`.
     pub fn selectForFn(ctx: *anyopaque, interval_idx: u64) Selection {
         const self: *PlanAdapter = @ptrCast(@alignCast(ctx));
         return .{
-            .broadcast = self.pattern.broadcastFor(interval_idx),
+            .broadcast = if (self.rest) |r| !r else self.pattern.broadcastFor(interval_idx),
             .mode = self.mode,
             .samples = self.samples,
         };
@@ -927,4 +931,50 @@ test "loop mode wraps through zero: the seam is click-free with no crossfade (#1
         const wrap_step = @abs(out[phrase.len] - out[phrase.len - 1]);
         try testing.expect(wrap_step == 0.0);
     }
+}
+
+// ---- chat transport commands (#9) --------------------------------------------
+
+/// A `!kujamba <verb>` transport command from room chat. `none` for anything
+/// unrecognized, so unknown commands are ignored safely.
+pub const ChatCommand = enum { play, rest, loop, repeat, once, stop, none };
+
+/// Parse a `!kujamba <verb>` command out of one room-chat string. The server's
+/// 0xC0 layout varies by chat kind (privmsg vs server vs channel), so the caller
+/// feeds every param and takes the first match rather than assuming an index.
+pub fn parseChatCommand(text: []const u8) ChatCommand {
+    const t = std.mem.trim(u8, text, " \t\r\n");
+    const prefix = "!kujamba ";
+    if (!std.ascii.startsWithIgnoreCase(t, prefix)) return .none;
+    const verb = std.mem.trim(u8, t[prefix.len..], " \t\r\n");
+    if (std.ascii.eqlIgnoreCase(verb, "play")) return .play;
+    if (std.ascii.eqlIgnoreCase(verb, "rest")) return .rest;
+    if (std.ascii.eqlIgnoreCase(verb, "loop")) return .loop;
+    if (std.ascii.eqlIgnoreCase(verb, "repeat")) return .repeat;
+    if (std.ascii.eqlIgnoreCase(verb, "once")) return .once;
+    if (std.ascii.eqlIgnoreCase(verb, "stop")) return .stop;
+    return .none;
+}
+
+test "chat command parsing recognises the transport verbs, case- and space-insensitively" {
+    try testing.expectEqual(ChatCommand.loop, parseChatCommand("!kujamba loop"));
+    try testing.expectEqual(ChatCommand.loop, parseChatCommand("  !KUJAMBA   LOOP  "));
+    try testing.expectEqual(ChatCommand.play, parseChatCommand("!kujamba play"));
+    try testing.expectEqual(ChatCommand.rest, parseChatCommand("!kujamba rest"));
+    try testing.expectEqual(ChatCommand.repeat, parseChatCommand("!kujamba repeat"));
+    try testing.expectEqual(ChatCommand.once, parseChatCommand("!kujamba once"));
+    try testing.expectEqual(ChatCommand.stop, parseChatCommand("!kujamba stop"));
+}
+
+test "chat command parsing ignores everything that is not a known verb" {
+    // unknown verbs, wrong prefix, other users' messages — all safely .none
+    for ([_][]const u8{
+        "!kujamba", // no verb
+        "!kujamba sideways", // unknown verb
+        "!kujamba loop now", // extra words
+        "kujamba loop", // missing !
+        "hello everyone", // ordinary chat
+        "", // empty
+        "!", // lone sigil
+    }) |s| try testing.expectEqual(ChatCommand.none, parseChatCommand(s));
 }
