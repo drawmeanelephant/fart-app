@@ -46,6 +46,14 @@
 //! are corpus entries 13 and 14. That is the point of the arrangement — the
 //! random generator can rediscover those shapes on its own now, and the corpus
 //! pins them whether or not it does.
+//!
+//! A second, quieter bug lived here too: `fakeServer` closed the connection the
+//! moment it finished writing, so every corpus entry that needed a handshake
+//! died in the challenge handler and was reported as a pass. Entries 2-4 were
+//! no-ops for as long as they existed. The lesson generalises past this file —
+//! a corpus entry that no longer reaches the handler it exists to cover is
+//! worse than no entry, because it reads as coverage — so there is now a test
+//! that asserts a live-path stream really goes live.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -71,7 +79,7 @@ test "fuzz the NINJAM dispatch: framing -> parse -> handlers on arbitrary server
 fn fuzzDispatchStep(_: void, smith: *std.testing.Smith) anyerror!void {
     var stream_buf: [max_stream_len]u8 = undefined;
     const n = smith.sliceWithHash(&stream_buf, dispatch_hash);
-    try runDispatchStep(stream_buf[0..n]);
+    _ = try runDispatchStep(stream_buf[0..n]);
 }
 
 // ---- one dispatch step --------------------------------------------------------
@@ -82,7 +90,10 @@ fn fuzzDispatchStep(_: void, smith: *std.testing.Smith) anyerror!void {
 /// directory itself is created.
 const fuzz_out_dir = "zig-cache/fuzz-out";
 
-fn runDispatchStep(stream: []const u8) !void {
+/// Drive one server-side byte stream through a real session and report what the
+/// session made of it. The fuzz target discards the stats; the regression test
+/// below asserts on them, which is the point of returning them.
+fn runDispatchStep(stream: []const u8) !session.Stats {
     const alloc = std.testing.allocator;
     const io = harnessIo();
 
@@ -106,8 +117,11 @@ fn runDispatchStep(stream: []const u8) !void {
     s.log.quiet = true; // transcript off, stderr off: the fuzzer owns the console
 
     // Graceful protocol errors are the parsers doing their job (failSession +
-    // non-zero stats) — not harness failures. Panics, OOB and leaks are.
-    _ = s.run() catch {};
+    // non-zero stats) — not harness failures. Panics, OOB and leaks are. A
+    // session that failed still has a verdict worth reading, so hand back its
+    // stats either way: swallowing them here is what let a broken handshake
+    // look like a passing corpus entry.
+    return s.run() catch s.stats;
 }
 
 fn fuzzOptions(port: u16) session.Options {
@@ -187,6 +201,9 @@ const Listener = struct {
 /// not accept through the io vtable. Everything here is poll-gated instead, so
 /// the stop flag and the deadline can always interrupt it.
 const accept_deadline_waits: u32 = 2000; // ~2 s of 1 ms polls; a live session connects in well under a millisecond
+/// Same idea for the post-write drain: how long to wait for a client that has
+/// gone quiet before giving up on it. Generous next to the 60 ms session cap.
+const read_idle_deadline_polls: u32 = 4000;
 
 fn fakeServer(listener: *Listener, stream: []const u8) void {
     const lfd = listener.server.socket.handle;
@@ -237,9 +254,28 @@ fn fakeServer(listener: *Listener, stream: []const u8) void {
     _ = std.posix.errno(std.posix.system.shutdown(cfd, std.posix.SHUT.WR));
 
     var scratch: [4096]u8 = undefined;
+    var idle_polls: u32 = 0;
     while (true) {
-        const n = std.posix.read(cfd, &scratch) catch return;
-        if (n == 0) return;
+        const n = std.posix.read(cfd, &scratch) catch |e| switch (e) {
+            // The accepted socket is non-blocking, so a read before the client
+            // has said anything returns WouldBlock. That is "not yet", not
+            // "gone": returning here closed the connection the instant the
+            // stream was written, which -- combined with the abort-on-close
+            // above -- reset the client before it could send its 0x80 reply.
+            // Every live-path corpus entry was therefore a silent no-op: the
+            // session died inside the challenge handler, and runDispatchStep's
+            // `catch {}` reported that as a pass.
+            error.WouldBlock => {
+                var fds = [_]std.posix.pollfd{.{ .fd = cfd, .events = std.posix.POLL.IN, .revents = 0 }};
+                _ = std.posix.poll(&fds, 1) catch return;
+                idle_polls += 1;
+                if (idle_polls > read_idle_deadline_polls) return; // client never hung up; bounded, not hung
+                continue;
+            },
+            else => return,
+        };
+        idle_polls = 0;
+        if (n == 0) return; // real EOF: the session closed its end
     }
 }
 
@@ -276,7 +312,7 @@ test "random server bytes through the dispatch (seeded, bounded)" {
     for (0..random_execs) |_| {
         const len = rand.uintAtMost(usize, buf.len);
         rand.bytes(buf[0..len]);
-        try runDispatchStep(buf[0..len]);
+        _ = try runDispatchStep(buf[0..len]);
     }
 }
 
@@ -311,29 +347,24 @@ fn fillCorpus(c: *CorpusBuf) void {
     // 2. a well-formed 0x00 challenge (keepalive caps = 3s, current version):
     //    the only message that moves the session forward; the client replies
     //
-    //    KNOWN GAP (found while pinning #40/#41): the session reads the
-    //    challenge, sends 0x80 AUTH_USER, and then never reaches 0x01 AUTH_OK
-    //    — the handshake stalls, so entries 2, 3 and 4 below are silently
-    //    no-ops and nothing in this corpus exercises the live-session paths
-    //    (interval clock, config re-anchor, finalize). Their comments describe
-    //    what they *intend* to cover. Entries that need no auth (5-14) do run,
-    //    which is why the #40/#41 repros are written without one. Worth its
-    //    own issue: until it is fixed, treat "goes live" as untested here.
+    //    Entries 2-4 used to be silent no-ops: fakeServer closed the instant it
+    //    finished writing, so every session died inside the challenge handler
+    //    and `catch {}` called that a pass. Fixed in fakeServer's read loop;
+    //    the regression test at the bottom of this file is what keeps it
+    //    honest, so these three really do reach the live paths now.
     var ch = StreamBuf{};
     ch.msg(proto.MSG_AUTH_CHALLENGE, &challengePayload(0x00000300, proto.PROTO_VER_CUR)) catch unreachable;
     c.entry(ch.stream());
 
-    // 3. challenge + success 0x01 reply: INTENDED to go live and run to the
-    //    duration cap (no config yet, so the interval clock never starts) —
-    //    but see the known gap above; this stops at the challenge today.
+    // 3. challenge + success 0x01 reply: the session goes live and runs to the
+    //    duration cap (no config yet, so the interval clock never starts)
     var live = StreamBuf{};
     live.msg(proto.MSG_AUTH_CHALLENGE, &challengePayload(0x00000300, proto.PROTO_VER_CUR)) catch unreachable;
     live.msg(proto.MSG_AUTH_REPLY, &authReplyPayload(true, "fuzzer", 8)) catch unreachable;
     c.entry(live.stream());
 
-    // 4. INTENDED to be live + a 0x02 config change: re-anchor, interval clock
-    //    starts, silence encodes for the remainder of the cap. Blocked on the
-    //    same handshake gap as entry 3.
+    // 4. live + a 0x02 config change: re-anchor, interval clock starts, silence
+    //    encodes for the remainder of the cap
     var clocked = StreamBuf{};
     clocked.msg(proto.MSG_AUTH_CHALLENGE, &challengePayload(0x00000300, proto.PROTO_VER_CUR)) catch unreachable;
     clocked.msg(proto.MSG_AUTH_REPLY, &authReplyPayload(true, "fuzzer", 8)) catch unreachable;
@@ -522,6 +553,61 @@ fn appendNulstr(dst: []u8, src: []const u8) usize {
     @memcpy(dst[0..n], src[0..n]);
     dst[n] = 0;
     return n + 1;
+}
+
+// The regression test for the fake server's WouldBlock bug, and the reason
+// `runDispatchStep` hands back its stats.
+//
+// A corpus entry that quietly stops reaching the handler it exists to cover is
+// worse than no entry: it reads as coverage and is not. Entries 2-4 claim to
+// go live, and for a long time none of them did — the server hung up the
+// instant it finished writing, so every session died inside the challenge
+// handler and `catch {}` reported that as a pass. This asserts the property
+// those entries are supposed to have, so it cannot go quiet again.
+test "a live-path stream really goes live: the handshake is not a silent no-op" {
+    const alloc = std.testing.allocator;
+    const io = harnessIo();
+
+    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var listener = Listener.init(try std.Io.net.IpAddress.listen(&addr, io, .{}), io);
+    defer listener.close();
+
+    // Entry 4's stream: challenge, successful auth reply, then a config change
+    // that starts the interval clock. Three frames, in that order.
+    var st = StreamBuf{};
+    st.msg(proto.MSG_AUTH_CHALLENGE, &challengePayload(0x00000300, proto.PROTO_VER_CUR)) catch unreachable;
+    st.msg(proto.MSG_AUTH_REPLY, &authReplyPayload(true, "fuzzer", 8)) catch unreachable;
+    st.msg(proto.MSG_CONFIG_CHANGE_NOTIFY, &configPayload(100, 8)) catch unreachable;
+
+    const srv = try std.Thread.spawn(.{}, fakeServer, .{ &listener, st.stream() });
+    var sess = session.Session.init(alloc, io, fuzzOptions(listener.port())) catch |e| {
+        listener.close();
+        srv.join();
+        return e;
+    };
+    const stats = sess.run() catch sess.stats;
+    sess.deinit(); // close the session socket so the server's read sees EOF
+    srv.join();
+
+    // The config is the THIRD frame, so three dispatched messages is the
+    // difference between "the handshake worked and the clock started" and
+    // "the session died after the challenge". Before the fix this was 1.
+    try std.testing.expect(stats.msgs_recv >= 3);
+    // The client got far enough to answer the challenge (0x80) and announce
+    // its channel (0x82) — i.e. it really authenticated, not just connected.
+    try std.testing.expect(stats.msgs_sent >= 2);
+    // The config was not merely received but *applied*: at 48 kHz, 8 bars to
+    // the minute at 100 bpm is exactly 230400 samples. This is the assertion
+    // that would have caught the bug on its own -- a session that died in the
+    // challenge handler never gets an interval clock at all.
+    //
+    // The final state is `.done`, not `.active`, and that is correct: a finite
+    // stream ends and the server hangs up, so the session reads EOF and fails
+    // itself. Asserting `.active` here would be asserting that the session had
+    // not yet noticed the server was gone.
+    try std.testing.expectEqual(@as(u64, 230400), sess.interval_len_samples);
+    try std.testing.expectEqual(@as(u16, 100), sess.bpm);
+    try std.testing.expectEqual(@as(u16, 8), sess.bpi);
 }
 
 // ---- corpus sanity ---------------------------------------------------------------
