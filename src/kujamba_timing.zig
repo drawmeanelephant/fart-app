@@ -135,6 +135,55 @@ var timing_io: ?std.Io.Threaded = null;
 /// accept-EAGAIN is a zig bug ("errnoBug"), so a non-blocking listener must not
 /// accept through the io vtable. Everything here is poll-gated instead, so the
 /// stop flag and every deadline can interrupt it.
+/// Read from the server's socket until a frame of type `want` arrives, counting
+/// everything read into `view`. Returns false on EOF, error, or deadline.
+///
+/// This replaces a fixed `drain(cfd, view, 200)` at each handshake step. The
+/// fixed budget was the harness's second-largest source of wall-clock
+/// dependence: it slept the full 200 ms twice, so the handshake took 400 ms
+/// before the client could go live, and the client — which polls for readability
+/// every 20 ms and has its own auth timeout — sometimes ran out of session first.
+/// That showed up as `msgs_recv=2` and `bars=0` on the macOS runner about half
+/// the time, with no error and no hint, because the failure was a *missing*
+/// `0x02` rather than a wrong one.
+///
+/// Waiting for the message the server is actually waiting for is both faster
+/// (a loopback round trip, so ~1 ms instead of 400) and a real assertion: the
+/// old code sent the config whether or not the client had registered its
+/// channel, so a client that never sent `0x82` still got a config and still
+/// looked healthy.
+fn readUntilType(cfd: std.posix.socket_t, view: *ServerView, want: u8, deadline_ms: u32) bool {
+    var buf: [8192]u8 = undefined;
+    var len: usize = 0;
+    var waited: u32 = 0;
+    while (waited < deadline_ms) {
+        const n = std.posix.read(cfd, buf[len..]) catch |e| switch (e) {
+            error.WouldBlock => {
+                _ = sleepMs(1);
+                waited += 1;
+                continue;
+            },
+            else => return false,
+        };
+        if (n == 0) return false;
+        view.bytes_read += n;
+        len += n;
+        var off: usize = 0;
+        while (len - off >= 5) {
+            const t = buf[off];
+            const l = std.mem.readInt(u32, buf[off + 1 ..][0..4], .little);
+            if (l > net.max_payload or len - off < 5 + l) break;
+            off += 5 + @as(usize, l);
+            if (t == want) return true;
+        }
+        if (off > 0) {
+            std.mem.copyForwards(u8, buf[0 .. len - off], buf[off..len]);
+            len -= off;
+        }
+    }
+    return false;
+}
+
 fn scriptedServer(listener: *Listener, script: ServerScript, view: *ServerView) void {
     const lfd = listener.server.socket.handle;
     // Shrink the receive window *before* accept: on both macOS and Linux the
@@ -199,9 +248,9 @@ fn scriptedServer(listener: *Listener, script: ServerScript, view: *ServerView) 
     // .active after the auth reply, and it never starts an interval clock
     // until the config arrives.
     if (!sendFrame(cfd, proto.MSG_AUTH_CHALLENGE, &challengePayload())) return;
-    if (!drain(cfd, view, 200)) return;
+    if (!readUntilType(cfd, view, 0x80, 2000)) return;
     if (!sendFrame(cfd, proto.MSG_AUTH_REPLY, &authReplyPayload("kujamba", 8))) return;
-    if (!drain(cfd, view, 200)) return;
+    if (!readUntilType(cfd, view, 0x82, 2000)) return;
 
     const cfg = blackholeConfig{};
     if (!sendFrame(cfd, proto.MSG_CONFIG_CHANGE_NOTIFY, &configPayload(cfg.bpm, cfg.bpi))) return;

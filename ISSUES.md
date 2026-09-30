@@ -479,6 +479,22 @@ to remove the thing it claims to break.
   from a Mac, catches it in about a minute, and is now part of how this was
   checked. Worth more than it sounds: the alternative is another round trip
   through a 10-minute CI job.
+- **A harness that sleeps where it could wait is a test that measures the
+  runner.** The timing harness's scripted server answered each handshake step by
+  sleeping a fixed 200 ms rather than by waiting for the message it needed, so
+  the handshake cost 400 ms before the client could go live, inside a session
+  capped at 4 s. On the macOS runner that failed roughly half the time with
+  `msgs_recv=2` and `bars=0` — the client never received the `0x02` — and no
+  error text anywhere, because the symptom was a *missing* config rather than a
+  wrong one. It now waits for the `0x80` and then the `0x82`, which is both
+  faster (a loopback round trip, ~1 ms rather than 400) and an assertion: the
+  old code sent the config whether or not the client had registered its channel,
+  so a client that never sent `0x82` still looked healthy.
+  Honest caveat: this could not be reproduced on a workstation, with or without
+  the change, even under 8x CPU load — the runner is slower than the machine it
+  would have to be reproduced on, and the only fixed delay on that path was the
+  200 ms sleep. It is the most plausible cause and it cannot be worse, but the
+  evidence that it fixed it is CI going green, not a local reproduction.
 - **The frame walk needs two checks, and testing one of them is easy to mistake
   for testing both.** `walkFrames` stops on a declared length that cannot be
   believed, and separately on a frame that runs past the end of the bytes. Every
