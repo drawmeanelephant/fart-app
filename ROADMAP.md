@@ -77,8 +77,15 @@ real instrument is **control while it runs**.
       whispered.
 - [ ] **Controllable vowel pitch table.** (#16) Let a preset shift the base freqs
       (`vowelBaseFreq`) up/down in cents for different "instruments."
-- [ ] **Loop seam crossfade.** (#17) The 8 ms end fade stops clicks; a short
-      crossfade at the wrap point would make `loop` mode seamless.
+- [x] **Loop seam crossfade.** (#17) ✅ **Already satisfied — no crossfade
+      needed, and adding one regresses.** Measured: the loop wrap is already
+      *exactly* click-free (wrap step 0.000000 on every phrase) because the synth
+      is zero at both ends — the attack term is 0 at t=0 and the decay term is 0
+      at u=1. A crossfade blends the already-zero tail into the head, so the loop
+      ends mid-head then jumps back to head[0]: the wrap step grows to 0.080
+      (5 ms) and 0.250 (2 ms), the latter larger than the biggest natural step in
+      the file. A test now locks in the zero-at-both-ends invariant that makes
+      `loop` seamless.
 - [x] **Onset/decay knobs** (#18) exposed from `voiceSpec` (attack, noise, wobble) so
       the fart can be tuned from clean to chaotic without editing tables. ✅
       **Landed** as `--voice "attack=N,noise=N,wobble=N"` on `join` and `render`:
