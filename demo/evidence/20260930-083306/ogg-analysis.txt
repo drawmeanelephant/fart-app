@@ -1,0 +1,7 @@
+OGG payloads-run1/interval_0000.ogg frames=211680 srate=44100 ch=1 rms=0.077942 peak=0.641482 pass=true
+OGG payloads-run1/interval_0001.ogg frames=211680 srate=44100 ch=1 rms=0.077942 peak=0.641482 pass=true
+OGG payloads-run1/interval_0002.ogg frames=211680 srate=44100 ch=1 rms=0.077942 peak=0.641482 pass=true
+OGG payloads-run1/interval_0004.ogg frames=211680 srate=44100 ch=1 rms=0.077942 peak=0.641482 pass=true
+OGG payloads-run1/interval_0005.ogg frames=211680 srate=44100 ch=1 rms=0.077942 peak=0.641482 pass=true
+OGG demo/evidence/20260930-083306/negative-control-silence.ogg frames=220500 srate=44100 ch=1 rms=0.000000 peak=0.000000 pass=false
+FAIL: rms 0.000000 < 0.020000

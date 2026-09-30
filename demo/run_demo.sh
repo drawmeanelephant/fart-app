@@ -85,9 +85,20 @@ CFG
 
 "$SRV" "$RUNTIME/demo.cfg" -logfile "$EVDIR/server.log" &
 SRVPID=$!
-sleep 0.7
 cleanup() { kill $SRVPID 2>/dev/null; wait $SRVPID 2>/dev/null; }
 trap cleanup EXIT
+
+# Wait for the server to actually listen instead of a blind sleep (#27): on a
+# cold CI runner a fixed 0.7s can race process startup, and both clients fail
+# with an instant loopback ECONNREFUSED — a false red, not a real one.
+echo "== waiting for ninjamsrv to listen on $PORT =="
+server_up=0
+for _ in $(seq 1 50); do
+  if ! kill -0 $SRVPID 2>/dev/null; then fail "ninjamsrv exited during startup (see server.log)"; fi
+  if lsof -nP -iTCP:$PORT -sTCP:LISTEN >/dev/null 2>&1; then server_up=1; break; fi
+  sleep 0.2
+done
+[ "$server_up" -eq 1 ] || fail "ninjamsrv did not listen on $PORT within 10s (see server.log)"
 
 D1="$RUNTIME/payloads-run1"; D2="$RUNTIME/payloads-run2"
 O1="$RUNTIME/out-run1"; O2="$RUNTIME/out-run2"

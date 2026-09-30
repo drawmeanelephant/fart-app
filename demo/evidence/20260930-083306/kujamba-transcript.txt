@@ -1,0 +1,85 @@
+[    0.000] connecting to 127.0.0.1:20531 as kujamba
+[    0.000] connected
+[    0.006] S>C 0x00 CHALLENGE challenge=3aa1887099f8f87e caps=0x00000300 ver=0x00020000 keepalive=3s license=0b
+[    0.006] C>S 0x80 AUTH_USER user=kujamba hash=92c7187d0eada0f4ad60fa79155180f047d9e88e caps=0
+[    0.018] S>C 0x01 AUTH_OK user=kujamba maxchan=8
+[    0.018] C>S 0x82 SET_CHANNEL_INFO n=1
+[    3.033] C>S KEEPALIVE (idle 3015ms)
+[    3.640] S>C 0x02 CONFIG bpm=100 bpi=8
+[    3.642] interval clock started: 211680 samples (4800ms)
+[    3.643] re-anchored to bpm=100 bpi=8: next interval 0 at grid bar 0 (phrase continues)
+[    3.643] S>C 0x03 USERINFO nrecords=1
+[    3.643]   user=refpeer@127.0.0.1 ch=0 active=1 name=refpeer-tone flags=0x00
+[    3.643] C>S 0x81 SET_USERMASK user=refpeer@127.0.0.1 mask=0x00000001
+[    3.643] S>C 0xC0 CHAT TOPIC:  | kujamba (Flatlophone) instrument demo |  | 
+[    3.664] C>S 0x83 UPLOAD_BEGIN guid=3b2e1b88d5771a125a511d8b5c413a2f chidx=0 interval=0
+[    3.664] C>S 0x84 WRITE guid=3b2e1b88d5771a125a511d8b5c413a2f flags=0 bytes=3552
+[    4.444] C>S 0x84 WRITE guid=3b2e1b88d5771a125a511d8b5c413a2f flags=0 bytes=4232
+[    5.328] C>S 0x84 WRITE guid=3b2e1b88d5771a125a511d8b5c413a2f flags=0 bytes=4234
+[    8.333] C>S KEEPALIVE (idle 3004ms)
+[    8.460] C>S 0x84 WRITE guid=3b2e1b88d5771a125a511d8b5c413a2f flags=1 bytes=1438
+[    8.460] payload dump payloads-run1/interval_0000.ogg bytes=13456
+[    8.460] interval 0 complete (grid bar 0, 211680 samples, 4800ms)
+[    8.485] C>S 0x83 UPLOAD_BEGIN guid=d55dc9ea5f7977c472f2c9cb3712748e chidx=0 interval=1
+[    8.485] C>S 0x84 WRITE guid=d55dc9ea5f7977c472f2c9cb3712748e flags=0 bytes=3552
+[    8.536] S>C 0x04 DOWNLOAD_BEGIN user=refpeer@127.0.0.1 ch=0 guid=8ac520805f3657813bd2306fa08527ee fourcc=0x7647474F
+[    9.254] C>S 0x84 WRITE guid=d55dc9ea5f7977c472f2c9cb3712748e flags=0 bytes=4232
+[   10.115] C>S 0x84 WRITE guid=d55dc9ea5f7977c472f2c9cb3712748e flags=0 bytes=4234
+[   11.641] S>C 0x05 WRITE user=refpeer@127.0.0.1 bytes=9216 flags=0 total=9216
+[   11.641] S>C 0x05 WRITE user=refpeer@127.0.0.1 bytes=2814 flags=1 total=12030
+[   11.641] download complete user=refpeer@127.0.0.1 ch=0 bytes=12030 fourcc=0x7647474F
+[   11.645] decoded user=refpeer@127.0.0.1 ch=0 srate=48000 ch=1 frames=230400 rms=0.213522
+[   11.645] wav open out-run1/refpeer_127.0.0.1_ch0.wav (srate=48000)
+[   13.135] C>S KEEPALIVE (idle 3019ms)
+[   13.261] C>S 0x84 WRITE guid=d55dc9ea5f7977c472f2c9cb3712748e flags=1 bytes=1438
+[   13.261] payload dump payloads-run1/interval_0001.ogg bytes=13456
+[   13.261] interval 1 complete (grid bar 1, 211680 samples, 4800ms)
+[   13.286] C>S 0x83 UPLOAD_BEGIN guid=2b75e07e771f0b7da31f0d97c4c6e8da chidx=0 interval=2
+[   13.286] C>S 0x84 WRITE guid=2b75e07e771f0b7da31f0d97c4c6e8da flags=0 bytes=3552
+[   13.508] S>C 0x04 DOWNLOAD_BEGIN user=refpeer@127.0.0.1 ch=0 guid=11fd580de7ae0aabe767dad7f6d348a5 fourcc=0x7647474F
+[   14.053] C>S 0x84 WRITE guid=2b75e07e771f0b7da31f0d97c4c6e8da flags=0 bytes=4232
+[   14.919] C>S 0x84 WRITE guid=2b75e07e771f0b7da31f0d97c4c6e8da flags=0 bytes=4234
+[   16.639] S>C 0x05 WRITE user=refpeer@127.0.0.1 bytes=9216 flags=0 total=9216
+[   16.639] S>C 0x05 WRITE user=refpeer@127.0.0.1 bytes=2814 flags=1 total=12030
+[   16.639] download complete user=refpeer@127.0.0.1 ch=0 bytes=12030 fourcc=0x7647474F
+[   16.644] decoded user=refpeer@127.0.0.1 ch=0 srate=48000 ch=1 frames=230400 rms=0.213522
+[   17.929] C>S KEEPALIVE (idle 3010ms)
+[   18.055] C>S 0x84 WRITE guid=2b75e07e771f0b7da31f0d97c4c6e8da flags=1 bytes=1438
+[   18.056] payload dump payloads-run1/interval_0002.ogg bytes=13456
+[   18.056] interval 2 complete (grid bar 2, 211680 samples, 4800ms)
+[   18.467] S>C 0x04 DOWNLOAD_BEGIN user=refpeer@127.0.0.1 ch=0 guid=ce02670ac402a005ed56d8bbef2611fa fourcc=0x7647474F
+[   21.065] C>S KEEPALIVE (idle 3011ms)
+[   21.641] S>C 0x05 WRITE user=refpeer@127.0.0.1 bytes=9216 flags=0 total=9216
+[   21.641] S>C 0x05 WRITE user=refpeer@127.0.0.1 bytes=2814 flags=1 total=12030
+[   21.641] download complete user=refpeer@127.0.0.1 ch=0 bytes=12030 fourcc=0x7647474F
+[   21.645] decoded user=refpeer@127.0.0.1 ch=0 srate=48000 ch=1 frames=230400 rms=0.213522
+[   22.861] C>S 0x83 SILENCE_MARKER chidx=0
+[   22.861] interval 3 complete (grid bar 3, 211680 samples, 4800ms)
+[   22.885] C>S 0x83 UPLOAD_BEGIN guid=a1b1476baa7c4ae85212c50cdd8698cb chidx=0 interval=4
+[   22.886] C>S 0x84 WRITE guid=a1b1476baa7c4ae85212c50cdd8698cb flags=0 bytes=3552
+[   23.422] S>C 0x04 DOWNLOAD_BEGIN user=refpeer@127.0.0.1 ch=0 guid=51dd89e8e2e90c7cc2af97c7fd76d595 fourcc=0x7647474F
+[   23.655] C>S 0x84 WRITE guid=a1b1476baa7c4ae85212c50cdd8698cb flags=0 bytes=4232
+[   24.520] C>S 0x84 WRITE guid=a1b1476baa7c4ae85212c50cdd8698cb flags=0 bytes=4234
+[   26.642] S>C 0x05 WRITE user=refpeer@127.0.0.1 bytes=9216 flags=0 total=9216
+[   26.642] S>C 0x05 WRITE user=refpeer@127.0.0.1 bytes=2814 flags=1 total=12030
+[   26.642] download complete user=refpeer@127.0.0.1 ch=0 bytes=12030 fourcc=0x7647474F
+[   26.647] decoded user=refpeer@127.0.0.1 ch=0 srate=48000 ch=1 frames=230400 rms=0.213522
+[   27.531] C>S KEEPALIVE (idle 3011ms)
+[   27.656] C>S 0x84 WRITE guid=a1b1476baa7c4ae85212c50cdd8698cb flags=1 bytes=1438
+[   27.657] payload dump payloads-run1/interval_0004.ogg bytes=13456
+[   27.657] interval 4 complete (grid bar 4, 211680 samples, 4800ms)
+[   27.681] C>S 0x83 UPLOAD_BEGIN guid=47bd838d0e2b425f28428dd694112703 chidx=0 interval=5
+[   27.681] C>S 0x84 WRITE guid=47bd838d0e2b425f28428dd694112703 flags=0 bytes=3552
+[   28.400] S>C 0x04 DOWNLOAD_BEGIN user=refpeer@127.0.0.1 ch=0 guid=de1a7d9c40d7e6a8598ca54bce3cd01d fourcc=0x7647474F
+[   28.463] C>S 0x84 WRITE guid=47bd838d0e2b425f28428dd694112703 flags=0 bytes=4232
+[   29.326] C>S 0x84 WRITE guid=47bd838d0e2b425f28428dd694112703 flags=0 bytes=4234
+[   31.640] S>C 0x05 WRITE user=refpeer@127.0.0.1 bytes=9216 flags=0 total=9216
+[   31.640] S>C 0x05 WRITE user=refpeer@127.0.0.1 bytes=2814 flags=1 total=12030
+[   31.640] download complete user=refpeer@127.0.0.1 ch=0 bytes=12030 fourcc=0x7647474F
+[   31.644] decoded user=refpeer@127.0.0.1 ch=0 srate=48000 ch=1 frames=230400 rms=0.213522
+[   32.341] C>S KEEPALIVE (idle 3015ms)
+[   32.447] C>S 0x84 WRITE guid=47bd838d0e2b425f28428dd694112703 flags=1 bytes=1438
+[   32.448] payload dump payloads-run1/interval_0005.ogg bytes=13456
+[   32.448] interval 5 complete (grid bar 5, 211680 samples, 4800ms)
+[   32.451] wav out-run1/refpeer_127.0.0.1_ch0.wav frames=1152000 srate=48000 rms=0.213501 peak=0.318756
+[   32.452] session end: ok=true

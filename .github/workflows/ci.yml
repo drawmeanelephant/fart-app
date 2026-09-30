@@ -5,7 +5,9 @@
 # keeps the check context name `build-test` (the one main's ruleset requires —
 # see the JSON below) and additionally proves the fart app itself runs on
 # Linux (`fart kujamba`, silent mode when the runner has no audio player):
-#   {"type":"required_status_checks","parameters":{"required_checks":[{"context":"build-test"}],"strict_required_status_checks_policy":false}}
+#   {"type":"required_status_checks","parameters":{"required_checks":[{"context":"build-test"},{"context":"demo-e2e"}],"strict_required_status_checks_policy":false}}
+# (demo-e2e is the live reference-server gate from #27; verify exact
+# context names from real runs before adding them).
 #
 # Steps per OS:
 #   zig build                              (Debug)
@@ -130,3 +132,100 @@ jobs:
             exit 1
           fi
           echo "kujamba smoke ok"
+
+  demo-e2e:
+    name: demo-e2e
+    needs: build-test-macos
+    # #27: the live reference-server demo gates merges — kujamba joins the
+    # UNMODIFIED reference ninjamsrv, refpeer (reference client core) receives
+    # and decodes, determinism re-run + negative control, per demo/run_demo.sh.
+    # Runs after the unit-test job; the reference build (checkout, ninjamsrv,
+    # client core, refpeer) is cached on the reference main SHA + the refpeer
+    # source hash, so steady-state wall time is one demo run, not a C++ build.
+    # No restore-keys fallback on purpose: a stale reference binary under a
+    # new SHA would test the wrong server and still look green.
+    runs-on: macos-latest
+    timeout-minutes: 30
+    env:
+      KUJ_RUNTIME: ${{ github.workspace }}/demo-runtime
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Zig (direct tarball from ziglang.org)
+        run: |
+          set -euo pipefail
+          tarball="zig-aarch64-macos-${ZIG_VERSION}.tar.xz"
+          url="https://ziglang.org/download/${ZIG_VERSION}/${tarball}"
+          echo "downloading $url"
+          curl -fsSL "$url" -o "$tarball"
+          # checksum from https://ziglang.org/download/index.json
+          echo "b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489  ${tarball}" | shasum -a 256 -c -
+          tar -xf "$tarball"
+          echo "${GITHUB_WORKSPACE}/zig-aarch64-macos-${ZIG_VERSION}" >> "$GITHUB_PATH"
+
+      - name: Compute reference build cache key
+        id: refkey
+        run: |
+          set -euo pipefail
+          REF_SHA=$(git ls-remote https://github.com/drawmeanelephant/ninjam refs/heads/main | cut -f1)
+          KEY="ninjam-ref-${REF_SHA}-${{ hashFiles('demo/refpeer.cpp') }}"
+          echo "sha=${REF_SHA}" >> "$GITHUB_OUTPUT"
+          echo "key=${KEY}" >> "$GITHUB_OUTPUT"
+          echo "cache key: ${KEY}"
+
+      - name: Restore reference build
+        id: refcache
+        uses: actions/cache@v4
+        with:
+          # everything run_demo.sh skips when already present under KUJ_RUNTIME
+          path: |
+            demo-runtime/ninjam-src
+            demo-runtime/srv-build
+            demo-runtime/core-build
+            demo-runtime/refpeer
+          key: ${{ steps.refkey.outputs.key }}
+
+      - name: Build reference server + client core + refpeer (cache miss only)
+        if: steps.refcache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          RT="${KUJ_RUNTIME}"
+          mkdir -p "$RT"
+          if [ ! -d "$RT/ninjam-src/.git" ]; then
+            git clone --depth 1 https://github.com/drawmeanelephant/ninjam "$RT/ninjam-src"
+          fi
+          echo "reference sha: $(git -C "$RT/ninjam-src" rev-parse HEAD) (expected ${{ steps.refkey.outputs.sha }})"
+          if [ ! -x "$RT/srv-build/bin/ninjamsrv" ]; then
+            cmake -S "$RT/ninjam-src" -B "$RT/srv-build" -DCMAKE_BUILD_TYPE=Release -DNINJAM_BUILD_CLIENT=OFF -DNINJAM_BUILD_TESTS=OFF
+            cmake --build "$RT/srv-build" -j 4
+          fi
+          if [ ! -f "$RT/core-build/libninjam_core.a" ]; then
+            cmake -S "$RT/ninjam-src" -B "$RT/core-build" -DCMAKE_BUILD_TYPE=Release -DNINJAM_BUILD_CLIENT=OFF -DNINJAM_BUILD_TESTS=OFF
+            cmake --build "$RT/core-build" -j 4
+          fi
+          if [ ! -x "$RT/refpeer" ]; then
+            VOR="$RT/core-build/_deps/vorbis-src"; OGGS="$RT/core-build/_deps/ogg-src"
+            clang++ -std=c++17 -O2 demo/refpeer.cpp -I"$RT/ninjam-src" \
+              -I"$OGGS/include" -I"$VOR/include" -I"$VOR/lib" \
+              "$RT/core-build/libninjam_core.a" "$RT/core-build/libninjam_net.a" \
+              "$RT/core-build/_deps/vorbis-build/lib/libvorbisenc.a" \
+              "$RT/core-build/_deps/vorbis-build/lib/libvorbis.a" \
+              "$RT/core-build/_deps/ogg-build/libogg.a" \
+              -framework CoreFoundation -framework CoreServices \
+              -o "$RT/refpeer"
+          fi
+          echo "reference build ready:"
+          ls -l "$RT/srv-build/bin/ninjamsrv" "$RT/refpeer"
+
+      - name: Run the live demo (gates merges, #27)
+        run: bash demo/run_demo.sh
+
+      - name: Upload demo evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: demo-evidence-${{ github.run_id }}
+          path: demo/evidence/
+          if-no-files-found: warn
+          retention-days: 14
