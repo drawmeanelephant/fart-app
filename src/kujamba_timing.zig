@@ -233,11 +233,43 @@ fn scriptedServer(listener: *Listener, script: ServerScript, view: *ServerView) 
 }
 
 /// One framed message. Returns false on a dead connection.
+///
+/// Note the two halves are written with `writeAllFrame`, not `rawSend`. The
+/// first version of this used `rawSend(...) != null`, which is wrong in a way
+/// that only shows up on a loaded machine: `rawSend` returns `0` for EAGAIN as
+/// well as for a real write, so a partial write looked like success. A 5-byte
+/// header followed by a body that never arrived leaves the peer inside
+/// `ensureBuffered`, waiting on a message it was told was longer than the bytes
+/// that followed — so the client never sees the `0x02` and the session idles to
+/// its duration cap. Measured on CI as `msgs_recv=2` with `bars=0` and no other
+/// symptom: the handshake appeared to work, because it did. The retry below is
+/// bounded rather than a `while (true)`, because the harness must not be able to
+/// hang the test it exists to measure.
 fn sendFrame(fd: std.posix.socket_t, mtype: u8, payload: []const u8) bool {
     var hdr: [5]u8 = undefined;
     hdr[0] = mtype;
     std.mem.writeInt(u32, hdr[1..5], @intCast(payload.len), .little);
-    return rawSend(fd, &hdr) != null and rawSend(fd, payload) != null;
+    return writeAllFrame(fd, &hdr) and writeAllFrame(fd, payload);
+}
+
+/// `sendFrameEagainSpins` retries of 1 ms before giving up on a full socket.
+const sendFrameEagainSpins: u32 = 2000;
+
+fn writeAllFrame(fd: std.posix.socket_t, bytes: []const u8) bool {
+    var off: usize = 0;
+    var spins: u32 = 0;
+    while (off < bytes.len) {
+        const n = rawSend(fd, bytes[off..]) orelse return false;
+        if (n == 0) {
+            spins += 1;
+            if (spins > sendFrameEagainSpins) return false;
+            _ = sleepMs(1);
+            continue;
+        }
+        off += n;
+        spins = 0;
+    }
+    return true;
 }
 
 fn rawSend(fd: std.posix.socket_t, bytes: []const u8) ?usize {
