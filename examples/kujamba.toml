@@ -23,3 +23,5 @@ pattern = "3+1"                       # 3 fart bars, then 1 rest bar
 attack = 1.0                          # e.g. 0.5 = snappier onsets
 noise = 1.0                           # e.g. 0    = clean, no attack splat
 wobble = 1.0                          # e.g. 2    = twice the flutter depth
+intensity = 1.0                       # #15: 0.25..4 — whisper to shout
+cents = 0                             # #16: ±1200 — shift every vowel pitch
