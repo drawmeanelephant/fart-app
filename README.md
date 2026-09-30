@@ -113,6 +113,13 @@ Split examples: `habari` → ha·ba·ri · `yako` → ya·ko · `asante` → a·
 | o | 86 |
 | u | 74 |
 
+The whole table transposes together: `--voice cents=N` shifts every base
+frequency by `2^(N/1200)` — 100 cents is one semitone, ±1200 the full octave
+the knob allows — so a preset can pick a different "instrument" without
+touching the character tables. The breath tail's 88 Hz carrier shifts with the
+same offset; the wordless `shuzi` rumbles do not (they have no vowels and
+their pitch is random by design).
+
 ### Onset class → attack / decay character
 
 | Class | Consonants | Attack | Noise mix | Wobble | Level |
@@ -137,29 +144,50 @@ one number.
 | `attack` | `attack_s` | 0.5 ms – 200 ms | at 0 the first sample computes `0/0`, and `NaN` → i16 is a panic |
 | `noise` | `noise_mix` | 0 – 1 | past 1 it is the same noise, just clipped |
 | `wobble` | `wobble_depth` | 0 – 1 | past 2, `wob = 1 - depth·(…)` goes negative and **flips the waveform's polarity** — that is distortion, not chaos |
+| `intensity` | level + `noise_mix` + the stress boost | 0.25 – 4 | below 0.25 the phrase stops being audible (0 would be exactly silent); past 4 the shout sits pinned at the 0.95 sample ceiling |
+| `cents` | every vowel's base freq | ±1200 cents | one octave either way; beyond that the buzzy oscillator leaves the instrument's register |
 
 `wobble_hz` is deliberately not a knob: the wobble knob is on how *deep* the
 flutter is, and the rate is part of each class's character.
 
+#### Effort: shouting and whispering (`intensity`, #15)
+
+`intensity` is vocal effort, and it moves three things together so a phrase
+can be shouted or whispered with one number:
+
+- **Level** scales by the effort, on every syllable including the breath tail.
+- **The noise mix scales with it** — a shout is splattier, a whisper a small
+  clean toot — clamped to the same 0–1 window the `noise` knob has.
+- **The stress emphasis rides on it**: the penultimate syllable's boost is
+  `1.2 × effort`, clamped to 1.0–2.4. A shout pushes the stressed syllable
+  past the stock emphasis (capped at twice stock, where it just clips); a
+  whisper below effort ≈ 0.83 flattens the word's dynamics entirely — a
+  whispered word has no stressed syllable.
+
+Parsed values are squeezed into 0.25–4 when applied, the same way `attack=0`
+becomes 0.5 ms, so a preset can never mute the instrument.
+
 ```bash
-# today's sound, exactly — every axis at 1
-./zig-out/bin/kujamba render --phrase "kujamba karibu" --out a.wav
+# shouted
+./zig-out/bin/kujamba render --phrase "kujamba karibu" --out shout.wav \
+  --voice "intensity=2.5"
 
-# clean and pure: no noise, no flutter, faster onset
-./zig-out/bin/kujamba render --phrase "kujamba karibu" --out clean.wav \
-  --voice "noise=0,wobble=0,attack=0.5"
+# whispered
+./zig-out/bin/kujamba render --phrase "kujamba karibu" --out whisper.wav \
+  --voice "intensity=0.4"
 
-# chaotic
-./zig-out/bin/kujamba render --phrase "kujamba karibu" --out wild.wav \
-  --voice "noise=2,wobble=2,attack=3"
+# a bassoon instead of the stock butt: one octave down
+./zig-out/bin/kujamba render --phrase "kujamba karibu" --out low.wav \
+  --voice "cents=-1200"
 ```
 
 **Leaving the knobs alone reproduces today's sound bit for bit.** That is
 asserted, not assumed: `src/golden.zig` pins the rendered audio of four phrases
 and three shuzi seeds, and all seven fingerprints pass unchanged with this
 feature in place. `x * 1.0` is exact in IEEE-754, so the default `1.0` on every
-axis is a true identity — which also means a saved preset that spells out
-`attack=1,noise=1,wobble=1` is also byte-identical.
+multiplier (and `0` on `cents`, whose factor is pinned at exactly 1.0) is a
+true identity — which also means a saved preset that spells out
+`attack=1,noise=1,wobble=1,intensity=1,cents=0` is also byte-identical.
 
 ### Timing policy (syllable count sets total duration)
 
@@ -321,6 +349,7 @@ cp examples/kujamba.toml kujamba.toml
 | `phrase` | string | the Swahili phrase (join + render) |
 | `pattern` | string | exactly `--pattern`'s syntax (`"3+1"`) |
 | `[voice] attack / noise / wobble` | numbers | the #18 knobs as multipliers, 1 = stock sound; axes the file leaves alone stay at 1 |
+| `[voice] intensity / cents` | numbers | #15/#16: vocal effort (0.25–4, 1 = stock) and a cents shift on the vowel pitches (±1200, 0 = stock); see the tuning tables above |
 
 A `--voice` flag replaces the whole `[voice]` table (it is a complete spec, as
 on the command line), and a `--host` flag without a port replaces the host name

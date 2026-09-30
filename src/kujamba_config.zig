@@ -21,6 +21,8 @@
 //!     attack = 1.0                  # 1 on every axis is the stock sound
 //!     noise  = 0.5
 //!     wobble = 2
+//!     intensity = 1.5               # #15: whisper 0.25 .. shout 4
+//!     cents = -700                  # #16: shift the vowel pitches a fifth down
 //!     [map]                         # the #21 sampler: note -> sound
 //!     note60 = "kujamba karibu"     # a phrase (quotes required for spaces)
 //!     note64 = shuzi:3              # a single wordless fart by seed
@@ -293,28 +295,30 @@ pub fn parse(text_in: []const u8, diag: *Diag) ParseError!Config {
             cfg.pattern = kujamba_out.parsePattern(value) catch
                 return diag.fail(line_no, error.BadPattern, "bad pattern '{s}' (want N or N+M)", .{value});
         } else if (std.mem.eql(u8, key, "voice")) {
-            return diag.fail(line_no, error.UnknownKey, "unknown key 'voice' (set [voice] attack/noise/wobble)", .{});
+            return diag.fail(line_no, error.UnknownKey, "unknown key 'voice' (set [voice] attack/noise/wobble/intensity/cents)", .{});
         } else if (std.mem.startsWith(u8, key, "voice.")) {
             const knob = key["voice.".len..];
             if (knob.len == 0 or std.mem.indexOfScalar(u8, knob, '.') != null)
                 return diag.fail(line_no, error.UnknownKey, "unknown key '{s}'", .{key});
             try setKnob(&cfg, knob, value, line_no, &seen_knobs, diag);
         } else {
-            return diag.fail(line_no, error.UnknownKey, "unknown key '{s}' (want host, user, pass, phrase, pattern or voice.attack/noise/wobble)", .{key});
+            return diag.fail(line_no, error.UnknownKey, "unknown key '{s}' (want host, user, pass, phrase, pattern or voice.attack/noise/wobble/intensity/cents)", .{key});
         }
     }
     return cfg;
 }
 
-const Knob = enum(u2) { attack, noise, wobble };
+const Knob = enum(u3) { attack, noise, wobble, intensity, cents };
 
 fn knobBit(k: Knob) u8 {
     return @as(u8, 1) << @intCast(@intFromEnum(k));
 }
 
 /// One voice knob from config text, with parseKnobs' own rules for --voice:
-/// a finite, non-negative multiplier. The synth clamps to the spec bounds when
-/// the knobs are applied, so no range check is needed here.
+/// a finite, non-negative multiplier — except `cents` (#16), which is an
+/// offset in cents and the one knob a negative value is meaningful for. The
+/// synth clamps to the spec bounds when the knobs are applied, so no range
+/// check is needed here.
 fn setKnob(cfg: *Config, key: []const u8, value: []const u8, line_no: usize, seen: *u8, diag: *Diag) ParseError!void {
     const k: Knob = if (std.mem.eql(u8, key, "attack"))
         .attack
@@ -322,8 +326,12 @@ fn setKnob(cfg: *Config, key: []const u8, value: []const u8, line_no: usize, see
         .noise
     else if (std.mem.eql(u8, key, "wobble"))
         .wobble
+    else if (std.mem.eql(u8, key, "intensity"))
+        .intensity
+    else if (std.mem.eql(u8, key, "cents"))
+        .cents
     else
-        return diag.fail(line_no, error.UnknownKey, "unknown [voice] key '{s}' (want attack, noise or wobble)", .{key});
+        return diag.fail(line_no, error.UnknownKey, "unknown [voice] key '{s}' (want attack, noise, wobble, intensity or cents)", .{key});
 
     const bit = knobBit(k);
     if (seen.* & bit != 0) return diag.dup(line_no, key);
@@ -333,13 +341,15 @@ fn setKnob(cfg: *Config, key: []const u8, value: []const u8, line_no: usize, see
         return diag.fail(line_no, error.BadVoiceValue, "voice.{s} must be a number (got '{s}')", .{ key, value });
     if (!std.math.isFinite(v))
         return diag.fail(line_no, error.BadVoiceValue, "voice.{s} must be finite (got '{s}')", .{ key, value });
-    if (v < 0)
+    if (v < 0 and k != .cents)
         return diag.fail(line_no, error.BadVoiceValue, "voice.{s} must be >= 0 (got '{s}'; knobs are multipliers)", .{ key, value });
 
     switch (k) {
         .attack => cfg.knobs.attack = v,
         .noise => cfg.knobs.noise = v,
         .wobble => cfg.knobs.wobble = v,
+        .intensity => cfg.knobs.intensity = v,
+        .cents => cfg.knobs.cents = v,
     }
 }
 
@@ -397,6 +407,8 @@ test "a full config file parses into typed values" {
         \\attack = 2
         \\noise = 0.5
         \\wobble = 3
+        \\intensity = 1.5
+        \\cents = -700
         \\
     );
     try testing.expectEqualStrings("nas.example.com", cfg.host.?);
@@ -408,6 +420,8 @@ test "a full config file parses into typed values" {
     try testing.expectEqual(@as(f32, 2.0), cfg.knobs.attack);
     try testing.expectEqual(@as(f32, 0.5), cfg.knobs.noise);
     try testing.expectEqual(@as(f32, 3.0), cfg.knobs.wobble);
+    try testing.expectEqual(@as(f32, 1.5), cfg.knobs.intensity);
+    try testing.expectEqual(@as(f32, -700.0), cfg.knobs.cents);
 }
 
 test "host carries the port and IPv6 brackets exactly like --host" {
@@ -443,6 +457,26 @@ test "knobs the file leaves alone stay at 1 (the identity)" {
     try testing.expectEqual(@as(f32, 1.0), cfg.knobs.attack);
     try testing.expectEqual(@as(f32, 0.0), cfg.knobs.noise);
     try testing.expectEqual(@as(f32, 1.0), cfg.knobs.wobble);
+    // the #15/#16 axes share the identity rule: intensity 1, cents 0
+    try testing.expectEqual(@as(f32, 1.0), cfg.knobs.intensity);
+    try testing.expectEqual(@as(f32, 0.0), cfg.knobs.cents);
+}
+
+test "intensity and cents ride the same [voice] table (#15, #16)" {
+    const table = parseOk("[voice]\nintensity = 0.5\ncents = -700\n");
+    try testing.expectEqual(@as(f32, 0.5), table.knobs.intensity);
+    try testing.expectEqual(@as(f32, -700.0), table.knobs.cents);
+
+    const dotted = parseOk("voice.intensity = 2\nvoice.cents = 1200\n");
+    try testing.expectEqual(@as(f32, 2.0), dotted.knobs.intensity);
+    try testing.expectEqual(@as(f32, 1200.0), dotted.knobs.cents);
+
+    // cents is an offset, so a negative value is fine — but intensity is a
+    // multiplier and negative is rejected like every other knob
+    try expectParseError(error.BadVoiceValue, "[voice]\nintensity = -1\n", 2, "voice.intensity must be >= 0");
+    try expectParseError(error.BadVoiceValue, "[voice]\ncents = nan\n", 2, "voice.cents must be finite");
+    try expectParseError(error.BadVoiceValue, "[voice]\ncents = quiet\n", 2, "voice.cents must be a number (got 'quiet')");
+    try expectParseError(error.DuplicateKey, "[voice]\ncents = 1\ncents = 2\n", 3, "'cents' appears twice");
 }
 
 test "comments, blank lines and CRLF line endings are ignored" {
