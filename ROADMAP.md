@@ -169,7 +169,7 @@ real instrument is **control while it runs**.
 
 ## Testing status (this pass)
 
-- Unit suites: **175/175 pass** (`zig build test`) — audit + synth + **golden
+- Unit suites: **176/176 pass** (`zig build test`) — audit + synth + **golden
   fingerprints** + kujamba glue + the vendored NINJAM modules + the M5 timing
   harness, in five targets. Synth tests are fail-against-silence enforced. Also
   green under `-Doptimize=ReleaseSafe`, which is the mode the demo builds in,

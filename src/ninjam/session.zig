@@ -2088,6 +2088,90 @@ test "kujamba: one lost bar is counted once, however many channels were on it (#
     try std.testing.expectEqual(@as(u64, 1), s.index.seq);
 }
 
+// #14: the clock keeps walking while every bar is refused.
+//
+// This is the property, stated deterministically. The end-to-end harness can
+// only observe it through a real-time session, which makes the result a
+// function of how fast the machine can encode — it produced 4 bars on a
+// workstation and 1 on a loaded CI runner for the same code. Driving
+// `finalizeInterval` directly removes the wall clock entirely: no timing, no
+// runner dependence, and the assertion can be as strong as the claim.
+//
+// The pre-fix failure was that `finalizeInterval` never *returned* from the
+// second bar onward. Here it returns for every bar, and the grid advances once
+// per bar, so the count of dropped bars and the count of bars the clock walked
+// are the same number.
+test "kujamba: the clock keeps walking while every bar is refused (#14)" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var phrase = [_]f32{0.1} ** 4096;
+    var bank = try onePhraseBank(alloc, &phrase);
+    defer bank.deinit();
+    var fill = kujamba_out.Fill{ .mode = .loop };
+    fill.bind(.loop, bank.active());
+    const pattern = try kujamba_out.parsePattern("1");
+    var adapter = kujamba_out.PlanAdapter{ .pattern = &pattern, .bank = &bank };
+
+    const fds = try saturatedSocketPair();
+    defer _ = std.posix.errno(std.posix.system.close(fds[1]));
+    var s = try Session.init(alloc, io, .{
+        .srate = 48000,
+        .channel_names = &.{"kujamba"},
+        .source = .{ .kujamba = &fill },
+        .id_seed = 42,
+        .plan = .{ .ctx = @ptrCast(&adapter), .selectFor = kujamba_out.PlanAdapter.selectForFn },
+    });
+    defer s.deinit();
+    s.conn = .{ .io = io, .fd = fds[0] };
+    s.log.quiet = true;
+    s.state = .active;
+    s.bpm = 120;
+    s.bpi = 4;
+    s.interval_len_samples = 96000;
+    s.interval_start_ns = clock.nowNs(io);
+    s.timing.anchor(s.interval_start_ns, s.bpm, s.bpi);
+    try s.startIntervalEncoders();
+
+    // the peer stops reading and never comes back
+    var junk: [4096]u8 = undefined;
+    @memset(&junk, 0xA5);
+    _ = fillUntilBlocked(fds[0], &junk);
+
+    const bars = 12;
+    var block: [960]f32 = undefined;
+    for (&block, 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i)) * 0.05) * 0.5;
+    const t0 = clock.nowNs(io);
+    for (0..bars) |_| {
+        for (s.locals) |*lc| {
+            var out: std.ArrayList(u8) = .empty;
+            defer out.deinit(alloc);
+            try lc.enc.?.encode(&block, &out);
+            try lc.pending.add(out.items);
+        }
+        try s.finalizeInterval();
+    }
+    const elapsed_ms = @divTrunc(clock.nowNs(io) - t0, std.time.ns_per_ms);
+
+    // every bar was lost ...
+    try std.testing.expectEqual(@as(u64, bars), s.stats.intervals_dropped);
+    try std.testing.expectEqual(@as(u64, 0), s.stats.intervals_uploaded);
+    // ... and the clock walked every one of them anyway: identity AND grid
+    // position both advance, because a bar that was never uploaded still happened
+    try std.testing.expectEqual(@as(u64, bars), s.index.seq);
+    try std.testing.expectEqual(@as(u64, bars), s.index.grid);
+    // the grid advanced monotonically, a bounded step at a time, the whole way
+    var prev = s.timing.boundaryNs(0);
+    for (1..bars + 1) |k| {
+        try std.testing.expect(s.timing.boundaryNs(k) > prev);
+        prev = s.timing.boundaryNs(k);
+    }
+    // and twelve refused uploads cost milliseconds, not minutes
+    try std.testing.expect(elapsed_ms < 500);
+}
+
 test "kujamba: the session recovers and uploads the next bar once the peer drains (#14)" {
     const alloc = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(alloc, .{});

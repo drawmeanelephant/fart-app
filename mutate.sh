@@ -197,6 +197,18 @@ run src/ninjam/session.zig \
 '            if (lc.broadcast) {' \
 "#14: keep sending after a channel was dropped" 15
 
+# ============ #14: the clock must walk through refused bars ===================
+
+run src/ninjam/session.zig \
+'        self.drop_marked = false;' \
+'        self.drop_marked = true;' \
+"#14: only the first refused bar of a run is counted" 15
+
+run src/ninjam/session.zig \
+'        self.index.complete();' \
+'        self.index.seq += 1;' \
+"#14: the grid stops advancing on a refused bar" 16
+
 echo "=== reverted: the suite must be green again ==="
 restore
 zig build test --summary all 2>&1 | grep -E "^Build Summary:" | tail -1

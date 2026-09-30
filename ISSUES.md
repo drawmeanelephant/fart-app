@@ -8,7 +8,7 @@ The dependency edges below are also encoded as GitHub `blocked-by` relations on
 the issues themselves, so `gh issue view 12` shows them without reading this.
 
 **State at time of writing:** 4 milestones (M4–M8), M4 complete and M5 complete
-(#13 + #14 landed together). `zig build test` → **175/175 pass** in five suites,
+(#13 + #14 landed together). `zig build test` → **176/176 pass** in five suites,
 in Debug, ReleaseSafe and `-Dlive=false`. CI gates pushes and PRs (build + test,
 `build-test`, on Linux); it is not yet required by `main`'s ruleset, and it does
 not yet run the live demo (#27).
@@ -226,7 +226,8 @@ and landing Linux first.
 `./mutate.sh` breaks one guard at a time and reports which tests went red. It
 exists because **a test that passes whether or not the guard is present is worse
 than no test** — it reads as coverage and is not — and because "I wrote a test
-for it" is not evidence that the test *bites*. It reports four outcomes
+for it" is not evidence that the test *bites*. All sixteen mutations are
+caught. It reports four outcomes
 (`CAUGHT` / `SURVIVED` / `NO-OP` / `BUILD ERROR`), restores every file
 afterwards, and ends with a clean `zig build test` so the evidence ends where it
 should: reverted, still green.
@@ -244,6 +245,14 @@ Three things it caught that reading the code did not:
   !lc.dropped)` invisible — both conjuncts agreed on every input the tests could
   produce. The two-channel test is what closes it, and it exists now for the
   accounting: a bar the room did not hear is one lost bar, not one per channel.
+- The **loopback** measurement turned out to be asserting the runner's encode
+  throughput rather than the code's behaviour: the same code produced 4 bars in
+  4 s on a workstation and 1 on a loaded macOS runner, and the first two floors I
+  picked (`>= 3`, then `>= 2`) were both really fitting the test to the machine.
+  The property it was standing in for — *the clock keeps walking through
+  refused bars* — is now asserted deterministically by driving `finalizeInterval`
+  twelve times against a blocked socket and counting: no wall clock, no runner,
+  and a claim strong enough to mutate.
 - One survivor turned out to be **redundant code**, not a test gap:
   `intervals_broadcast` is only accumulated on the `else` of `if (dropped_here)`,
   so `!lc.dropped` in the line above can never matter. It stays — a correct local
