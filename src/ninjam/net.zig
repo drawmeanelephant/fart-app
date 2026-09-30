@@ -425,7 +425,13 @@ const so_nwrite: u32 = 0x1024;
 /// `TIOCOUTQ` in the asm-generic Linux encoding, `_IOR('t', 17, int)`.
 const tiocoutq_linux: c_ulong = 0x5411;
 
-extern "c" fn ioctlTIOCOUTQ(fd: c_int, request: c_ulong, arg: *i32) c_int;
+// Bound to the real libc `ioctl` symbol, and that is deliberate: Zig resolves
+// an `extern` declaration by *name*, so a plausible-looking name like
+// `ioctlTIOCOUTQ` compiles cleanly on macOS — where this branch is dead code and
+// never referenced — and then fails at link time on Linux with
+// "undefined symbol: ioctlTIOCOUTQ". The failure is build-only, and only on the
+// one platform that takes this path, which is a good way to lose an afternoon.
+extern "c" fn ioctl(fd: c_int, request: c_ulong, arg: *i32) c_int;
 
 fn sockoptI32(fd: std.posix.socket_t, optname: u32) ?i32 {
     var v: i32 = 0;
@@ -450,7 +456,7 @@ fn outqBytes(fd: std.posix.socket_t) ?usize {
     var q: ?i32 = switch (builtin.os.tag) {
         .linux => blk: {
             var v: i32 = 0;
-            if (std.posix.errno(ioctlTIOCOUTQ(fd, tiocoutq_linux, &v)) != .SUCCESS) break :blk null;
+            if (std.posix.errno(ioctl(fd, tiocoutq_linux, &v)) != .SUCCESS) break :blk null;
             break :blk v;
         },
         .macos, .ios, .tvos, .watchos => sockoptI32(fd, so_nwrite),

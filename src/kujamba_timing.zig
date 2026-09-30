@@ -999,6 +999,13 @@ test "#14: sendRoom is never optimistic about the room it promises" {
     try std.testing.expectEqual(net.SendOutcome.sent, outcome);
 
     // And the gate must not be so eager to refuse that it breaks a healthy
-    // session: the same socket takes a second frame straight afterwards.
-    try std.testing.expectEqual(net.SendOutcome.sent, try conn.sendMessageBounded(proto.MSG_UPLOAD_INTERVAL_WRITE, payload, session.upload_write_budget_ms));
+    // session: the same socket takes a control-sized frame straight afterwards.
+    //
+    // Small on purpose. A second *large* frame would be testing the remaining
+    // room, not the gate's disposition, and whether it fits is a question about
+    // a live TCP connection and whatever the kernel has done with the first
+    // frame's 16 KiB since — which is how this test failed once, under load,
+    // with the gate behaving correctly.
+    const small = [_]u8{0x01} ** 256;
+    try std.testing.expectEqual(net.SendOutcome.sent, try conn.sendMessageBounded(proto.MSG_UPLOAD_INTERVAL_BEGIN, &small, session.upload_write_budget_ms));
 }

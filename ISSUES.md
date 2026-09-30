@@ -467,6 +467,18 @@ to remove the thing it claims to break.
   waiting for a kernel to do it. On TCP the half-full state has to be waited for,
   and even then it moves: the room settled at 16332 free on one run and at the
   full 81660 on the next, with nothing different in between.
+- **Zig resolves an `extern` declaration by name, so a renamed libc call links on
+  one platform and not another.** `net.zig` needed `ioctl` for `TIOCOUTQ`, and
+  the natural-looking `extern "c" fn ioctlTIOCOUTQ(...)` compiles and links
+  perfectly on macOS — because macOS takes the `SO_NWRITE` branch and never
+  references the Linux one, so the declaration is dead code and the linker never
+  sees it. On Linux it fails at link time with `undefined symbol:
+  ioctlTIOCOUTQ`. Nothing in the macOS test suite, in any optimisation mode, can
+  see this: it is a *build* failure on the one target that takes that path.
+  `zig build -Dtarget=x86_64-linux-gnu -Dlive=false` cross-compiles **and links**
+  from a Mac, catches it in about a minute, and is now part of how this was
+  checked. Worth more than it sounds: the alternative is another round trip
+  through a 10-minute CI job.
 - **A test can manufacture the desynchronisation it is looking for.** The first
   version of the frame-alignment test failed intermittently with a 1–4 byte tail,
   for a reason that had nothing to do with the code: the helper that drives the
