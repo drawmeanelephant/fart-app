@@ -64,7 +64,7 @@ pub fn build(b: *std.Build) void {
     kujamba_run_step.dependOn(&run_kujamba.step);
 
     // -------------------------------------------------------------------------
-    // test: run audit.zig + synth.zig built-in test suites
+    // test: audit + synth + golden + kujamba
     // -------------------------------------------------------------------------
     const audit_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -74,7 +74,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_tests = b.addRunArtifact(audit_tests);
-    const test_step = b.step("test", "Run audit + synth unit tests");
+    const test_step = b.step("test", "Run audit, synth, golden and kujamba test suites");
     test_step.dependOn(&run_tests.step);
 
     // synth.zig is libc-free, so its test module links no libc either.
@@ -87,6 +87,19 @@ pub fn build(b: *std.Build) void {
     });
     const run_synth_tests = b.addRunArtifact(synth_tests);
     test_step.dependOn(&run_synth_tests.step);
+
+    // Golden fingerprints: the byte-level guard on what the synth actually
+    // renders. Its own target so the check keeps running even while synth.zig's
+    // test module is being rewritten. libc-free, like synth.
+    const golden_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/golden.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_golden_tests = b.addRunArtifact(golden_tests);
+    test_step.dependOn(&run_golden_tests.step);
 
     // kujamba: the instrument + every unit test in the vendored NINJAM subset
     // (framing, protocol, auth, vorbis encode/decode, WAV, session engine).
