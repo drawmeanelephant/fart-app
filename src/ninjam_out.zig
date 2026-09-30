@@ -53,9 +53,12 @@ pub const Selection = struct {
     broadcast: bool,
     /// play mode for the interval
     mode: Mode,
-    /// phrase buffer to read this interval; null keeps whatever the source
-    /// already holds. Carried ahead of #8's bank so the hook is reshaped once.
-    samples: ?[]const f32 = null,
+    /// bank entry to read this interval; null keeps whatever the source already
+    /// holds. This is a *pointer to the entry*, not a bare buffer, because
+    /// binding a phrase is not just swapping samples: the `loop`/`once` playhead
+    /// lives in the entry, so switching phrases and switching back resumes each
+    /// where it left off instead of restarting (#8, #10).
+    phrase: ?*Phrase = null,
 };
 
 /// Parse a play mode name ("repeat", "loop", "once").
@@ -68,12 +71,55 @@ pub fn parseMode(s: []const u8) ModeError!Mode {
 
 /// Session-source adapter over a pre-rendered mono phrase (f32, ±1.0).
 pub const Fill = struct {
-    samples: []const f32,
+    /// the bound phrase's audio. Owned by the `Phrase` this fill is bound to, or
+    /// by the caller for the standalone (offline) uses that never bind a bank.
+    samples: []const f32 = &.{},
     mode: Mode = .repeat,
     /// playback cursor for `loop`/`once` modes (advances only while encoding,
     /// so rest bars freeze it). Deterministic: block sizes may vary with wall
     /// clock, but every interval advances the cursor by exactly its length.
     cursor: u64 = 0,
+    /// the bank entry `samples`/`cursor` are synced with, if the source was
+    /// driven by a `PhraseBank`. null for the standalone/offline uses of `Fill`
+    /// that own a bare buffer and advance `cursor` directly.
+    bound: ?*Phrase = null,
+
+    /// Apply one bar's selection, at the bar boundary, before any audio (#11).
+    /// The session calls this rather than assigning `mode`/`samples`, because
+    /// binding a phrase is not a pointer swap — it also moves the playhead.
+    ///
+    /// **The playhead travels with the phrase, not with the instrument.** On
+    /// every bind the outgoing entry is handed back its own `cursor` and the
+    /// incoming entry's is loaded. That is what "the cache accounts for cursor
+    /// state across switches" (#10) has to mean, and it is why `cursor` lives
+    /// in `Phrase` rather than only here:
+    ///
+    ///  - Two live phrases have two independent playheads, so `!kujamba 1`,
+    ///    `!kujamba 2`, `!kujamba 1` resumes phrase 1 mid-word where the room
+    ///    left it — the behaviour a bank of loops implies.
+    ///  - The naive alternative (one shared cursor, rewound to 0 on a switch)
+    ///    silently loses that state, and doing it *without* rewinding is worse:
+    ///    the cursor is an index into a specific buffer, so in `once` mode a
+    ///    stale position past the new phrase's end would leave the instrument
+    ///    permanently silent, and in `loop` mode `cursor % len` would drop the
+    ///    listener into the middle of a word.
+    ///  - Re-binding the *same* entry is a pure round trip, so a redundant
+    ///    `!kujamba 2` and every ordinary bar boundary leave the playhead
+    ///    exactly where it was (#12's "a config change does not cut the
+    ///    phrase" still holds).
+    ///  - A null entry (empty bank) keeps the current phrase, which is how an
+    ///    invalid selection avoids dropping audio.
+    pub fn bind(self: *Fill, mode: Mode, phrase: ?*Phrase) void {
+        if (self.bound) |out| out.cursor = self.cursor;
+        self.mode = mode;
+        if (phrase) |p| {
+            if (self.bound != p) {
+                self.samples = p.samples;
+                self.cursor = p.cursor;
+            }
+        }
+        self.bound = phrase;
+    }
 
     /// Fill `dst` with the next audio. `offset` is the sample offset inside the
     /// current interval; `repeat` mode reads the phrase from there (zero-padded
@@ -191,15 +237,196 @@ pub const IntervalIndex = struct {
     }
 };
 
+// ---- phrase bank (#8, #10) ---------------------------------------------------
+
+/// One entry in the bank: a phrase, rendered once at startup, plus the playhead
+/// that `loop`/`once` modes advance through it.
+///
+/// The `cursor` lives *in the entry*, not in the `Fill`. That is what makes a
+/// switch back to a phrase resume it instead of restarting, and it is the
+/// concrete thing #10 asks for ("cache accounts for `--play` mode cursor state
+/// across switches"). Two live phrases therefore have two independent
+/// playheads; a single shared `Fill.cursor` could only ever have one.
+pub const Phrase = struct {
+    /// the phrase text, trimmed. Chat selects by this name.
+    ///
+    /// Always **borrowed**, never freed by the bank: it points at argv, at the
+    /// arena, at the phrases file's text, or at a literal in a test. Copying
+    /// every name to normalise that would be a per-phrase allocation for a
+    /// string that is already stable for the whole run.
+    name: []const u8,
+    /// rendered once, up front, and never re-rendered on a switch. The synth is
+    /// a pure function of (phrase, knobs), so this is deterministic (#10).
+    /// Owned by the bank iff `owned`.
+    samples: []const f32,
+    /// whether the bank allocated `samples` and must free it. False for buffers
+    /// adopted by `initBorrowed`.
+    owned: bool = true,
+    /// playback position for `loop`/`once`. Only the active entry advances.
+    cursor: u64 = 0,
+};
+
+pub const PhraseBank = struct {
+    /// owns the rendered buffers; the `Phrase` structs themselves borrow.
+    alloc: std.mem.Allocator,
+    entries: std.ArrayList(Phrase) = .empty,
+    /// index the plan is currently selecting
+    current: usize = 0,
+    /// index a chat command asked for, consumed at the next bar boundary.
+    /// null = no pending switch. #11 already guarantees the plan is read once
+    /// per bar *before* any audio, so applying it here is what makes the
+    /// switch bar-accurate for free.
+    pending: ?usize = null,
+    /// selections a chat command asked for that did not resolve. Reported so
+    /// "invalid selection is a no-op" is observable rather than silent.
+    rejected: u32 = 0,
+    /// selections that took effect. Equals `rejected`-complement: a session
+    /// that never dropped audio has `switches + rejected == requests`.
+    switches: u32 = 0,
+
+    pub fn init(alloc: std.mem.Allocator) PhraseBank {
+        return .{ .alloc = alloc };
+    }
+
+    /// Adopt buffers that were rendered elsewhere, without re-rendering or
+    /// taking ownership. The counterpart of `add` for callers that already hold
+    /// `[]const f32` — tests, mostly, which use a synthetic buffer instead of
+    /// paying for a real synth render.
+    ///
+    /// `names` must be the same length as `buffers`; both are borrowed for the
+    /// life of the bank.
+    pub fn initBorrowed(
+        alloc: std.mem.Allocator,
+        names: []const []const u8,
+        buffers: []const []const f32,
+    ) !PhraseBank {
+        std.debug.assert(names.len == buffers.len);
+        var bank = PhraseBank.init(alloc);
+        errdefer bank.deinit();
+        for (names, buffers) |name, buf| {
+            try bank.entries.append(alloc, .{
+                .name = name,
+                .samples = buf,
+                .owned = false,
+            });
+        }
+        return bank;
+    }
+
+    /// Free the buffers this bank rendered, and the entry list. Adopted
+    /// buffers (`owned == false`) are left alone, and names are never freed —
+    /// see `Phrase`.
+    pub fn deinit(self: *PhraseBank) void {
+        for (self.entries.items) |p| {
+            if (p.owned) self.alloc.free(p.samples);
+        }
+        self.entries.deinit(self.alloc);
+        self.* = .{ .alloc = self.alloc };
+    }
+
+    /// Render `phrase` once and append it. This is the whole of #10: the
+    /// expensive part (synthesis) happens here, at load, and never again.
+    pub fn add(self: *PhraseBank, phrase: []const u8, knobs: synth.VoiceKnobs) !void {
+        const samples = try renderPhraseF32With(self.alloc, phrase, knobs);
+        errdefer self.alloc.free(samples);
+        try self.entries.append(self.alloc, .{ .name = phrase, .samples = samples });
+    }
+
+    /// Parse a bank file: one phrase per line, `#` comments and blank lines
+    /// skipped, CRLF tolerated. Deliberately *not* TOML — the config file
+    /// (#22) is a settings overlay, and a phrase list is a different shape
+    /// (a bag of strings, not a table). Reusing TOML here would make every
+    /// phrase a key/value pair for no benefit.
+    ///
+    /// Line-oriented means `name == phrase text`, so `!kujamba <name>` and
+    /// `!kujamba <n>` are two ways to say the same thing and there is no second
+    /// vocabulary to keep in sync.
+    pub fn parse(self: *PhraseBank, text: []const u8, knobs: synth.VoiceKnobs) !void {
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        while (lines.next()) |raw| {
+            const line = std.mem.trim(u8, raw, " \t\r");
+            if (line.len == 0 or line[0] == '#') continue;
+            try self.add(line, knobs);
+        }
+    }
+
+    /// Resolve a chat selector to an index: an all-digits token is a 1-based
+    /// position, anything else is matched case-insensitively against the
+    /// phrase text. Returns null for anything that names no entry, so the
+    /// caller can keep the current phrase rather than drop audio.
+    pub fn resolve(self: *const PhraseBank, raw: []const u8) ?usize {
+        // Trimmed here as well as in the chat parser: `resolve` is a public
+        // entry point, and a caller reading a name from a file or a config
+        // should not have to know that chat happens to pre-trim.
+        const sel = std.mem.trim(u8, raw, " \t\r\n");
+        if (sel.len == 0) return null;
+        if (std.fmt.parseInt(usize, sel, 10) catch null) |n| {
+            // 1-based, because a human in a chat room counting phrases starts
+            // at one. 0 is not a valid selector.
+            if (n == 0 or n > self.entries.items.len) return null;
+            return n - 1;
+        }
+        for (self.entries.items, 0..) |p, i| {
+            if (std.ascii.eqlIgnoreCase(p.name, sel)) return i;
+        }
+        return null;
+    }
+
+    /// Ask for `sel` to play next. Resolves now (so an invalid selector is
+    /// rejected at the moment it is typed, and counted), but the switch lands
+    /// at the next bar boundary when `active` is called.
+    pub fn request(self: *PhraseBank, sel: []const u8) void {
+        const idx = self.resolve(sel) orelse {
+            self.rejected += 1;
+            return;
+        };
+        self.pending = idx;
+    }
+
+    /// The phrase the next bar plays, applying any pending switch. Called once
+    /// per bar by the plan, before any audio — so this is the bar boundary, not
+    /// an arbitrary point in the stream.
+    pub fn active(self: *PhraseBank) ?*Phrase {
+        if (self.pending) |i| {
+            self.pending = null;
+            self.current = i;
+            self.switches += 1;
+        }
+        if (self.entries.items.len == 0) return null;
+        return &self.entries.items[self.current];
+    }
+
+    /// The active phrase's audio, for a caller that only needs the buffer.
+    pub fn activeSamples(self: *PhraseBank) []const f32 {
+        const p = self.active() orelse return &.{};
+        return p.samples;
+    }
+
+    /// The name of the phrase the *current* bar would play, without applying a
+    /// pending switch. Test-only, and deliberately read-only: a test that wants
+    /// to assert "the switch has not landed yet" must not be the thing that
+    /// lands it.
+    pub fn currentName(self: *PhraseBank) []const u8 {
+        if (self.entries.items.len == 0) return "";
+        return self.entries.items[self.current].name;
+    }
+};
+
 /// Adapter so a `Pattern` can be handed to `session.Options.plan`.
 pub const PlanAdapter = struct {
     pattern: *const Pattern,
     /// play mode the plan selects for each interval. A live switch updates this
     /// and it is picked up at the next bar boundary.
     mode: Mode = .repeat,
-    /// the phrase buffer this plan currently selects. One buffer today; #8
-    /// resolves an index into a bank here.
-    samples: []const f32 = &.{},
+    /// the phrase bank this plan selects from (#8). It holds exactly one entry
+    /// when `--phrases` was not given, so "a live switch" and "the single
+    /// phrase" are the same code path rather than two that can disagree.
+    ///
+    /// A pointer, not a value: the bank owns the rendered buffers, and both the
+    /// plan and the `Fill` hold `*Phrase` into its entries. Copying the struct
+    /// would duplicate the `ArrayList` owner and let one copy free buffers the
+    /// other still points at.
+    bank: *PhraseBank,
     /// live broadcast override (#9). null = follow the bar pattern; true =
     /// force a rest bar (silence markers); false = force a play bar. Set by a
     /// `!kujamba play|rest` chat command and consumed at the next bar boundary.
@@ -211,7 +438,7 @@ pub const PlanAdapter = struct {
         return .{
             .broadcast = if (self.rest) |r| !r else self.pattern.broadcastFor(interval_idx),
             .mode = self.mode,
-            .samples = self.samples,
+            .phrase = self.bank.active(),
         };
     }
 };
@@ -935,46 +1162,377 @@ test "loop mode wraps through zero: the seam is click-free with no crossfade (#1
 
 // ---- chat transport commands (#9) --------------------------------------------
 
-/// A `!kujamba <verb>` transport command from room chat. `none` for anything
-/// unrecognized, so unknown commands are ignored safely.
-pub const ChatCommand = enum { play, rest, loop, repeat, once, stop, none };
+/// A `!kujamba <arg>` command from room chat. `none` for anything that is not a
+/// kujamba command at all, so ordinary chat and other people's messages are
+/// ignored safely.
+///
+/// This is a tagged union rather than the plain enum #9 shipped because #8 added
+/// a second kind of command: a *phrase selector* carries a payload. The
+/// alternative — a separate `chat_select` callback and a second scan of the same
+/// 0xC0 params — would duplicate the routing (and the "first match wins" rule,
+/// and the fuzz surface of `get(0..4)`) for one extra payload.
+///
+/// A token that is not a known transport verb is a `.select` rather than
+/// `.none`. The parser deliberately does **not** know what the bank contains, so
+/// an unknown word routes to the bank, which resolves it or counts it as
+/// rejected. That keeps the bank in one place instead of splitting "is this a
+/// valid command?" across two files.
+pub const ChatCommand = union(enum) {
+    none,
+    play,
+    rest,
+    loop,
+    repeat,
+    once,
+    stop,
+    /// `!kujamba <n>` or `!kujamba <name>` — pick the next phrase (#8)
+    select: []const u8,
+};
 
-/// Parse a `!kujamba <verb>` command out of one room-chat string. The server's
+/// Parse a `kujamba <arg>` command out of one room-chat string. The server's
 /// 0xC0 layout varies by chat kind (privmsg vs server vs channel), so the caller
 /// feeds every param and takes the first match rather than assuming an index.
+///
+/// **The leading `!` is optional, and that is not a style choice.** The
+/// reference server's `User_Group::onChatMessage` (ninjam/server/usercon.cpp)
+/// intercepts any *MSG* whose text starts with `!`, replies "Unknown !command"
+/// to the sender, and **returns without broadcasting**. So on an unmodified
+/// ninjamsrv a literal `!kujamba loop` never reaches the room at all — it is
+/// swallowed before any client sees it. Verified against the real server: a peer
+/// sending `!kujamba 2` produced no `0xC0` for the listener at all, while
+/// `kujamba 2` arrived as `MSG: <user> | kujamba 2`.
+///
+/// Accepting both forms means the command works on the reference server *and*
+/// on any server (or IRC bridge) that does relay bang-prefixed text, so nobody
+/// has to know which one they are on.
+///
+/// The returned selector borrows `text`, so the handler must resolve it before
+/// the chat buffer is reused. `PhraseBank.request` does exactly that — it stores
+/// an index, never the string.
 pub fn parseChatCommand(text: []const u8) ChatCommand {
-    const t = std.mem.trim(u8, text, " \t\r\n");
-    const prefix = "!kujamba ";
+    // Strip the sigil *first*: the reference server swallows it before the
+    // message is ever broadcast, so on ninjamsrv this is the only form that
+    // arrives. Accepting "!!" and "! " too costs nothing.
+    var t = std.mem.trim(u8, text, " \t\r\n");
+    if (t.len > 0 and t[0] == '!') t = std.mem.trim(u8, t[1..], " \t\r\n");
+
+    const prefix = "kujamba";
     if (!std.ascii.startsWithIgnoreCase(t, prefix)) return .none;
-    const verb = std.mem.trim(u8, t[prefix.len..], " \t\r\n");
-    if (std.ascii.eqlIgnoreCase(verb, "play")) return .play;
-    if (std.ascii.eqlIgnoreCase(verb, "rest")) return .rest;
-    if (std.ascii.eqlIgnoreCase(verb, "loop")) return .loop;
-    if (std.ascii.eqlIgnoreCase(verb, "repeat")) return .repeat;
-    if (std.ascii.eqlIgnoreCase(verb, "once")) return .once;
-    if (std.ascii.eqlIgnoreCase(verb, "stop")) return .stop;
-    return .none;
+    // The character after the name must be whitespace, or "kujambazal" would
+    // parse as a command addressed to us.
+    const after = t[prefix.len..];
+    if (after.len == 0 or !std.ascii.isWhitespace(after[0])) return .none;
+    const arg = std.mem.trim(u8, after, " \t\r\n");
+    if (arg.len == 0) return .none;
+    if (std.ascii.eqlIgnoreCase(arg, "play")) return .play;
+    if (std.ascii.eqlIgnoreCase(arg, "rest")) return .rest;
+    if (std.ascii.eqlIgnoreCase(arg, "loop")) return .loop;
+    if (std.ascii.eqlIgnoreCase(arg, "repeat")) return .repeat;
+    if (std.ascii.eqlIgnoreCase(arg, "once")) return .once;
+    if (std.ascii.eqlIgnoreCase(arg, "stop")) return .stop;
+    return .{ .select = arg };
 }
 
 test "chat command parsing recognises the transport verbs, case- and space-insensitively" {
-    try testing.expectEqual(ChatCommand.loop, parseChatCommand("!kujamba loop"));
-    try testing.expectEqual(ChatCommand.loop, parseChatCommand("  !KUJAMBA   LOOP  "));
-    try testing.expectEqual(ChatCommand.play, parseChatCommand("!kujamba play"));
-    try testing.expectEqual(ChatCommand.rest, parseChatCommand("!kujamba rest"));
-    try testing.expectEqual(ChatCommand.repeat, parseChatCommand("!kujamba repeat"));
-    try testing.expectEqual(ChatCommand.once, parseChatCommand("!kujamba once"));
-    try testing.expectEqual(ChatCommand.stop, parseChatCommand("!kujamba stop"));
+    try testing.expectEqual(ChatCommand{ .loop = {} }, parseChatCommand("kujamba loop"));
+    try testing.expectEqual(ChatCommand{ .loop = {} }, parseChatCommand("!kujamba loop"));
+    try testing.expectEqual(ChatCommand{ .loop = {} }, parseChatCommand("  !KUJAMBA   LOOP  "));
+    try testing.expectEqual(ChatCommand{ .play = {} }, parseChatCommand("kujamba play"));
+    try testing.expectEqual(ChatCommand{ .rest = {} }, parseChatCommand("!kujamba rest"));
+    try testing.expectEqual(ChatCommand{ .repeat = {} }, parseChatCommand("kujamba repeat"));
+    try testing.expectEqual(ChatCommand{ .once = {} }, parseChatCommand("kujamba once"));
+    try testing.expectEqual(ChatCommand{ .stop = {} }, parseChatCommand("!kujamba stop"));
 }
 
-test "chat command parsing ignores everything that is not a known verb" {
-    // unknown verbs, wrong prefix, other users' messages — all safely .none
+test "the leading ! is optional, because the reference server eats it (#9, verified)" {
+    // ninjamsrv's onChatMessage intercepts any MSG starting with '!' and
+    // returns without broadcasting, so `!kujamba loop` never reaches a room.
+    // Both spellings parse, so the command works on that server and on any that
+    // does relay bang-prefixed text.
+    try testing.expectEqual(ChatCommand{ .loop = {} }, parseChatCommand("kujamba loop"));
+    try testing.expectEqual(ChatCommand{ .loop = {} }, parseChatCommand("!kujamba loop"));
+    try testing.expectEqual(ChatCommand{ .loop = {} }, parseChatCommand("! kujamba loop"));
+    try testing.expectEqual(ChatCommand{ .loop = {} }, parseChatCommand("  !KUJAMBA  loop "));
+}
+
+test "chat command parsing ignores everything that is not a kujamba command" {
+    // no argument, wrong prefix, other users' messages — all safely .none
     for ([_][]const u8{
-        "!kujamba", // no verb
-        "!kujamba sideways", // unknown verb
-        "!kujamba loop now", // extra words
-        "kujamba loop", // missing !
+        "kujamba", // no argument
+        "!kujamba", // no argument
+        "kujamba   ", // argument is only whitespace
+        "kujambazal", // the name must be a whole word, not a prefix of another
         "hello everyone", // ordinary chat
         "", // empty
         "!", // lone sigil
-    }) |s| try testing.expectEqual(ChatCommand.none, parseChatCommand(s));
+    }) |s| try testing.expectEqual(ChatCommand{ .none = {} }, parseChatCommand(s));
+}
+
+test "an unrecognised argument parses as a phrase selector, not as nothing (#8)" {
+    // The parser cannot know the bank, so an unknown token is routed to it and
+    // the bank decides. This is what makes `!kujamba 2` and
+    // `!kujamba habari yako` work without the parser enumerating phrases.
+    //
+    // The selector *borrows* the chat text (a tagged union compares by pointer,
+    // so these are compared as strings), which is why the handler must resolve
+    // it to an index before the chat buffer is reused.
+    const expect_select = struct {
+        fn f(text: []const u8, want: []const u8) !void {
+            switch (parseChatCommand(text)) {
+                .select => |sel| try testing.expectEqualStrings(want, sel),
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }.f;
+    try expect_select("kujamba 2", "2");
+    try expect_select("!kujamba 2", "2");
+    try expect_select("  KUJAMBA   Habari Yako  ", "Habari Yako");
+    // extra words are not a verb, so they are a (probably unresolvable) selector
+    try expect_select("kujamba loop now", "loop now");
+}
+
+// ---- phrase bank tests (#8, #10) ---------------------------------------------
+
+test "a phrases file renders every phrase once, up front, deterministically (#10)" {
+    const alloc = testing.allocator;
+    const text =
+        \\# a bank of Swahili phrases
+        \\kujamba karibu
+        \\asante sana
+        \\
+        \\habari yako   # trailing comment is NOT stripped: it is part of the phrase
+    ;
+    var bank = PhraseBank.init(alloc);
+    defer bank.deinit();
+    try bank.parse(text, .{});
+
+    // blank lines and full-line comments are skipped; the rest are phrases
+    try testing.expectEqual(@as(usize, 3), bank.entries.items.len);
+    try testing.expectEqualStrings("kujamba karibu", bank.entries.items[0].name);
+    try testing.expectEqualStrings("asante sana", bank.entries.items[1].name);
+    try testing.expectEqualStrings("habari yako   # trailing comment is NOT stripped: it is part of the phrase", bank.entries.items[2].name);
+
+    // every phrase rendered to real audio, and none of them is silence
+    for (bank.entries.items) |p| {
+        try testing.expect(p.samples.len > 0);
+        try testing.expect(rmsOf(p.samples) > 0.01);
+        try testing.expect(p.owned);
+    }
+
+    // The whole point of #10: loading is a pure function of (file, knobs), so a
+    // second load is sample-identical and a switch can never re-render.
+    var again = PhraseBank.init(alloc);
+    defer again.deinit();
+    try again.parse(text, .{});
+    for (bank.entries.items, again.entries.items) |a, b| {
+        try testing.expectEqualStrings(a.name, b.name);
+        try testing.expectEqualSlices(f32, a.samples, b.samples);
+    }
+
+    // ...and a switch does not touch the buffers: the pointers the bank handed
+    // out at load are still the ones it hands out now.
+    try testing.expectEqual(
+        @intFromPtr(bank.entries.items[1].samples.ptr),
+        @intFromPtr(bank.entries.items[1].samples.ptr),
+    );
+    bank.request("2");
+    try testing.expectEqual(
+        @intFromPtr(bank.entries.items[1].samples.ptr),
+        @intFromPtr(bank.active().?.samples.ptr),
+    );
+}
+
+test "a phrases file with CRLF endings parses the same as one with LF" {
+    const alloc = testing.allocator;
+    var bank = PhraseBank.init(alloc);
+    defer bank.deinit();
+    try bank.parse("kujamba karibu\r\nasante sana\r\n", .{});
+    try testing.expectEqual(@as(usize, 2), bank.entries.items.len);
+    try testing.expectEqualStrings("asante sana", bank.entries.items[1].name);
+}
+
+test "a selector resolves by 1-based position or by name, case-insensitively" {
+    const alloc = testing.allocator;
+    var bank = PhraseBank.init(alloc);
+    defer bank.deinit();
+    try bank.parse("kujamba karibu\nasante sana\nhabari yako\n", .{});
+
+    // position, 1-based because a person counting phrases in a room starts at 1
+    try testing.expectEqual(@as(?usize, 0), bank.resolve("1"));
+    try testing.expectEqual(@as(?usize, 1), bank.resolve("2"));
+    try testing.expectEqual(@as(?usize, 2), bank.resolve("3"));
+    // by name, case- and whitespace-insensitively
+    try testing.expectEqual(@as(?usize, 1), bank.resolve("asante sana"));
+    try testing.expectEqual(@as(?usize, 2), bank.resolve("  HABARI YAKO  "));
+    // a name that looks like a number is a name, not an index, so digits always
+    // mean position -- there is no way to reach a numeric phrase by name
+    try testing.expectEqual(@as(?usize, 0), bank.resolve("1 "));
+}
+
+test "an invalid or empty selector is rejected and the current phrase keeps playing (#8)" {
+    const alloc = testing.allocator;
+    var bank = PhraseBank.init(alloc);
+    defer bank.deinit();
+    try bank.parse("kujamba karibu\nasante sana\n", .{});
+    const first = bank.active().?;
+    try testing.expectEqualStrings("kujamba karibu", first.name);
+
+    // out of range, zero (there is no 0th phrase), unknown name, empty
+    var expected_rejected: u32 = 0;
+    for ([_][]const u8{ "0", "3", "99", "nope", "", "   " }) |bad| {
+        expected_rejected += 1;
+        bank.request(bad);
+        try testing.expectEqual(@as(?usize, null), bank.pending);
+        try testing.expectEqual(expected_rejected, bank.rejected);
+        // no pending switch, so the next bar binds the phrase already playing
+        try testing.expectEqual(@intFromPtr(first.samples.ptr), @intFromPtr(bank.active().?.samples.ptr));
+    }
+    try testing.expectEqual(@as(u32, 0), bank.switches);
+}
+
+test "a request is applied at the next bar, not when it is typed (#8)" {
+    const alloc = testing.allocator;
+    var bank = PhraseBank.init(alloc);
+    defer bank.deinit();
+    try bank.parse("kujamba karibu\nasante sana\n", .{});
+    try testing.expectEqualStrings("kujamba karibu", bank.active().?.name);
+
+    bank.request("2");
+    // Requested, but the phrase that would play *this* bar has already been
+    // decided. `pending` is set and `current` is NOT: that gap is the whole
+    // bar-accuracy property, and it is what keeps a live switch from splicing
+    // audio that is already being encoded. `active` is what the plan calls,
+    // once per bar, before any audio.
+    try testing.expectEqual(@as(?usize, 1), bank.pending);
+    try testing.expectEqual(@as(usize, 0), bank.current);
+    try testing.expectEqual(@as(u32, 0), bank.switches);
+    try testing.expectEqualStrings("kujamba karibu", bank.currentName());
+
+    // The next bar: the switch lands, and the pending is consumed.
+    const p = bank.active().?;
+    try testing.expectEqualStrings("asante sana", p.name);
+    try testing.expectEqual(@as(usize, 1), bank.current);
+    try testing.expectEqual(@as(u32, 1), bank.switches);
+    try testing.expectEqual(@as(?usize, null), bank.pending);
+    // and it is not applied twice
+    _ = bank.active();
+    try testing.expectEqual(@as(u32, 1), bank.switches);
+}
+
+test "each phrase keeps its own playhead, so switching back resumes rather than restarts (#10)" {
+    const alloc = testing.allocator;
+    // Distinct constant buffers so "which phrase is playing" is unambiguous.
+    const a = [_]f32{ 1, 1, 1, 1 };
+    const b = [_]f32{ 2, 2, 2, 2, 2, 2 };
+    var bank = try PhraseBank.initBorrowed(alloc, &.{ "a", "b" }, &.{ &a, &b });
+    defer bank.deinit();
+
+    var fill = Fill{ .mode = .loop };
+    fill.bind(.loop, bank.active());
+    try testing.expectEqualStrings("a", bank.active().?.name);
+    var dst: [4]f32 = undefined;
+
+    // play a bar of phrase a: the playhead advances through it. The live
+    // playhead is the Fill's; the bank's copy is written back on the next bind,
+    // which is the only moment the two are allowed to disagree.
+    fill.copyInto(0, dst[0..4]);
+    try testing.expectEqualSlices(f32, &a, &dst);
+    try testing.expectEqual(@as(u64, 4), fill.cursor);
+
+    // switch to b, and play a bar of it
+    bank.request("2");
+    fill.bind(.loop, bank.active());
+    try testing.expectEqualStrings("b", bank.active().?.name);
+    try testing.expectEqual(@as(u64, 4), bank.entries.items[0].cursor); // a kept its place
+    try testing.expectEqual(@as(u64, 0), fill.cursor); // and b starts at its beginning
+    fill.copyInto(0, dst[0..4]);
+    try testing.expectEqualSlices(f32, b[0..4], &dst);
+    try testing.expectEqual(@as(u64, 4), fill.cursor);
+
+    // switch back to a: it resumes at sample 4, wrapping -- NOT from 0
+    bank.request("1");
+    fill.bind(.loop, bank.active());
+    try testing.expectEqual(@as(u64, 4), fill.cursor);
+    try testing.expectEqual(@as(u64, 4), bank.entries.items[1].cursor); // b kept its place
+    fill.copyInto(0, dst[0..4]);
+    try testing.expectEqualSlices(f32, &a, &dst); // wrapped back to the start of a
+    try testing.expectEqual(@as(u64, 8), fill.cursor);
+}
+
+test "a switch rewinds the playhead, and a redundant re-select does not (#8)" {
+    const alloc = testing.allocator;
+    const a = [_]f32{ 1, 1, 1, 1 };
+    const b = [_]f32{ 2, 2, 2, 2 };
+    var bank = try PhraseBank.initBorrowed(alloc, &.{ "a", "b" }, &.{ &a, &b });
+    defer bank.deinit();
+
+    var fill = Fill{ .mode = .loop };
+    fill.bind(.loop, bank.active());
+    var dst: [3]f32 = undefined;
+    fill.copyInto(0, dst[0..3]);
+    try testing.expectEqual(@as(u64, 3), fill.cursor);
+
+    // re-selecting the phrase already playing is a no-op on the playhead --
+    // this is the case that would break #12's "a config change does not cut the
+    // phrase" if bind() rewound unconditionally
+    bank.request("1");
+    fill.bind(.loop, bank.active());
+    try testing.expectEqual(@as(u64, 3), fill.cursor);
+
+    // a real switch to a *different* phrase starts it at its beginning
+    bank.request("2");
+    fill.bind(.loop, bank.active());
+    try testing.expectEqual(@as(u64, 0), fill.cursor);
+    fill.copyInto(0, dst[0..3]);
+    try testing.expectEqualSlices(f32, b[0..3], &dst);
+}
+
+test "re-binding the same phrase every bar does not rewind the playhead (#11 + #8)" {
+    const alloc = testing.allocator;
+    const a = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    var bank = try PhraseBank.initBorrowed(alloc, &.{"a"}, &.{&a});
+    defer bank.deinit();
+
+    var fill = Fill{ .mode = .once };
+    fill.bind(.once, bank.active());
+    var dst: [2]f32 = undefined;
+    fill.copyInto(0, dst[0..2]);
+    try testing.expectEqualSlices(f32, a[0..2], &dst);
+
+    // three more bar boundaries, same phrase: the playhead must keep climbing
+    fill.bind(.once, bank.active());
+    fill.bind(.once, bank.active());
+    fill.bind(.once, bank.active());
+    try testing.expectEqual(@as(u64, 2), fill.cursor);
+    fill.copyInto(0, dst[0..2]);
+    try testing.expectEqualSlices(f32, a[2..4], &dst);
+}
+
+test "binding a null phrase keeps the current one, so an empty bank drops no audio (#8)" {
+    const alloc = testing.allocator;
+    const a = [_]f32{ 1, 2, 3, 4 };
+    var bank = try PhraseBank.initBorrowed(alloc, &.{"a"}, &.{&a});
+    defer bank.deinit();
+    var fill = Fill{ .mode = .repeat };
+    fill.bind(.repeat, bank.active());
+    var dst: [4]f32 = undefined;
+    fill.copyInto(0, dst[0..4]);
+    try testing.expectEqualSlices(f32, &a, &dst);
+
+    // what an empty bank (or a plan with no selection) would hand over
+    fill.bind(.repeat, null);
+    fill.copyInto(0, dst[0..4]);
+    try testing.expectEqualSlices(f32, &a, &dst);
+    try testing.expect(fill.bound == null);
+}
+
+test "an empty bank yields no phrase at all, and does not panic (#8)" {
+    const alloc = testing.allocator;
+    var bank = PhraseBank.init(alloc);
+    defer bank.deinit();
+    try testing.expect(bank.active() == null);
+    try testing.expectEqual(@as(usize, 0), bank.activeSamples().len);
+    bank.request("1"); // nothing to select
+    try testing.expect(bank.active() == null);
+    try testing.expectEqual(@as(u32, 1), bank.rejected);
 }
