@@ -108,6 +108,28 @@ pub const Stats = struct {
     /// interval payload dumps written (payload_dump_dir)
     payload_dumps: u64 = 0,
 
+    // ---- M5 timing telemetry (#13, #14) ------------------------------------
+    /// Wall time spent inside one interval's upload-write section, in ns. The
+    /// audio clock's own budget is one interval; a value near or above it means
+    /// the network stalled interval generation rather than the other way round.
+    /// Max over the session, because the worst stall is the one that matters.
+    upload_stall_ns: u64 = 0,
+    /// #13: signed nanoseconds between the local interval grid and the grid
+    /// derived from the server's 0x02 arrival. Positive = the local clock is
+    /// running ahead of the server's. Reported (abs) at the end of the session.
+    drift_ns: i64 = 0,
+    /// #13: absolute value of the largest |drift| seen, in ns.
+    max_abs_drift_ns: u64 = 0,
+    /// #13: how many intervals the bounded slew actually moved, and the total
+    /// correction applied (ns). A session where these are zero is one where the
+    /// local grid already agreed with the server's.
+    clock_corrections: u64 = 0,
+    total_correction_ns: i64 = 0,
+    /// #14: bars whose upload was abandoned because the socket would block,
+    /// and the encoded bytes thrown away with them.
+    intervals_dropped: u64 = 0,
+    upload_bytes_dropped: u64 = 0,
+
     intervals_downloaded: u64 = 0,
     download_bytes: u64 = 0,
     samples_decoded: u64 = 0,
@@ -162,6 +184,14 @@ const max_local_channels = 4;
 const encode_block_samples = 960; // 20 ms @ 48 kHz
 const chunk_flush_bytes = 2048; // coalesce encoded bytes into >=2KiB chunks
 const default_keepalive_s: u32 = 3;
+/// kujamba (#14): how long an upload write may wait for a slow socket, in ms.
+///
+/// Zero, and that is the point. The audio clock has exactly one bar of budget
+/// and the upload is not worth any of it: a socket that cannot take a bar right
+/// now will not take it a second later either, and finding that out by waiting
+/// is what turned a jittery connection into a frozen performance. Zero means
+/// ask once and act on the answer.
+pub const upload_write_budget_ms: i32 = 0;
 
 const UserEntry = struct {
     name_len: usize = 0,
@@ -215,6 +245,9 @@ const LocalChannel = struct {
     dump: Buf,
     produced: u64 = 0,
     interval_idx: u64 = 0,
+    /// kujamba (#14): this channel's bar was abandoned because the socket would
+    /// block. Nothing more is sent for it this bar, and the audio keeps going.
+    dropped: bool = false,
 
     fn nameSlice(self: *const LocalChannel) []const u8 {
         return self.name[0..self.name_len];
@@ -298,6 +331,14 @@ pub const Session = struct {
     // dump filenames, --intervals) and is monotonic for the whole session;
     // `index.grid` is the bar position and drives only the pattern decision.
     index: kujamba_out.IntervalIndex = .{},
+    // kujamba (#13): the bar grid, anchored to the server's and corrected by a
+    // bounded slew. See `kujamba_out.ServerClock` for why the correction chases
+    // the wall clock rather than the server's epoch.
+    timing: kujamba_out.ServerClock = .{},
+    // kujamba (#14): has *this* bar already been counted as dropped? Cleared at
+    // the top of `finalizeInterval`, so N channels failing on one bar is one
+    // lost bar, not N.
+    drop_marked: bool = false,
 
     start_ns: i128 = 0,
     chat_sent: bool = false,
@@ -607,6 +648,7 @@ pub const Session = struct {
             lc.pending.clear();
             lc.begun = false;
             lc.produced = 0;
+            lc.dropped = false;
             var serial: u32 = 0;
             if (self.opts.id_seed) |seed| {
                 // deterministic ids: byte-identical payloads across runs
@@ -638,7 +680,14 @@ pub const Session = struct {
         if (self.interval_len_samples == 0) return;
         const elapsed_ns = now_ns - self.interval_start_ns;
         const elapsed_samples: u64 = @intCast(@divFloor(elapsed_ns * @as(i128, self.opts.srate), 1_000_000_000));
-        const target = @min(elapsed_samples, self.interval_len_samples);
+        // kujamba (#13): the encode target leads the wall clock by a bounded
+        // margin, so the last block is already encoded — and the flush and the
+        // final 0x84 chunk already in flight — when the boundary arrives, rather
+        // than starting at it. This changes *when* a bar is generated, never
+        // *what*: the sample sequence, the block sizes and therefore the encoded
+        // bytes are identical, so the determinism evidence is untouched.
+        const lead = self.timing.encodeLeadSamples(self.interval_len_samples);
+        const target = @min(elapsed_samples +| lead, self.interval_len_samples);
 
         while (self.locals[0].produced < target) {
             // all channels advance in lockstep, so every channel encodes the
@@ -668,13 +717,14 @@ pub const Session = struct {
             }
             // stream out full chunks mid-interval
             for (self.locals) |*lc| {
+                if (lc.dropped) continue;
                 while (lc.begun and lc.pending.len >= chunk_flush_bytes) {
-                    try self.sendUploadChunk(lc, false);
+                    if (!try self.sendUploadChunk(lc, false)) break;
                 }
-                if (!lc.begun and lc.pending.len >= chunk_flush_bytes) {
+                if (!lc.begun and !lc.dropped and lc.pending.len >= chunk_flush_bytes) {
                     // first chunk of the interval: send held 0x83 then data
-                    try self.sendUploadBegin(lc);
-                    try self.sendUploadChunk(lc, false);
+                    if (!try self.sendUploadBegin(lc)) continue;
+                    _ = try self.sendUploadChunk(lc, false);
                 }
             }
         }
@@ -684,7 +734,54 @@ pub const Session = struct {
         }
     }
 
-    fn sendUploadBegin(self: *Session, lc: *LocalChannel) !void {
+    /// #14: send one upload message, refusing to wait for a peer that cannot
+    /// keep up. Returns false when the socket would block and the bar is being
+    /// abandoned — see `dropInterval` for what happens next.
+    ///
+    /// `self.send` is deliberately NOT used here. `send` goes through
+    /// `net.zig`'s `sendMessage`, whose EAGAIN path polls in a loop until the
+    /// peer reads (see the note on `writeAllBounded`): unbounded, on the audio
+    /// clock's own path. The zero budget turns "wait forever" into "ask once",
+    /// which is the difference between dropping a bar and hanging the session.
+    fn sendUpload(self: *Session, mtype: u8, payload: []const u8) !bool {
+        const conn = &(self.conn orelse return false);
+        if (!conn.writable()) return false;
+        if (!try conn.sendMessageBounded(mtype, payload, upload_write_budget_ms)) return false;
+        self.stats.msgs_sent += 1;
+        self.stats.bytes_sent += payload.len + 5;
+        self.last_keepalive_ms = clock.nowMs(self.io);
+        return true;
+    }
+
+    /// #14: abandon this channel's bar because the socket would block.
+    ///
+    /// The audio keeps running. That is the whole point of the issue: a bar is
+    /// worth one bar of audio, and a socket that cannot take it right now cannot
+    /// be made to take it by waiting — the audio clock has no slack to spend.
+    /// So the bytes are counted and thrown away, the channel is left `dropped`
+    /// so `finalizeInterval` sends nothing more for it (not even a silence
+    /// marker: this bar had audio, and claiming otherwise would be a lie the
+    /// room would hear as a rest), and the session moves on to the next bar with
+    /// a fresh guid.
+    fn dropInterval(self: *Session, lc: *LocalChannel, reason: []const u8) void {
+        const discarded = lc.pending.len + lc.dump.len;
+        lc.dropped = true;
+        lc.begun = false;
+        lc.pending.clear();
+        lc.dump.clear();
+        // count once per bar, not once per channel: a dropped bar is one lost
+        // bar, and counting per channel would report N losses for one silence
+        if (!self.drop_marked) {
+            self.drop_marked = true;
+            self.stats.intervals_dropped += 1;
+            self.stats.upload_bytes_dropped += discarded;
+            self.log.line("UPLOAD DROPPED: {s} — bar {d} skipped (socket would block, {d} bytes discarded); continuing at the next bar", .{
+                reason, self.index.seq, discarded,
+            });
+        }
+    }
+
+    fn sendUploadBegin(self: *Session, lc: *LocalChannel) !bool {
         var f = Fixed{};
         try proto.buildUploadIntervalBegin(.{
             .guid = lc.guid,
@@ -692,31 +789,57 @@ pub const Session = struct {
             .fourcc = proto.FOURCC_OGGV,
             .chidx = @intCast(self.channelIndex(lc)),
         }, &f);
-        try self.send(proto.MSG_UPLOAD_INTERVAL_BEGIN, f.slice());
+        if (!try self.sendUpload(proto.MSG_UPLOAD_INTERVAL_BEGIN, f.slice())) {
+            self.dropInterval(lc, "0x83 would block");
+            return false;
+        }
         lc.begun = true;
         self.log.line("C>S 0x83 UPLOAD_BEGIN guid={s} chidx={d} interval={d}", .{
             // kujamba (#12): the guid's sequence number, not the grid position
             hexBuf(&lc.guid, &self.hex_scratch), self.channelIndex(lc), self.index.seq,
         });
+        return true;
     }
 
     fn channelIndex(self: *Session, lc: *LocalChannel) usize {
         return (@intFromPtr(lc) - @intFromPtr(self.locals.ptr)) / @sizeOf(LocalChannel);
     }
 
-    fn sendUploadChunk(self: *Session, lc: *LocalChannel, final: bool) !void {
+    /// #14: record how long one interval's upload section took. The max is the
+    /// number that matters — one slow peer is survivable, a stall measured in
+    /// whole bars is the audio clock being eaten by the network.
+    fn noteUploadStall(self: *Session, ns: i128) void {
+        if (ns <= 0) return;
+        const u: u64 = @intCast(ns);
+        if (u > self.stats.upload_stall_ns) self.stats.upload_stall_ns = u;
+    }
+
+    /// #13: copy the clock's private drift ledger into `Stats`, which is what
+    /// `RESULT` prints and what a test can read.
+    fn publishClockTelemetry(self: *Session) void {
+        self.stats.drift_ns = self.timing.drift_ns;
+        self.stats.max_abs_drift_ns = self.timing.max_abs_drift_ns;
+        self.stats.clock_corrections = self.timing.corrections;
+        self.stats.total_correction_ns = self.timing.total_correction_ns;
+    }
+
+    /// #14: returns false when the bar was abandoned mid-transfer.
+    fn sendUploadChunk(self: *Session, lc: *LocalChannel, final: bool) !bool {
         // payload cap: 16384 - 17 = 16367 bytes per write message
         const cap: usize = 16367;
         var remaining = lc.pending.items();
         if (remaining.len == 0) {
-            if (!final) return;
+            if (!final) return true;
             // must terminate the transfer even with no data: empty write
             var f0 = Fixed{};
             try proto.buildUploadIntervalWrite(.{ .guid = lc.guid, .flags = 1, .data = "" }, &f0);
-            try self.send(proto.MSG_UPLOAD_INTERVAL_WRITE, f0.slice());
+            if (!try self.sendUpload(proto.MSG_UPLOAD_INTERVAL_WRITE, f0.slice())) {
+                self.dropInterval(lc, "final 0x84 would block");
+                return false;
+            }
             self.stats.upload_chunks += 1;
             self.log.line("C>S 0x84 WRITE guid={s} flags=1 bytes=0 (final)", .{hexBuf(&lc.guid, &self.hex_scratch)});
-            return;
+            return true;
         }
         while (remaining.len > 0) {
             const n = @min(remaining.len, cap);
@@ -730,7 +853,10 @@ pub const Session = struct {
                 .flags = if (final and is_last) 1 else 0,
                 .data = remaining[0..n],
             }, &f);
-            try self.send(proto.MSG_UPLOAD_INTERVAL_WRITE, f.slice());
+            if (!try self.sendUpload(proto.MSG_UPLOAD_INTERVAL_WRITE, f.slice())) {
+                self.dropInterval(lc, "0x84 would block");
+                return false;
+            }
             self.stats.upload_chunks += 1;
             self.stats.upload_bytes += n;
             self.log.line("C>S 0x84 WRITE guid={s} flags={d} bytes={d}", .{
@@ -739,6 +865,7 @@ pub const Session = struct {
             remaining = remaining[n..];
         }
         lc.pending.clear();
+        return true;
     }
 
     /// Write the interval's concatenated 0x84 payload bytes to
@@ -767,7 +894,25 @@ pub const Session = struct {
     }
 
     fn finalizeInterval(self: *Session) !void {
+        // #13/#14 telemetry: wall time the upload section of ONE interval takes.
+        // The audio clock regenerates a whole bar per interval, so this is the
+        // number that says whether a slow peer can starve it.
+        const stall_start_ns = clock.nowNs(self.io);
+        defer self.noteUploadStall(clock.nowNs(self.io) - stall_start_ns);
+
+        // kujamba (#13): this is the instant the bar boundary was crossed, and
+        // it is what the clock's drift is measured against. Taken BEFORE the
+        // upload work below so the wire time is charged to the socket, not
+        // disguised as late generation.
+        const boundary_ns = stall_start_ns;
+
+        self.drop_marked = false;
         for (self.locals) |*lc| {
+            // #14: a channel whose bar was abandoned mid-interval sends nothing
+            // further this bar — not the tail, and not a silence marker, because
+            // this bar had audio and saying otherwise would be a lie the room
+            // hears as a rest.
+            if (lc.dropped) continue;
             if (lc.broadcast) {
                 if (lc.enc) |e| {
                     var out: std.ArrayList(u8) = .empty;
@@ -787,14 +932,18 @@ pub const Session = struct {
                             .fourcc = 0,
                             .chidx = @intCast(self.channelIndex(lc)),
                         }, &f);
-                        try self.send(proto.MSG_UPLOAD_INTERVAL_BEGIN, f.slice());
+                        if (!try self.sendUpload(proto.MSG_UPLOAD_INTERVAL_BEGIN, f.slice())) {
+                            self.dropInterval(lc, "silence marker would block");
+                            continue;
+                        }
                         self.stats.silence_markers += 1;
                         self.log.line("C>S 0x83 SILENCE_MARKER chidx={d}", .{self.channelIndex(lc)});
                     } else {
-                        try self.sendUploadBegin(lc);
+                        _ = try self.sendUploadBegin(lc);
                     }
                 }
-                try self.sendUploadChunk(lc, true);
+                if (lc.dropped) continue;
+                _ = try self.sendUploadChunk(lc, true);
                 if (self.opts.payload_dump_dir) |dump_dir| {
                     try self.writePayloadDump(lc, dump_dir);
                 }
@@ -807,26 +956,49 @@ pub const Session = struct {
                     .fourcc = 0,
                     .chidx = @intCast(self.channelIndex(lc)),
                 }, &f);
-                try self.send(proto.MSG_UPLOAD_INTERVAL_BEGIN, f.slice());
+                if (!try self.sendUpload(proto.MSG_UPLOAD_INTERVAL_BEGIN, f.slice())) {
+                    self.dropInterval(lc, "silence marker would block");
+                    continue;
+                }
                 self.stats.silence_markers += 1;
                 self.log.line("C>S 0x83 SILENCE_MARKER chidx={d}", .{self.channelIndex(lc)});
             }
         }
-        self.stats.intervals_uploaded += 1;
         var streaming: u64 = 0;
+        var dropped_here = false;
         for (self.locals) |lc| {
-            if (lc.broadcast) streaming += 1;
+            // A dropped channel did not stream, so it is not counted as
+            // broadcast: `intervals_broadcast` is what the demo asserts on and
+            // it must keep meaning "this bar really went out".
+            if (lc.broadcast and !lc.dropped) streaming += 1;
+            if (lc.dropped) dropped_here = true;
         }
-        self.stats.upload_channels = @max(self.stats.upload_channels, streaming);
-        self.stats.intervals_broadcast += streaming;
-        self.log.line("interval {d} complete (grid bar {d}, {d} samples, {d}ms)", .{
-            // kujamba (#12): seq and grid are distinct, so log both
-            self.index.seq, self.index.grid, self.interval_len_samples, self.interval_len_samples * 1000 / self.opts.srate,
-        });
+        if (dropped_here) {
+            self.log.line("interval {d} dropped ({d} channels), audio clock continues", .{ self.index.seq, self.locals.len });
+        } else {
+            self.stats.intervals_uploaded += 1;
+            self.stats.upload_channels = @max(self.stats.upload_channels, streaming);
+            self.stats.intervals_broadcast += streaming;
+            self.log.line("interval {d} complete (grid bar {d}, {d} samples, {d}ms)", .{
+                // kujamba (#12): seq and grid are distinct, so log both
+                self.index.seq, self.index.grid, self.interval_len_samples, self.interval_len_samples * 1000 / self.opts.srate,
+            });
+        }
         self.index.complete();
-        // re-anchor on the exact grid to avoid drift
-        const interval_ns: i128 = @divTrunc(@as(i128, @intCast(self.interval_len_samples)) * 1_000_000_000, @as(i128, self.opts.srate));
-        self.interval_start_ns += interval_ns;
+
+        // kujamba (#13): the bar grid, disciplined. Before this it was
+        // `interval_start_ns += interval_ns` with nothing measuring whether the
+        // session was keeping up, so the time spent on the wire above was
+        // silently stolen from every subsequent bar's generation budget and
+        // never returned. Now the crossing time is measured against the bar's
+        // nominal end and a *bounded* correction is applied — bounded twice
+        // over, as a fraction of the bar and in absolute nanoseconds, so a fast
+        // tempo cannot get a jumpy correction and a slow one cannot get a
+        // visible one.
+        const next_start_ns = self.timing.nextStartNs(self.interval_start_ns, boundary_ns);
+        self.interval_start_ns = next_start_ns;
+        self.publishClockTelemetry();
+
         if (self.opts.stop_after_intervals) |n_stop| {
             // kujamba (#12): the cap counts intervals, so it reads the
             // monotonic sequence — a config change must not extend the run
@@ -1013,6 +1185,14 @@ pub const Session = struct {
             }
             self.interval_len_samples = @intCast(@divTrunc(@as(u64, self.opts.srate) * @as(u64, cfg.bpi) * 60, @as(u64, cfg.bpm)));
             self.interval_start_ns = clock.nowNs(self.io);
+            // kujamba (#13): anchor the disciplined grid on this boundary. The
+            // `0x02` arrival is the only place the server ever tells the client
+            // where its grid is, so it is the only place a re-anchor belongs —
+            // and re-anchoring the clock (not just the start time) is what keeps
+            // the drift ledger continuous across a tempo change instead of
+            // quietly restarting at zero.
+            self.timing.anchor(self.interval_start_ns, cfg.bpm, cfg.bpi);
+            self.publishClockTelemetry();
             // kujamba (#12): only the grid geometry moves. The bar counter and
             // the phrase cursor stay put, and the interval sequence keeps
             // climbing, so no guid repeats and no payload dump is overwritten.
@@ -1023,6 +1203,11 @@ pub const Session = struct {
             });
             self.log.line("re-anchored to bpm={d} bpi={d}: next interval {d} at grid bar {d} (phrase continues)", .{
                 cfg.bpm, cfg.bpi, self.index.seq, self.index.grid,
+            });
+            self.log.line("server clock: bar={d}ns slew limit={d}ms lead={d} samples", .{
+                self.timing.interval_ns,
+                @divTrunc(self.timing.slewLimitNs(), std.time.ns_per_ms),
+                self.timing.encodeLeadSamples(self.interval_len_samples),
             });
         }
     }
@@ -1623,6 +1808,348 @@ test "kujamba: a rest bar still rebinds the mode, so a switch while resting land
 /// stack buffer.
 fn onePhraseBank(alloc: std.mem.Allocator, samples: []const f32) !kujamba_out.PhraseBank {
     return kujamba_out.PhraseBank.initBorrowed(alloc, &.{"test"}, &.{samples});
+}
+
+/// A socketpair whose client end has a deliberately tiny send buffer and a peer
+/// that never reads — the one shape that reliably produces `EAGAIN`.
+///
+/// Loopback TCP is not usable for this: measured on macOS, a socketpair peer
+/// that stops reading still absorbs **654 KB** with `SO_RCVBUF` set to 4096,
+/// because the loopback path does not honour the receive window the way a real
+/// network does. So end-to-end backpressure is a *slow-peer* failure, not a
+/// jitter failure, and on loopback it is not reachable inside a test's patience.
+/// A socketpair has a genuinely bounded buffer, which is what makes the drop
+/// path testable at all — and it is the same `Conn`, the same `sendMessageBounded`
+/// and the same `finalizeInterval`, only with a smaller pipe.
+fn saturatedSocketPair() ![2]std.posix.socket_t {
+    var fds: [2]std.posix.socket_t = undefined;
+    const rc = std.posix.system.socketpair(@intCast(std.posix.AF.UNIX), @intCast(std.posix.SOCK.STREAM), 0, &fds);
+    if (std.posix.errno(rc) != .SUCCESS) return error.SocketPairFailed;
+    std.posix.setsockopt(fds[0], std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, &std.mem.toBytes(@as(i32, 4096))) catch {};
+    std.posix.setsockopt(fds[1], std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, &std.mem.toBytes(@as(i32, 4096))) catch {};
+    // non-blocking on BOTH ends: the peer must be able to be drained without
+    // blocking, and the client end already is on the real path
+    for (fds) |fd| {
+        var o: std.c.O = @bitCast(@as(u32, @intCast(std.c.fcntl(fd, std.c.F.GETFL, @as(c_int, 0)))));
+        o.NONBLOCK = true;
+        _ = std.c.fcntl(fd, std.c.F.SETFL, @as(c_int, @bitCast(o)));
+    }
+    return fds;
+}
+
+/// Fill a non-blocking socket until `write` returns `EAGAIN`. Returns the bytes
+/// it took, so a test can assert the pipe really was full.
+fn fillUntilBlocked(fd: std.posix.socket_t, buf: []const u8) usize {
+    var total: usize = 0;
+    while (true) {
+        const rc = std.posix.system.write(fd, buf.ptr, buf.len);
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => total += @intCast(rc),
+            else => return total,
+        }
+    }
+}
+
+fn drainSocket(fd: std.posix.socket_t, buf: []u8) usize {
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = std.posix.read(fd, buf) catch break;
+        if (n == 0) break;
+        total += n;
+    }
+    return total;
+}
+
+// #14: a socket that cannot take the bar costs the bar, not the audio clock.
+//
+// This is the acceptance test the issue asks for, end to end through
+// `finalizeInterval`. Before the fix this call did not return at all: `send()`
+// went to `net.zig`'s `sendMessage`, whose EAGAIN branch polls in a loop until
+// the peer reads. The bound asserted here is deliberately generous — a poll
+// syscall and a log line — because the point is only that it is *bounded*.
+test "kujamba: a blocked socket drops the bar instead of stalling the clock (#14)" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var phrase = [_]f32{ 0.1, 0.2, 0.3, 0.4, 0.5, 0.6 };
+    var bank = try onePhraseBank(alloc, &phrase);
+    defer bank.deinit();
+    var fill = kujamba_out.Fill{ .mode = .loop };
+    fill.bind(.loop, bank.active());
+    const pattern = try kujamba_out.parsePattern("1");
+    var adapter = kujamba_out.PlanAdapter{ .pattern = &pattern, .bank = &bank };
+
+    const fds = try saturatedSocketPair();
+    defer _ = std.posix.errno(std.posix.system.close(fds[1])); // fds[0] is s.conn's
+    var s = try Session.init(alloc, io, .{
+        .srate = 48000,
+        .channel_names = &.{"kujamba"},
+        .source = .{ .kujamba = &fill },
+        .id_seed = 42,
+        .plan = .{ .ctx = @ptrCast(&adapter), .selectFor = kujamba_out.PlanAdapter.selectForFn },
+    });
+    defer s.deinit();
+    s.conn = .{ .io = io, .fd = fds[0] };
+    s.log.quiet = true;
+
+    // a live session with a running interval clock, as `onConfig` leaves it
+    s.state = .active;
+    s.bpm = 120;
+    s.bpi = 4;
+    s.interval_len_samples = 96000; // 2 s at 48 kHz
+    s.interval_start_ns = clock.nowNs(io);
+    s.timing.anchor(s.interval_start_ns, s.bpm, s.bpi);
+    const dropped_guid = s.locals[0].guid;
+    try s.startIntervalEncoders();
+    // the bar has real audio in it, so this is a bar worth losing
+    var block: [960]f32 = undefined;
+    for (&block, 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i)) * 0.05) * 0.5;
+    for (s.locals) |*lc| {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(alloc);
+        try lc.enc.?.encode(&block, &out);
+        try lc.pending.add(out.items);
+    }
+    const pending_before = s.locals[0].pending.len;
+    try std.testing.expect(pending_before > 0);
+
+    // the peer stops reading: fill the pipe
+    var junk: [4096]u8 = undefined;
+    @memset(&junk, 0xA5);
+    const absorbed = fillUntilBlocked(fds[0], &junk);
+    try std.testing.expect(absorbed > 0);
+    try std.testing.expect(!s.conn.?.writable()); // the gate agrees it is full
+
+    // the bar is finalized against a socket that cannot take it
+    const t0 = clock.nowNs(io);
+    try s.finalizeInterval();
+    const elapsed_ms = @divTrunc(clock.nowNs(io) - t0, std.time.ns_per_ms);
+
+    // the bar is counted as lost, and NOT as uploaded
+    try std.testing.expectEqual(@as(u64, 1), s.stats.intervals_dropped);
+    try std.testing.expectEqual(@as(u64, 0), s.stats.intervals_uploaded);
+    try std.testing.expectEqual(@as(u64, 0), s.stats.intervals_broadcast);
+    try std.testing.expect(s.stats.upload_bytes_dropped > 0);
+    // and not one byte of it was counted as uploaded, which is the other half
+    // of "dropped": a bar cannot be both lost and sent
+    try std.testing.expectEqual(@as(u64, 0), s.stats.upload_bytes);
+    try std.testing.expectEqual(@as(u64, 0), s.stats.upload_chunks);
+    // the clock did not stop: the sequence moved on
+    try std.testing.expectEqual(@as(u64, 1), s.index.seq);
+    // and the bar it moved by is bounded (#13's "no audible jumps", asserted
+    // where it is applied). This bar was finished *early* — the test finalizes
+    // straight after encoding 20 ms of a 2 s bar — so the correction runs
+    // backwards, which is exactly the case a one-sided clamp would get wrong.
+    const nominal_next = s.timing.boundaryNs(0) + s.timing.interval_ns;
+    const applied = s.interval_start_ns - nominal_next;
+    try std.testing.expect(@abs(applied) <= s.timing.slewLimitNs());
+    try std.testing.expect(applied < 0); // early bar -> pulled back, not pushed on
+    // the next bar is a fresh guid, so the server cannot read the retry as a
+    // continuation of the guid it never finished receiving
+    try std.testing.expect(!std.mem.eql(u8, &dropped_guid, &s.locals[0].guid));
+
+    // this is the acceptance criterion: bounded, not merely "eventually".
+    // Pre-fix it was unbounded (measured >5 s and still not returning).
+    try std.testing.expect(elapsed_ms < 250);
+}
+
+// #14: a drop can happen mid-interval, not only at the boundary.
+//
+// The chunk streaming inside `advanceAudio` sends `0x83`/`0x84` too, on the same
+// audio-clock path, so it needs the same gate. When it trips, the channel is
+// already `dropped` by the time `finalizeInterval` runs — which is what the
+// `if (lc.dropped) continue` at the top of that loop is for. Without this test
+// that guard could be deleted and nothing would notice.
+test "kujamba: a mid-interval chunk that would block drops the bar and stays dropped (#14)" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var phrase = [_]f32{0.1} ** 4096;
+    var bank = try onePhraseBank(alloc, &phrase);
+    defer bank.deinit();
+    var fill = kujamba_out.Fill{ .mode = .loop };
+    fill.bind(.loop, bank.active());
+    const pattern = try kujamba_out.parsePattern("1");
+    var adapter = kujamba_out.PlanAdapter{ .pattern = &pattern, .bank = &bank };
+
+    const fds = try saturatedSocketPair();
+    defer _ = std.posix.errno(std.posix.system.close(fds[1]));
+    var s = try Session.init(alloc, io, .{
+        .srate = 48000,
+        .channel_names = &.{"kujamba"},
+        .source = .{ .kujamba = &fill },
+        .id_seed = 42,
+        .plan = .{ .ctx = @ptrCast(&adapter), .selectFor = kujamba_out.PlanAdapter.selectForFn },
+    });
+    defer s.deinit();
+    s.conn = .{ .io = io, .fd = fds[0] };
+    s.log.quiet = true;
+    s.state = .active;
+    s.bpm = 120;
+    s.bpi = 4;
+    s.interval_len_samples = 96000;
+    s.interval_start_ns = clock.nowNs(io) - @as(i128, 96000) * 1_000_000_000 / 48000;
+    s.timing.anchor(s.interval_start_ns, s.bpm, s.bpi);
+    try s.startIntervalEncoders();
+
+    // the peer stops reading before the bar even starts
+    var junk: [4096]u8 = undefined;
+    @memset(&junk, 0xA5);
+    _ = fillUntilBlocked(fds[0], &junk);
+
+    // generate a whole bar's worth: the chunk streaming inside advanceAudio has
+    // to try to send, and must fail without blocking. Note that advanceAudio
+    // finalises the bar itself once `produced` reaches the end, so the drop is
+    // observed through the counters rather than through `lc.dropped`, which the
+    // next `startIntervalEncoders` has already cleared.
+    const t0 = clock.nowNs(io);
+    try s.advanceAudio(clock.nowNs(io));
+    const elapsed_ms = @divTrunc(clock.nowNs(io) - t0, std.time.ns_per_ms);
+
+    // the mid-interval send tripped the gate, and the bar was counted once
+    try std.testing.expectEqual(@as(u64, 1), s.stats.intervals_dropped);
+    try std.testing.expectEqual(@as(u64, 0), s.stats.intervals_uploaded);
+    try std.testing.expectEqual(@as(u64, 0), s.stats.upload_bytes);
+    try std.testing.expectEqual(@as(u64, 0), s.stats.upload_chunks);
+    // THIS is what the `if (lc.dropped) continue` at the top of
+    // `finalizeInterval` buys. Without it, a channel dropped mid-interval falls
+    // through to the "nothing encoded at all, send a silence marker" branch —
+    // and the room hears a rest bar where the instrument was actually playing.
+    // A dropped bar has to be silent about itself, not lie about why.
+    try std.testing.expectEqual(@as(u64, 0), s.stats.silence_markers);
+    try std.testing.expect(elapsed_ms < 250);
+}
+
+test "kujamba: one lost bar is counted once, however many channels were on it (#14)" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var phrase = [_]f32{0.1} ** 4096;
+    var bank = try onePhraseBank(alloc, &phrase);
+    defer bank.deinit();
+    var fill = kujamba_out.Fill{ .mode = .loop };
+    fill.bind(.loop, bank.active());
+    const pattern = try kujamba_out.parsePattern("1");
+    var adapter = kujamba_out.PlanAdapter{ .pattern = &pattern, .bank = &bank };
+
+    const fds = try saturatedSocketPair();
+    defer _ = std.posix.errno(std.posix.system.close(fds[1]));
+    // TWO channels on one blocked socket. The point is the accounting: a bar
+    // the room did not hear is one lost bar, not one per channel. Counting per
+    // channel would report a two-channel client as twice as broken as it is.
+    var s = try Session.init(alloc, io, .{
+        .srate = 48000,
+        .channel_names = &.{ "kujamba", "kujamba2" },
+        .source = .{ .kujamba = &fill },
+        .id_seed = 42,
+        .plan = .{ .ctx = @ptrCast(&adapter), .selectFor = kujamba_out.PlanAdapter.selectForFn },
+    });
+    defer s.deinit();
+    s.conn = .{ .io = io, .fd = fds[0] };
+    s.log.quiet = true;
+    s.state = .active;
+    s.bpm = 120;
+    s.bpi = 4;
+    s.interval_len_samples = 96000;
+    s.interval_start_ns = clock.nowNs(io);
+    s.timing.anchor(s.interval_start_ns, s.bpm, s.bpi);
+    try s.startIntervalEncoders();
+    var block: [960]f32 = undefined;
+    for (&block, 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i)) * 0.05) * 0.5;
+    for (s.locals) |*lc| {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(alloc);
+        try lc.enc.?.encode(&block, &out);
+        try lc.pending.add(out.items);
+    }
+
+    var junk: [4096]u8 = undefined;
+    @memset(&junk, 0xA5);
+    _ = fillUntilBlocked(fds[0], &junk);
+    try s.finalizeInterval();
+
+    try std.testing.expectEqual(@as(usize, 2), s.locals.len);
+    // one bar lost ...
+    try std.testing.expectEqual(@as(u64, 1), s.stats.intervals_dropped);
+    try std.testing.expectEqual(@as(u64, 0), s.stats.intervals_uploaded);
+    // ... and no audio from either channel credited to the room
+    try std.testing.expectEqual(@as(u64, 0), s.stats.intervals_broadcast);
+    try std.testing.expectEqual(@as(u64, 0), s.stats.upload_channels);
+    // but the clock moved exactly one bar, not two
+    try std.testing.expectEqual(@as(u64, 1), s.index.seq);
+}
+
+test "kujamba: the session recovers and uploads the next bar once the peer drains (#14)" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var phrase = [_]f32{ 0.1, 0.2, 0.3, 0.4, 0.5, 0.6 };
+    var bank = try onePhraseBank(alloc, &phrase);
+    defer bank.deinit();
+    var fill = kujamba_out.Fill{ .mode = .loop };
+    fill.bind(.loop, bank.active());
+    const pattern = try kujamba_out.parsePattern("1");
+    var adapter = kujamba_out.PlanAdapter{ .pattern = &pattern, .bank = &bank };
+
+    const fds = try saturatedSocketPair();
+    defer _ = std.posix.errno(std.posix.system.close(fds[1])); // fds[0] is s.conn's
+    var s = try Session.init(alloc, io, .{
+        .srate = 48000,
+        .channel_names = &.{"kujamba"},
+        .source = .{ .kujamba = &fill },
+        .id_seed = 42,
+        .plan = .{ .ctx = @ptrCast(&adapter), .selectFor = kujamba_out.PlanAdapter.selectForFn },
+    });
+    defer s.deinit();
+    s.conn = .{ .io = io, .fd = fds[0] };
+    s.log.quiet = true;
+    s.state = .active;
+    s.bpm = 120;
+    s.bpi = 4;
+    s.interval_len_samples = 96000;
+    s.interval_start_ns = clock.nowNs(io);
+    s.timing.anchor(s.interval_start_ns, s.bpm, s.bpi);
+    try s.startIntervalEncoders();
+
+    // bar 1: blocked, dropped
+    var junk: [4096]u8 = undefined;
+    @memset(&junk, 0xA5);
+    _ = fillUntilBlocked(fds[0], &junk);
+    try s.finalizeInterval();
+    try std.testing.expectEqual(@as(u64, 1), s.stats.intervals_dropped);
+    const dropped_guid = s.locals[0].guid;
+
+    // the peer wakes up and drains
+    var sink: [65536]u8 = undefined;
+    _ = drainSocket(fds[1], &sink);
+    try std.testing.expect(s.conn.?.writable());
+
+    // bar 2: the same audio, a fresh guid, and this time it goes out
+    var block: [960]f32 = undefined;
+    for (&block, 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i)) * 0.05) * 0.5;
+    for (s.locals) |*lc| {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(alloc);
+        try lc.enc.?.encode(&block, &out);
+        try lc.pending.add(out.items);
+    }
+    try s.finalizeInterval();
+
+    try std.testing.expectEqual(@as(u64, 1), s.stats.intervals_uploaded);
+    try std.testing.expectEqual(@as(u64, 1), s.stats.intervals_broadcast);
+    try std.testing.expect(s.stats.upload_bytes > 0);
+    // the dropped bar's guid was never completed and the next one is a NEW guid,
+    // so the server cannot mistake the retry for a continuation
+    try std.testing.expect(!std.mem.eql(u8, &dropped_guid, &s.locals[0].guid));
+    try std.testing.expectEqual(@as(u64, 2), s.index.seq);
 }
 
 test "kujamba: a !kujamba mode command over 0xC0 lands at the next bar, not mid-bar" {

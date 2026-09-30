@@ -7,10 +7,11 @@ and which decisions get made once instead of three times.
 The dependency edges below are also encoded as GitHub `blocked-by` relations on
 the issues themselves, so `gh issue view 12` shows them without reading this.
 
-**State at time of writing:** 4 milestones (M4–M8), M4 complete. `zig build test`
-→ **148/148 pass** in five suites, in both Debug and ReleaseSafe. CI gates pushes
-and PRs (build + test, `build-test`, on Linux); it is not yet required by `main`'s
-ruleset, and it does not yet run the live demo (#27).
+**State at time of writing:** 4 milestones (M4–M8), M4 complete and M5 complete
+(#13 + #14 landed together). `zig build test` → **175/175 pass** in five suites,
+in Debug, ReleaseSafe and `-Dlive=false`. CI gates pushes and PRs (build + test,
+`build-test`, on Linux); it is not yet required by `main`'s ruleset, and it does
+not yet run the live demo (#27).
 
 Two open issues (#40, #41) are crash bugs the #26 fuzzer found in the client:
 a wire-controlled `channel_id >= 32` and a `bpm=0` config both panic. Both are
@@ -37,6 +38,8 @@ unblocks them (#11) is the smallest item in M4.
 | **#19** Offline render | ✅ **done** — `kujamba render`, see below | verification harness for M6 |
 | **#8** Phrase bank | ✅ **done** — `--phrases FILE` + `!kujamba <n\|name>` | M4 complete |
 | **#27** CI demo | Extends the existing `build-test` job with the live reference-server run | #28 (flake rate), the safety net for everything |
+| **#13** Server-clock discipline | ✅ **done** — `ServerClock`, bounded slew, encode lead | M5 complete |
+| **#14** Upload backpressure | ✅ **done** — measured, then bounded write + drop-and-continue | M5 complete |
 
 Everything else is Wave 2+ and can proceed in parallel once the above land.
 
@@ -118,14 +121,25 @@ maintainable if new divergence is batched, not dripped in per-issue.
 | File | Status | Diverged by |
 |---|---|---|
 | `src/ninjam/session.zig` | **already diverged** (kujamba hooks) | #12, #13, #14, #24, #25 |
-| `src/ninjam/net.zig` | byte-identical | #23, #25 |
+| `src/ninjam/net.zig` | **already diverged** (`writeAllBounded` / `sendMessageBounded` / `writable`) | #14, #23, #25 |
 | `src/ninjam/proto.zig` | byte-identical | #26 — *only if* the harness lands in-tree |
 | `src/ninjam/buf.zig` | byte-identical | #26 — *only if* the harness lands in-tree |
 | `src/ninjam/audio.zig` | byte-identical (live path compiled out) | #20 (`-Dlive` toggle + miniaudio) |
-| `src/ninjam_out.zig` | **new** (not vendored) | #10, #11, #12, #17, #22 |
+| `src/ninjam_out.zig` | **new** (not vendored) | #10, #11, #12, #13, #17, #22 |
 | `src/kujamba_main.zig` | **new** (not vendored) | #8, #9, #19, #20, #21, #22, #25 |
+| `src/kujamba_timing.zig` | **new** (not vendored) | #13, #14 — the M5 timing harness |
 | `src/synth.zig` | **new** (not vendored) | #15, #16, #18 |
 | `src/golden.zig` | **new** (not vendored) | guards #15, #16, #17, #18 |
+
+> **`net.zig` had to be touched, and it is worth being honest about why.** The
+> rule above is "push down into `src/ninjam/` only when there's no choice", and
+> for #14 there was not one. The stall is *inside* `writeAllRaw`: the socket is
+> non-blocking, so a peer that stops reading turns `write` into EAGAIN, and the
+> EAGAIN branch polls for 1000 ms in a loop while discarding the result. No
+> caller can bound that from outside — the only lever a caller has is whether to
+> call, and "don't call" is not the same as "call and give up". The change is
+> purely additive: `writeAllRaw`/`sendMessage` are untouched and still used by
+> every non-upload message, and three new functions sit beside them.
 
 **Rule of thumb:** if a change can live in `ninjam_out.zig` or
 `kujamba_main.zig`, it should. Push down into `src/ninjam/` only when there's no
@@ -146,6 +160,8 @@ recommended answer.
 |---|---|---|
 | **Is the voice preset part of the render key?** There is no render key today — `synth.zig:408` seeds the PRNG from `Wyhash.hash(0x5EED_F00D, phrase)`, text only. | #15, #16 | Decide once, document as a determinism claim. Keeping intensity *out* of the seed gives two intensities of one phrase identical noise — arguably better for A/B. |
 | **`interval_seq` vs `interval_idx`** | #12, #24, #29 | **Settled** — split as `IntervalIndex{seq, grid}`. See the bug section above. |
+| **Is the bar grid open or closed loop?** | #13, #24, #29 | **Settled — closed loop, correcting toward the wall clock.** `interval_start_ns += interval_ns` silently inherited every stall into the next bar. `ServerClock` measures each crossing and applies a correction bounded by both a fraction of the bar and 40 ms absolute. Deliberately *not* locked to the server's epoch: that offset is a constant of unknown one-way latency and the server re-times on arrival anyway. See "What drift actually is" above. |
+| **How long may a socket write wait?** | #14, #24 | **Settled — zero, on the audio-clock path.** A bar is worth one bar of audio and the socket is not worth any of it. Uploads get `sendMessageBounded(..., 0)`; control messages (keepalive, chat, registration) keep using the unbounded `sendMessage`, because losing those ends the session rather than skipping a bar, and they are a handful of bytes against a socket with room. |
 | **Where does the loop crossfade live?** | #17, #8 | In `Fill.copyInto` (`cursor % n` at `ninjam_out.zig:72`), **not** in `renderPhraseF32`. In the render it would double-fade and wrongly affect `repeat`/`once`. |
 | **Golden hash for the synth** | #15, #16, #17, #18 | **Settled, and not a byte hash.** An exact WAV SHA-256 was tried and rejected on measurement: Debug and ReleaseSafe render different exact bytes from identical source, because LLVM contracts the synth's `@exp`/`@sin` differently per optimization level. Measured across all 7 baseline entries, the exact WAV hash differs between modes for **3 of them** (`kujamba karibu`, `asante sana kijiji`, `shuzi seed 0`) — the shorter, simpler renders happen to be stable, so a byte-hash guard would look fine locally and go red on CI. `src/golden.zig` instead asserts syllable count, sample count, peak, zero crossings, and a SHA-256 of the 10 ms windowed RMS envelope, which is bit-identical across modes on all 7. Expect it to fire on every M6 change; that is the point. |
 | **CI gate strictness** | #27, #28 | Start report-only, flip to required after a green streak. That streak is the flake-rate data #28 needs. |
@@ -167,7 +183,11 @@ fix, the other is the harness that makes M6 verifiable without a room.
 - **M4:** #8, #9 — ✅ **M4 is complete.** A bandleader can now shape the
   performance entirely from room chat: `!kujamba <verb>` for transport,
   `!kujamba <n|name>` for the phrase, every one of them landing on a bar line.
-- **M5:** #13, #14
+- **M5:** #13, #14 — ✅ **M5 is complete.** Both landed together because they are
+  the same defect seen from two sides: a bar's audio is generated on a wall
+  clock, and the upload of that bar happens inline on the same path. #13 makes
+  the clock honest about being late; #14 stops it being late on a peer's
+  schedule. Fixing either alone leaves the other half of the stall.
 - **M6:** #15, #16, #17
 - **M8:** #26 (fuzz — keep the harness out-of-tree) — ✅ **landed**
 
@@ -179,13 +199,47 @@ fix, the other is the harness that makes M6 verifiable without a room.
 honestly a separate job (Winsock shim + console handler) — consider splitting it
 and landing Linux first.
 
-### Wave 3 — investigation close-out
-- **#28** — local repros can start immediately; the *close* waits on #27's rate.
+### Wave 3 — investigation close-out- **#28** — local repros can start immediately; the *close* waits on #27's rate.
   Do not close via #24: reconnect makes the symptom survivable, which masks a
   real server-side or local-side defect rather than fixing it.
 
 ### Wave 4 — vendored reconciliation
 - **#29** — batched, last.
+
+---
+
+## Mutation testing
+
+`./mutate.sh` breaks one guard at a time and reports which tests went red. It
+exists because **a test that passes whether or not the guard is present is worse
+than no test** — it reads as coverage and is not — and because "I wrote a test
+for it" is not evidence that the test *bites*. It reports four outcomes
+(`CAUGHT` / `SURVIVED` / `NO-OP` / `BUILD ERROR`), restores every file
+afterwards, and ends with a clean `zig build test` so the evidence ends where it
+should: reverted, still green.
+
+Three things it caught that reading the code did not:
+
+- The first sweep reported **8 of 12 survivors**, and every one was real. Two
+  were harness bugs (`sed -i ''` on BSD swallowing the expression as the backup
+  extension; a test-failure grep that missed `ninjam.session.test....` because
+  the module name contains a dot). The rest were tests that passed for the wrong
+  reason: the timing tests passed a literal `0` instead of the session's own
+  `upload_write_budget_ms`, so turning the budget back into a second changed
+  nothing they measured.
+- The #14 drop tests all used **one channel**, which made `if (lc.broadcast and
+  !lc.dropped)` invisible — both conjuncts agreed on every input the tests could
+  produce. The two-channel test is what closes it, and it exists now for the
+  accounting: a bar the room did not hear is one lost bar, not one per channel.
+- One survivor turned out to be **redundant code**, not a test gap:
+  `intervals_broadcast` is only accumulated on the `else` of `if (dropped_here)`,
+  so `!lc.dropped` in the line above can never matter. It stays — a correct local
+  expression beats one that is correct only in context — and `mutate.sh` says so
+  next to the entry rather than leaving a reader to rediscover it.
+
+`NO-OP` and `BUILD ERROR` are failures of the *script*, not of the code, and they
+are reported separately for that reason: an entry that does not compile tells you
+nothing about the guard it meant to break.
 
 ---
 
@@ -251,6 +305,66 @@ and landing Linux first.
 - **#14's backpressure is already observable.** The run loop's
   `pollReadable(20)` already eats up to 20 ms of the audio budget per pass, and
   `send()` runs inline from `finalizeInterval`. Measure before fixing.
+  ✅ **Measured, and worse than "observable".** `net.zig`'s `writeAllRaw` answers
+  EAGAIN with `poll(&fds, 1000)` **inside a loop, discarding the return value** —
+  so it does not wait "up to a second", it waits a second, wakes, retries, and
+  waits again, indefinitely, until the peer reads or the socket dies. One 16 KiB
+  `sendMessage` against a socket whose peer had stopped reading **did not return
+  after 5000 ms** and would not have returned at all. `finalizeInterval` called
+  it inline. The fix is a bounded write (`writeAllBounded`, deadline not
+  per-attempt timeout) plus a **zero** millisecond budget on the upload path.
+  Same shape as #17's crossfade and #18's clamps: the guard that looked like a
+  nicety was hiding an unbounded wait.
+
+- **"Would block" is only reachable on a socket with a bounded buffer, and
+  macOS loopback has none.** A loopback peer that stops reading still absorbs
+  **654 KB** with `SO_RCVBUF` pinned to 4096 — measured, twice, at two different
+  request sizes — so `write` never returns EAGAIN on loopback and the whole drop
+  path is unreachable inside a test's patience. It is also why the hazard is a
+  *slow-peer* failure measured in seconds, not a jitter failure. A Unix
+  `socketpair` has a genuinely bounded buffer (measured: full at exactly the
+  requested `SO_SNDBUF`), so `src/kujamba_timing.zig` and the `session.zig`
+  backpressure tests use one and feed a `net.Conn` its fd. The lesson for the
+  next agent: **on macOS, reach for a socketpair before concluding a network
+  condition cannot be tested.** A related trap, already hit once here: on this
+  platform `poll(POLLOUT)` stays *false* on a socketpair that has room for a
+  few hundred bytes, so `Conn.writable()` is a reliable "is this wide open"
+  check but not a reliable "could this frame fit" check — which is exactly why
+  `sendUpload` needs both.
+
+- **What drift actually is (and why the correction does not chase the server's
+  clock).** The local bar grid and the server's grid both advance by one bar and
+  both start at the `0x02` arrival, so the difference between them is a
+  **constant** — the one-way latency of the config message — and a constant the
+  client cannot measure and does not need to: the server re-times an upload on
+  arrival. What actually accumulated was **execution lag**: the run loop's 20 ms
+  poll granularity plus whatever `finalizeInterval` spent on the wire, stolen from
+  every subsequent bar's generation budget and never given back, which
+  `advanceAudio` then repaid as one catch-up burst. So `ServerClock` corrects
+  toward the **wall clock**, not toward the server's epoch. Correcting toward the
+  epoch would have looked more faithful and been wrong.
+
+- **The bar's nanosecond length was truncated twice.** The session derived a bar
+  as `@divTrunc(interval_len_samples * 1e9 / srate)` from a sample count that had
+  itself been truncated from `srate * bpi * 60 / bpm`. At 48 kHz / 5 bpi / 137 bpm
+  that is 2 189 770 833 ns against the exact 2 189 781 021 ns — 10.2 us short,
+  every bar, forever, with nothing measuring it. One division from the wire
+  values (`kujamba_out.intervalNsFor`) has no such error. Small, systematic, and
+  entirely invisible: the kind of thing #13 exists to notice.
+
+- **An encode lead longer than the bar is a silent, permanent stall.** If the
+  encoder is asked to run more than one bar ahead, then `produced < target` in
+  `advanceAudio` is false before the bar begins, `finalizeInterval` never fires,
+  and the session sits there uploading nothing forever. It is not reachable at
+  `max_slew_div = 100` — `lead_ns ≤ interval_ns / 100`, so `lead_samples ≤
+  bar / 100` — which is why the explicit `@min(..., interval_len_samples)` is
+  defence-in-depth rather than logic, and why the test sweeps the tempo range
+  and asserts the property instead of trusting the algebra. Two related shapes
+  from the same sweep: `per_sample` is `1e9 / srate` (20.8 us at 48 kHz) for
+  *every* tempo, so a bar of a few tens of samples cannot carry a lead worth
+  naming and it correctly rounds to zero; and at 48 kHz / 1 bpi / 65535 bpm the
+  bar is 43 samples, so a guard written as "the lead is small" is meaningless
+  there and only `lead < bar` is a real property.
 - **#26's realistic bug is downstream of the parser.** The parsers are
   length-checked with `catch`; the likely panic is a consumer (e.g. `parseChat`'s
   `get(0..4)` returning empty slices). Fuzz a dispatch step, not just the parser.

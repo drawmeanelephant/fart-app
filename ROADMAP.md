@@ -15,8 +15,9 @@ own.
 
 > **Build order lives in [ISSUES.md](ISSUES.md)** — which issues block
 > which, the recommended sequencing, and the vendored-file ledger. Short version:
-> **#8, #9, #10, #11, #12, #17, #18, #19, #22, #25, #26 are landed**; next start with **#27**.
-> Everything else is downstream.
+> **#8, #9, #10, #11, #12, #17, #18, #19, #22, #25, #26 are landed**; **M4 is
+> complete** and **M5 is now complete too** (#13 and #14 landed together — they
+> share the same code path). Everything else is downstream.
 > The `blocked-by` edges are encoded on the issues themselves. Tracked as
 > [#31](https://github.com/drawmeanelephant/fart-app/issues/31).
 
@@ -72,12 +73,32 @@ real instrument is **control while it runs**.
       pattern decision only). A `0x02` config change now moves the grid geometry
       and nothing else — the bar counter, the interval sequence, and the phrase
       cursor all run through it.
-- [ ] **Server-clock discipline.** (#13) Track drift against the server's interval
-      boundary (the `0x02` config arrival + local clock) and nudge the encode
-      target so uploads land in the window even on a jittery connection.
-- [ ] **Upload backpressure.** (#14) If `write` would block, don't stall the audio
-      clock — drop to the next interval and note it in the transcript (the
-      `Stats` struct has room for a counter).
+- [x] **Server-clock discipline.** (#13) ✅ **Landed.** `kujamba_out.ServerClock`
+      anchors the bar grid on the `0x02` arrival and measures every boundary
+      crossing against its own nominal end. The correction is bounded **twice** —
+      as a fraction of the bar (1%) *and* in absolute nanoseconds (40 ms) — so a
+      fast tempo cannot get a jumpy correction and a slow one cannot get a
+      visible one. The encode target leads the wall clock by the same fraction,
+      so the final flush and its `0x84` are in flight when the boundary arrives
+      instead of starting at it; it changes *when* a bar is generated, never
+      *what*, so the encoded bytes and the determinism evidence are untouched.
+      Telemetry (`drift_ms`, `max_drift_ms`, `clock_corrections`) is in `RESULT`.
+      See "What drift actually is" in ISSUES.md — the correction deliberately
+      chases execution lag, not the server's epoch.
+- [x] **Upload backpressure.** (#14) ✅ **Landed, measured first.** The socket
+      write that stalled the audio clock was `net.zig`'s `writeAllRaw`, whose
+      EAGAIN branch polls for 1000 ms in a loop and discards the return value —
+      so it does not wait "up to a second", it waits a second, wakes, tries
+      again, and never stops. Measured: one 16 KiB `sendMessage` against a socket
+      whose peer had stopped reading **did not return after 5000 ms** and would
+      not have returned at all. `finalizeInterval` called it inline, on the
+      interval-generation path. Now `net.zig` has `sendMessageBounded`, the
+      upload path uses it with a **zero** millisecond budget, and a socket that
+      cannot take a bar costs the bar: `intervals_dropped` /
+      `upload_bytes_dropped` are counted, the transcript names the bar and why,
+      and the session continues at the next one with a fresh guid. A dropped
+      channel sends nothing further — not even a silence marker, which would
+      tell the room the instrument was resting when it was playing.
 
 ## M6 — Sounds like an instrument (the synth as a playable voice)
 
@@ -148,10 +169,11 @@ real instrument is **control while it runs**.
 
 ## Testing status (this pass)
 
-- Unit suites: **148/148 pass** (`zig build test`) — audit + synth + **golden
-  fingerprints** + kujamba glue + the vendored NINJAM modules, in five targets.
-  Synth tests are fail-against-silence enforced. Also green under
-  `-Doptimize=ReleaseSafe`, which is the mode the demo builds in.
+- Unit suites: **175/175 pass** (`zig build test`) — audit + synth + **golden
+  fingerprints** + kujamba glue + the vendored NINJAM modules + the M5 timing
+  harness, in five targets. Synth tests are fail-against-silence enforced. Also
+  green under `-Doptimize=ReleaseSafe`, which is the mode the demo builds in,
+  and under `-Dlive=false`.
 - **Synth golden fingerprints** (`src/golden.zig`, own test target): four
   phrases and three shuzi seeds, each pinned on syllable count, sample count,
   peak, zero crossings, and a SHA-256 of the 10 ms windowed RMS energy

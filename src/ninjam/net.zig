@@ -237,6 +237,92 @@ pub const Conn = struct {
         try self.writeAllRaw(&hdr);
         if (payload.len > 0) try self.writeAllRaw(payload);
     }
+
+    /// Send `data`, giving the socket at most `budget_ms` **in total** to accept
+    /// it. Returns false if the bytes did not all go out within the budget.
+    ///
+    /// This exists because `writeAllRaw` cannot be used by the audio clock. The
+    /// socket is non-blocking (`setNonblocking` runs right after connect), so a
+    /// peer that stops reading turns `write` into EAGAIN — and `writeAllRaw`'s
+    /// answer is to `poll(POLLOUT, 1000)` **in a loop, discarding the return
+    /// value**. It therefore does not wait "up to a second"; it waits a second,
+    /// wakes, tries again, waits another second, and so on, *forever*, until
+    /// the peer reads or the connection dies. `finalizeInterval` calls `send()`
+    /// inline on the interval-generation path, so that unbounded wait is a
+    /// direct stall of the audio clock — measured at >5 s and still not
+    /// returning, for a single 16 KiB upload against a socket with an 8 KiB
+    /// buffer (see `src/kujamba_timing.zig`, #14).
+    ///
+    /// A partial write is deliberately reported as a plain `false` rather than an
+    /// error: some of the bytes went out and some did not, so the frame is
+    /// incomplete. That is benign — both ends frame by the declared length, so
+    /// the server simply never completes that guid — whereas failing the session
+    /// over a peer that is briefly slow would turn a recoverable stall into a
+    /// dead performance.
+    fn writeAllBounded(self: *Conn, data: []const u8, budget_ms: i32) Error!bool {
+        if (self.fd < 0) return error.ConnectionClosed;
+        if (data.len == 0) return true;
+        // a deadline, not a per-attempt timeout: three brief stalls inside one
+        // budget must not add up to three budgets
+        const deadline_ms = clock.nowMs(self.io) + budget_ms;
+        var off: usize = 0;
+        while (off < data.len) {
+            const rc = std.posix.system.write(self.fd, data[off..].ptr, data[off..].len);
+            switch (std.posix.errno(rc)) {
+                .SUCCESS => off += @intCast(rc),
+                .AGAIN => {
+                    const left = deadline_ms - clock.nowMs(self.io);
+                    if (left <= 0) return false;
+                    var fds = [_]std.posix.pollfd{.{
+                        .fd = self.fd,
+                        .events = std.posix.POLL.OUT,
+                        .revents = 0,
+                    }};
+                    _ = try std.posix.poll(&fds, @intCast(left));
+                },
+                .INTR => {},
+                else => return error.ConnectionClosed,
+            }
+        }
+        self.last_send_ms = clock.nowMs(self.io);
+        return true;
+    }
+
+    /// `sendMessage` with a hard bound on how long it may wait for the peer.
+    ///
+    /// Returns false when the message did not go out within `budget_ms`. The
+    /// only caller that has to care is the upload path (#14), where giving up on
+    /// a bar is strictly better than stalling the audio clock behind it; every
+    /// other message can keep using `sendMessage`.
+    ///
+    /// `budget_ms = 0` never waits at all, which is what an upload wants: it
+    /// asks the socket "can you take this?" and acts on the answer instead of
+    /// discovering the answer a second later.
+    pub fn sendMessageBounded(self: *Conn, mtype: u8, payload: []const u8, budget_ms: i32) Error!bool {
+        if (payload.len > max_payload) return error.BadFrame;
+        var hdr: [5]u8 = undefined;
+        hdr[0] = mtype;
+        std.mem.writeInt(u32, hdr[1..5], @intCast(payload.len), .little);
+        if (!try self.writeAllBounded(&hdr, budget_ms)) return false;
+        if (payload.len == 0) return true;
+        return self.writeAllBounded(payload, budget_ms);
+    }
+
+    /// Would the socket accept a write right now?
+    ///
+    /// A zero-timeout `poll`, i.e. the question "is the peer keeping up" asked
+    /// without paying to find out. #14 uses it to drop a bar *before* spending
+    /// any of the bar's time on a write that cannot succeed, rather than after.
+    pub fn writable(self: *Conn) bool {
+        if (self.fd < 0) return false;
+        var fds = [_]std.posix.pollfd{.{
+            .fd = self.fd,
+            .events = std.posix.POLL.OUT,
+            .revents = 0,
+        }};
+        const n = std.posix.poll(&fds, 0) catch return false;
+        return n > 0 and (fds[0].revents & std.posix.POLL.OUT) != 0;
+    }
 };
 
 test "framing constants" {

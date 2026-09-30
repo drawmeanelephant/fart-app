@@ -486,7 +486,7 @@ fn cmdJoin(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: [
     var out_buf: [2048]u8 = undefined;
     const line = std.fmt.bufPrint(
         &out_buf,
-        "RESULT ok={} err=\"{s}\" seed={d} play={s} phrases={d} phrase={d} phrase_switches={d} phrase_rejected={d} intervals_uploaded={d} intervals_broadcast={d} silence_markers={d} payload_dumps={d} upload_chunks={d} upload_bytes={d} intervals_downloaded={d} msgs_sent={d} msgs_recv={d}\n",
+        "RESULT ok={} err=\"{s}\" seed={d} play={s} phrases={d} phrase={d} phrase_switches={d} phrase_rejected={d} intervals_uploaded={d} intervals_broadcast={d} silence_markers={d} payload_dumps={d} upload_chunks={d} upload_bytes={d} intervals_downloaded={d} msgs_sent={d} msgs_recv={d} intervals_dropped={d} upload_bytes_dropped={d} upload_stall_ms={d} drift_ms={d} max_drift_ms={d} clock_corrections={d}\n",
         .{
             ok,
             err_text,
@@ -505,6 +505,15 @@ fn cmdJoin(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: [
             stats.intervals_downloaded,
             stats.msgs_sent,
             stats.msgs_recv,
+            // M5 timing telemetry (#13, #14). `intervals_dropped` is the one a
+            // user should ever notice: a non-zero value means the room heard
+            // gaps, and the transcript names which bars and why.
+            stats.intervals_dropped,
+            stats.upload_bytes_dropped,
+            @divTrunc(stats.upload_stall_ns, std.time.ns_per_ms),
+            @divTrunc(stats.drift_ns, std.time.ns_per_ms),
+            @divTrunc(stats.max_abs_drift_ns, std.time.ns_per_ms),
+            stats.clock_corrections,
         },
     ) catch return;
     std.Io.File.stdout().writeStreamingAll(io, line) catch {};
