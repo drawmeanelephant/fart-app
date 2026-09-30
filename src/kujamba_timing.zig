@@ -617,10 +617,8 @@ test "#14: a refused frame leaves the peer's byte stream still frame-aligned" {
     // sender is loaded with *valid frames* so that the peer's stream can be
     // parsed, and so that a torn upload would be visible as a boundary error
     // rather than as junk.
-    var frame: [13]u8 = undefined;
-    frame[0] = 0x01;
-    std.mem.writeInt(u32, frame[1..5], 8, .little);
-    @memset(frame[5..], 0x7E);
+    var frame_buf: [13]u8 = undefined;
+    const frame = @constCast(buildFrame(&frame_buf, 0x01, 8, 0x7E));
 
     var payload: [16367]u8 = undefined;
     @memset(&payload, 0x5A);
@@ -628,7 +626,7 @@ test "#14: a refused frame leaves the peer's byte stream still frame-aligned" {
     const head = try std.testing.allocator.alloc(u8, 400_000);
     defer std.testing.allocator.free(head);
     var head_len: usize = 0;
-    const room = waitForPartialRoom(&conn, fds[1], 5 + payload.len, &frame, &queued, head, &head_len);
+    const room = waitForPartialRoom(&conn, fds[1], 5 + payload.len, frame, &queued, head, &head_len);
     const outcome = try conn.sendMessageBounded(proto.MSG_UPLOAD_INTERVAL_WRITE, &payload, session.upload_write_budget_ms);
     std.debug.print(
         \\  #14 aligned  {d} junk frames queued, {d} free, {d} helper bytes, {d}-byte frame -> {any}
@@ -646,7 +644,7 @@ test "#14: a refused frame leaves the peer's byte stream still frame-aligned" {
     // The two buffers are one stream: the helper above already read the first
     // `head_len` bytes off the wire, so they are put back in front before
     // parsing.
-    const sink = try std.testing.allocator.alloc(u8, 262_144);
+    const sink = try std.testing.allocator.alloc(u8, 512_000);
     defer std.testing.allocator.free(sink);
     var seen: usize = 0;
     var stalls: u32 = 0;
@@ -685,29 +683,17 @@ test "#14: a refused frame leaves the peer's byte stream still frame-aligned" {
     const total = head_len + seen;
     try std.testing.expectEqual(queued, total); // the frame contributed nothing
 
-    var off: usize = 0;
-    var frames: usize = 0;
-    while (off < total) {
-        try std.testing.expect(total - off >= 5); // a torn frame's declared tail
-        const t = sink[off];
-        const len = std.mem.readInt(u32, sink[off + 1 ..][0..4], .little);
-        try std.testing.expect(t != 0xFF);
-        try std.testing.expect(len <= net.max_payload);
-        try std.testing.expect(total - off >= 5 + len);
-        off += 5 + @as(usize, len);
-        frames += 1;
-    }
-    // Whatever is left over has to be the filler's own short final write and
-    // nothing else. `fillUntilBlocked` stops on a short write, so the junk is
-    // whole frames followed by a remainder — on macOS that remainder is 0 and on
-    // Linux it is whatever was left, which is why the first version of this
-    // reported a torn frame that the test had put there itself. A torn *upload*
-    // would show up as a different number here, or as a frame that runs past
-    // the end.
-    try std.testing.expect(total - off < frame.len);
-    try std.testing.expectEqual(queued % frame.len, total - off);
-    std.debug.print("  {d} bytes parsed as {d} whole frames, no tail\n", .{ total, frames });
-    try std.testing.expect(frames > 0);
+    // The junk is whole frames plus at most one partial frame, by construction,
+    // so the frame count and the residue are both known in advance. A torn
+    // *upload* is what would break them: its declared length would run past the
+    // end of what arrived, eating the frames behind it, so the walk would
+    // report fewer frames and a larger residue than went in.
+    const residue = total % frame.len;
+    const w = walkFrames(sink[0..total]);
+    std.debug.print("  {d} bytes walked as {d} whole frames, {d}-byte filler remainder\n", .{ total, w.frames, w.residue });
+    try std.testing.expectEqual(queued / frame.len, w.frames);
+    try std.testing.expectEqual(residue, w.residue);
+    try std.testing.expect(w.frames > 0);
 }
 
 /// A connected TCP pair on loopback whose client end has a pinned send buffer
@@ -805,8 +791,148 @@ fn tcpPairBuffered(snd_buf_bytes: i32, rcv_buf_bytes: i32) ![2]std.posix.socket_
 /// sender's room grows one byte at a time and the loop stops in the band rather
 /// than leaping over it. `getsockopt` costs about a microsecond, so a few hundred
 /// thousand samples is a couple of seconds of very fine resolution.
-fn waitForPartialRoom(conn: *net.Conn, peer: std.posix.socket_t, frame_bytes: usize, fill: []const u8, junk_out: *usize, head: []u8, head_len: *usize) usize {
-    junk_out.* = fillUntilBlocked(conn.fd, fill);
+/// What walking a NINJAM byte stream found: whole frames, plus the bytes left
+/// over that did not make one.
+pub const Walk = struct { frames: usize = 0, residue: usize = 0 };
+
+/// Walk a NINJAM byte stream exactly as the server's parser does: one type byte,
+/// a little-endian length, that many payload bytes, repeat. There is no resync
+/// marker, so this is the only reading of the stream there is.
+///
+/// A frame whose declared length runs past the end of what arrived is a *torn*
+/// frame, and that is the failure #14 exists to prevent. It cannot be reported
+/// as an error here — from inside the walk it is indistinguishable from a
+/// stream that simply stopped — so it shows up as a frame count and a residue
+/// that disagree with what went in, which is what the callers below assert.
+pub fn walkFrames(bytes: []const u8) Walk {
+    var w: Walk = .{};
+    var off: usize = 0;
+    while (off < bytes.len) {
+        if (bytes.len - off < 5) break; // too short for even a header
+        const len = std.mem.readInt(u32, bytes[off + 1 ..][0..4], .little);
+        if (len > net.max_payload) break; // not a header we can believe
+        if (bytes.len - off < 5 + @as(usize, len)) break; // the frame runs past the end
+        w.frames += 1;
+        off += 5 + @as(usize, len);
+    }
+    w.residue = bytes.len - off;
+    return w;
+}
+
+/// Build a well-formed frame of `payload_len` bytes in `out`.
+fn buildFrame(out: []u8, mtype: u8, payload_len: usize, fill: u8) []const u8 {
+    out[0] = mtype;
+    std.mem.writeInt(u32, out[1..5], @intCast(payload_len), .little);
+    @memset(out[5 .. 5 + payload_len], fill);
+    return out[0 .. 5 + payload_len];
+}
+
+// #14: the frame walk, on inputs where the answer is not in doubt.
+//
+// The socket tests that use this have to manufacture their own stream, and a
+// manufactured stream is a source of false alarms — one version of the alignment
+// test reported a torn frame that its own filler had put there. So the walk
+// itself is checked here on byte patterns with no sockets in them: a clean run of
+// frames, a run with a truncated tail, and the actual shape of the bug, where a
+// header promises 16 KiB, 6 KiB arrive, and a perfectly good frame follows. That
+// last one is the point of the whole exercise: it must *not* look like a clean
+// stream, and a test that cannot tell the difference is not testing anything.
+test "#14: a torn frame is visible to the frame walk" {
+    // a clean run of three 8-byte frames
+    var clean: [3 * 13]u8 = undefined;
+    for (0..3) |i| _ = buildFrame(clean[i * 13 ..][0..13], 0x01, 8, 0x7E);
+    const a = walkFrames(&clean);
+    try std.testing.expectEqual(@as(usize, 3), a.frames);
+    try std.testing.expectEqual(@as(usize, 0), a.residue);
+
+    // the same, with a frame cut short — the filler's permitted remainder
+    var truncated: [3 * 13 + 6]u8 = undefined;
+    for (0..3) |i| _ = buildFrame(truncated[i * 13 ..][0..13], 0x01, 8, 0x7E);
+    @memset(truncated[3 * 13 ..], 0x7E);
+    const b = walkFrames(&truncated);
+    try std.testing.expectEqual(@as(usize, 3), b.frames);
+    try std.testing.expectEqual(@as(usize, 6), b.residue);
+
+    // And the bug itself. A frame is torn — its header promises 8 bytes and 4
+    // arrive — and then two perfectly good frames follow it, as the next two
+    // bars would.
+    //
+    // The walk cannot say "that was torn": from where it stands, a frame with
+    // more bytes after it is just a frame. What it does is *disagree with the
+    // sender's account of the stream*, and the disagreement is the whole
+    // symptom. Four complete frames went in. The walk reports fewer, because the
+    // good frame behind the tear was swallowed as the torn frame's missing
+    // payload — which is exactly what the server would do, and why every message
+    // after a single torn frame is garbage.
+    var torn: [2 * 13 + 5 + 4 + 2 * 13]u8 = undefined;
+    var t: usize = 0;
+    for (0..2) |_| {
+        _ = buildFrame(torn[t..][0..13], 0x01, 8, 0x7E);
+        t += 13;
+    }
+    torn[t] = 0x84;
+    std.mem.writeInt(u32, torn[t + 1 ..][0..4], 8, .little); // promises 8
+    @memset(torn[t + 5 ..][0..4], 0x5A); // delivers 4
+    t += 5 + 4;
+    for (0..2) |_| {
+        _ = buildFrame(torn[t..][0..13], 0x01, 8, 0x7E);
+        t += 13;
+    }
+
+    const c = walkFrames(torn[0..t]);
+    try std.testing.expect(c.frames < 4); // four went in
+    try std.testing.expect(c.residue > 0); // and it did not end on a boundary
+    std.debug.print("  torn frame: 4 whole frames in, {d} frames and a {d}-byte tail out\n", .{ c.frames, c.residue });
+
+    // And the case the *length* check exists for, which is a different failure
+    // from the one above: the stream simply ends in the middle of a frame whose
+    // header is perfectly believable. Here it declares 8 payload bytes and 3
+    // arrive. That is what a truncated read looks like, and it is also exactly
+    // what the alignment test's filler can leave behind, so the residue it
+    // accounts for is this one.
+    //
+    // Worth its own case because the two checks are not redundant. The other
+    // cases here all trip the "declared length is not believable" check first,
+    // which left the length check with no test at all — a mutation removing it
+    // survived, and the walk then stepped past the end of the buffer entirely.
+    var cut: [2 * 13 + 8]u8 = undefined;
+    var c_off: usize = 0;
+    for (0..2) |_| {
+        _ = buildFrame(cut[c_off..][0..13], 0x01, 8, 0x7E);
+        c_off += 13;
+    }
+    cut[c_off] = 0x84;
+    std.mem.writeInt(u32, cut[c_off + 1 ..][0..4], 8, .little);
+    @memset(cut[c_off + 5 ..][0..3], 0x5A);
+    c_off += 8;
+    const d = walkFrames(cut[0..c_off]);
+    try std.testing.expectEqual(@as(usize, 2), d.frames);
+    try std.testing.expectEqual(@as(usize, 8), d.residue);
+}
+
+/// Fill a socket with whole copies of `frame`, writing at most one partial
+/// frame and only ever as the very last thing on the wire. Returns the total.
+///
+/// `fillUntilBlocked` is the obvious thing to reach for and it is wrong here: it
+/// stops on a *short* write without stopping the loop, so the stream can end up
+/// as whole frames, a 7-byte fragment, then more whole frames — permanently
+/// misaligned, with the parser then reading a length out of the wrong byte and
+/// reporting a torn frame that the test had manufactured. Stopping at the first
+/// short write makes the stream whole frames followed by at most one remainder,
+/// which is an exact quantity the caller can account for.
+fn fillWithWholeFrames(fd: std.posix.socket_t, frame: []u8) usize {
+    var total: usize = 0;
+    while (true) {
+        const n = std.posix.system.write(fd, frame.ptr, frame.len);
+        if (std.posix.errno(n) != .SUCCESS) return total;
+        const w: usize = @intCast(n);
+        total += w;
+        if (w < frame.len) return total; // a partial frame, and nothing after it
+    }
+}
+
+fn waitForPartialRoom(conn: *net.Conn, peer: std.posix.socket_t, frame_bytes: usize, fill: []u8, junk_out: *usize, head: []u8, head_len: *usize) usize {
+    junk_out.* = fillWithWholeFrames(conn.fd, fill);
     var spins: u32 = 0;
     // Drain first, then look. The order matters more than it looks: a
     // check-first loop returns having consumed nothing on any platform where

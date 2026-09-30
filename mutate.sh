@@ -279,6 +279,19 @@ run src/kujamba_timing.zig \
 # `head_len` non-zero everywhere, so entry 20 bites on both and the divergence
 # has nowhere left to hide.
 
+run src/kujamba_timing.zig \
+'        if (bytes.len - off < 5 + @as(usize, len)) break; // the frame runs past the end' \
+'        if (false) break;' \
+"#14: the frame walk stops noticing a frame that runs past the end" 21
+
+# `walkFrames` is the server's parser, used by the alignment test to decide
+# whether the peer's byte stream still lands on frame boundaries. Its length
+# check is the whole of that judgement: without it the walk steps past the end
+# of the stream, which is what a torn frame looks like from the inside. The
+# "torn frame is visible to the frame walk" test pins the claim directly — four
+# whole frames in, three frames and a 22-byte tail out — with no sockets in it,
+# so it cannot be lost to a platform's socket accounting.
+
 echo "=== reverted: the suite must be green again ==="
 restore
 zig build test --summary all 2>&1 | grep -E "^Build Summary:" | tail -1

@@ -8,7 +8,7 @@ The dependency edges below are also encoded as GitHub `blocked-by` relations on
 the issues themselves, so `gh issue view 12` shows them without reading this.
 
 **State at time of writing:** 4 milestones (M4–M8), M4 complete and M5 complete
-(#13 + #14 landed together). `zig build test` → **179/179 pass** in five suites,
+(#13 + #14 landed together). `zig build test` → **180/180 pass** in five suites,
 in Debug, ReleaseSafe and `-Dlive=false`. CI gates pushes and PRs (build + test,
 `build-test`, on Linux); it is not yet required by `main`'s ruleset, and it does
 not yet run the live demo (#27).
@@ -227,7 +227,7 @@ and landing Linux first.
 `./mutate.sh` breaks one guard at a time and reports which tests went red. It
 exists because **a test that passes whether or not the guard is present is worse
 than no test** — it reads as coverage and is not — and because "I wrote a test
-for it" is not evidence that the test *bites*. All twenty mutations are
+for it" is not evidence that the test *bites*. All twenty-one mutations are
 caught. It reports four outcomes
 (`CAUGHT` / `SURVIVED` / `NO-OP` / `BUILD ERROR`), restores every file
 afterwards, and ends with a clean `zig build test` so the evidence ends where it
@@ -479,6 +479,18 @@ to remove the thing it claims to break.
   from a Mac, catches it in about a minute, and is now part of how this was
   checked. Worth more than it sounds: the alternative is another round trip
   through a 10-minute CI job.
+- **The frame walk needs two checks, and testing one of them is easy to mistake
+  for testing both.** `walkFrames` stops on a declared length that cannot be
+  believed, and separately on a frame that runs past the end of the bytes. Every
+  case the first version of the torn-frame test used tripped the *first* check —
+  the garbage behind a tear reads as a length of `0x7E7E7E7E` — so the second
+  check had no test at all, and a mutation removing it survived while the suite
+  stayed green. It needed its own input: a stream that ends in the middle of a
+  frame whose header is entirely believable. That case is not contrived, by the
+  way; it is exactly what a truncated read looks like, and it is exactly what the
+  alignment test's filler leaves behind, so the residue that test accounts for
+  *is* this one. Without the check the walk then steps past the end of the buffer
+  and the residue underflows.
 - **A test can be correct on the machine that wrote it and wrong everywhere
   else, and the fix is to make the divergence impossible rather than to patch
   each platform.** The frame-alignment test takes three attempts to get right on
