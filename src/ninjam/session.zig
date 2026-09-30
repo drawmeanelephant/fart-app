@@ -743,10 +743,25 @@ pub const Session = struct {
     /// peer reads (see the note on `writeAllBounded`): unbounded, on the audio
     /// clock's own path. The zero budget turns "wait forever" into "ask once",
     /// which is the difference between dropping a bar and hanging the session.
+    ///
+    /// `false` is returned only for `SendOutcome.declined`, which is a promise
+    /// that not one byte reached the wire — that promise is what makes dropping a
+    /// bar safe, and it is why the frame-fit check lives in `sendMessageBounded`
+    /// rather than here. `.partial` gets no such promise: part of the frame is
+    /// already on the wire and the peer is about to eat the next bar's bytes as
+    /// this frame's missing tail, so continuing would turn a dropped bar into a
+    /// session that uploads nothing for the rest of its life. That is a
+    /// connection-level failure and it fails the session.
     fn sendUpload(self: *Session, mtype: u8, payload: []const u8) !bool {
         const conn = &(self.conn orelse return false);
-        if (!conn.writable()) return false;
-        if (!try conn.sendMessageBounded(mtype, payload, upload_write_budget_ms)) return false;
+        switch (try conn.sendMessageBounded(mtype, payload, upload_write_budget_ms)) {
+            .sent => {},
+            .declined => return false,
+            .partial => return self.failSession(
+                "upload frame of {d} bytes could not be written whole; the byte stream can no longer be framed, so this connection is finished",
+                .{payload.len + 5},
+            ),
+        }
         self.stats.msgs_sent += 1;
         self.stats.bytes_sent += payload.len + 5;
         self.last_keepalive_ms = clock.nowMs(self.io);

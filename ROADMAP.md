@@ -100,6 +100,24 @@ real instrument is **control while it runs**.
       channel sends nothing further — not even a silence marker, which would
       tell the room the instrument was resting when it was playing.
 
+      > A dropped bar is only safe because **nothing** of its frame reaches the
+      > wire, and the first cut of this did not guarantee that. The NINJAM frame
+      > is `[u8 type][u32 LE len][payload]` on a byte stream with no resync
+      > marker, so a torn frame is not one lost message: the server completes it
+      > with the *next* bar's bytes and then reads a header from mid-stream, and
+      > every message after that is garbage. A fresh guid does not save it —
+      > the server never sees those bytes as a guid, they are the tail of the
+      > frame before. Measured on that code: a half-full socket, a 16 KiB frame,
+      > a zero budget — refused, and **6000 bytes on the wire**. So the drop is
+      > now atomic: `net.zig` measures the send buffer's real free space
+      > (`SO_SNDBUF` − queue depth, per target) against the whole frame *before*
+      > touching the wire, and `sendMessageBounded` returns a three-valued
+      > `SendOutcome`. `declined` carries a promise that not one byte went out and
+      > is the only outcome that may drop a bar; `partial` fails the session,
+      > because by then the stream cannot be framed again. `POLLOUT` is not that
+      > question — it means "at least one byte free" and is true of a socket with
+      > 6 KiB of room and a 16 KiB frame to put there.
+
 ## M6 — Sounds like an instrument (the synth as a playable voice)
 
 - [ ] **Velocity / dynamics input.** (#15) Map a per-phrase or per-word intensity to
@@ -169,11 +187,17 @@ real instrument is **control while it runs**.
 
 ## Testing status (this pass)
 
-- Unit suites: **176/176 pass** (`zig build test`) — audit + synth + **golden
+- Unit suites: **179/179 pass** (`zig build test`) — audit + synth + **golden
   fingerprints** + kujamba glue + the vendored NINJAM modules + the M5 timing
   harness, in five targets. Synth tests are fail-against-silence enforced. Also
   green under `-Doptimize=ReleaseSafe`, which is the mode the demo builds in,
   and under `-Dlive=false`.
+- **Mutation testing** (`./mutate.sh`): **19 mutations, 19 caught, zero
+  survivors**, ending reverted-and-green. A guard with no test that bites it is
+  worse than no guard, because it reads as coverage. The two guards added for
+  the frame-atomicity fix are both covered: deleting the frame-fit check is
+  caught by the half-full-socket test, and halving its threshold is caught by
+  the same test.
 - **Synth golden fingerprints** (`src/golden.zig`, own test target): four
   phrases and three shuzi seeds, each pinned on syllable count, sample count,
   peak, zero crossings, and a SHA-256 of the 10 ms windowed RMS energy

@@ -8,7 +8,7 @@ The dependency edges below are also encoded as GitHub `blocked-by` relations on
 the issues themselves, so `gh issue view 12` shows them without reading this.
 
 **State at time of writing:** 4 milestones (M4–M8), M4 complete and M5 complete
-(#13 + #14 landed together). `zig build test` → **176/176 pass** in five suites,
+(#13 + #14 landed together). `zig build test` → **179/179 pass** in five suites,
 in Debug, ReleaseSafe and `-Dlive=false`. CI gates pushes and PRs (build + test,
 `build-test`, on Linux); it is not yet required by `main`'s ruleset, and it does
 not yet run the live demo (#27).
@@ -121,7 +121,7 @@ maintainable if new divergence is batched, not dripped in per-issue.
 | File | Status | Diverged by |
 |---|---|---|
 | `src/ninjam/session.zig` | **already diverged** (kujamba hooks) | #12, #13, #14, #24, #25 |
-| `src/ninjam/net.zig` | **already diverged** (`writeAllBounded` / `sendMessageBounded` / `writable`) | #14, #23, #25 |
+| `src/ninjam/net.zig` | **already diverged** (`writeAllBounded` / `sendMessageBounded` / `writable` / `sendRoom` / `SendOutcome`) | #14, #23, #25 |
 | `src/ninjam/proto.zig` | byte-identical | #26 — *only if* the harness lands in-tree |
 | `src/ninjam/buf.zig` | byte-identical | #26 — *only if* the harness lands in-tree |
 | `src/ninjam/audio.zig` | byte-identical (live path compiled out) | #20 (`-Dlive` toggle + miniaudio) |
@@ -162,6 +162,7 @@ recommended answer.
 | **`interval_seq` vs `interval_idx`** | #12, #24, #29 | **Settled** — split as `IntervalIndex{seq, grid}`. See the bug section above. |
 | **Is the bar grid open or closed loop?** | #13, #24, #29 | **Settled — closed loop, correcting toward the wall clock.** `interval_start_ns += interval_ns` silently inherited every stall into the next bar. `ServerClock` measures each crossing and applies a correction bounded by both a fraction of the bar and 40 ms absolute. Deliberately *not* locked to the server's epoch: that offset is a constant of unknown one-way latency and the server re-times on arrival anyway. See "What drift actually is" above. |
 | **How long may a socket write wait?** | #14, #24 | **Settled — zero, on the audio-clock path.** A bar is worth one bar of audio and the socket is not worth any of it. Uploads get `sendMessageBounded(..., 0)`; control messages (keepalive, chat, registration) keep using the unbounded `sendMessage`, because losing those ends the session rather than skipping a bar, and they are a handful of bytes against a socket with room. |
+| **May a write be half-done and then abandoned?** | #14, #31 | **Settled — no, never.** The NINJAM frame is `[u8 type][u32 LE len][payload]` on a byte stream with **no resync marker**, so a torn frame does not merely lose one message: the peer finishes it with the *next* frame's bytes, then reads a header from mid-stream, and every message after that is garbage. A half-written frame is therefore a connection-level failure, never a bar-level one. `sendMessageBounded` returns a three-valued `SendOutcome` — `sent` / `declined` / `partial` — so a caller *cannot* mistake "nothing went out" for "some went out". Only `declined` may drop a bar, and it carries a promise that not one byte reached the wire; `partial` fails the session. The drop is made atomic by measuring the send buffer's real free space (`SO_SNDBUF` − queue depth) against the whole frame before touching the wire. |
 | **Where does the loop crossfade live?** | #17, #8 | In `Fill.copyInto` (`cursor % n` at `ninjam_out.zig:72`), **not** in `renderPhraseF32`. In the render it would double-fade and wrongly affect `repeat`/`once`. |
 | **Golden hash for the synth** | #15, #16, #17, #18 | **Settled, and not a byte hash.** An exact WAV SHA-256 was tried and rejected on measurement: Debug and ReleaseSafe render different exact bytes from identical source, because LLVM contracts the synth's `@exp`/`@sin` differently per optimization level. Measured across all 7 baseline entries, the exact WAV hash differs between modes for **3 of them** (`kujamba karibu`, `asante sana kijiji`, `shuzi seed 0`) — the shorter, simpler renders happen to be stable, so a byte-hash guard would look fine locally and go red on CI. `src/golden.zig` instead asserts syllable count, sample count, peak, zero crossings, and a SHA-256 of the 10 ms windowed RMS envelope, which is bit-identical across modes on all 7. Expect it to fire on every M6 change; that is the point. |
 | **CI gate strictness** | #27, #28 | Start report-only, flip to required after a green streak. That streak is the flake-rate data #28 needs. |
@@ -226,7 +227,7 @@ and landing Linux first.
 `./mutate.sh` breaks one guard at a time and reports which tests went red. It
 exists because **a test that passes whether or not the guard is present is worse
 than no test** — it reads as coverage and is not — and because "I wrote a test
-for it" is not evidence that the test *bites*. All sixteen mutations are
+for it" is not evidence that the test *bites*. All nineteen mutations are
 caught. It reports four outcomes
 (`CAUGHT` / `SURVIVED` / `NO-OP` / `BUILD ERROR`), restores every file
 afterwards, and ends with a clean `zig build test` so the evidence ends where it
@@ -258,10 +259,31 @@ Three things it caught that reading the code did not:
   so `!lc.dropped` in the line above can never matter. It stays — a correct local
   expression beats one that is correct only in context — and `mutate.sh` says so
   next to the entry rather than leaving a reader to rediscover it.
+- The **first cut of the #14 fix was wrong in a way that read as a feature.** It
+  reported a torn frame as a plain `false`, with a comment saying that was benign
+  because "both ends frame by the declared length, so the server simply never
+  completes that guid". Backwards: the server *does* complete it, with the next
+  bar's bytes as the missing payload, and then parses the bytes after that as a
+  header from mid-stream. The fresh guid does not save it, because the server
+  never sees those bytes as a guid — they are the tail of the frame before. So
+  the first drop cost the rest of the session's uploads, silently, which is the
+  dead performance the issue exists to prevent minus the honesty of a
+  disconnect. Measured on that code: a half-full socket, a 16 KiB frame, a zero
+  budget — `false` returned, **6000 bytes on the wire**. The test that caught it
+  asserts on bytes, not on a return value, for the same reason.
 
 `NO-OP` and `BUILD ERROR` are failures of the *script*, not of the code, and they
 are reported separately for that reason: an entry that does not compile tells you
 nothing about the guard it meant to break.
+
+**A `SURVIVED` is only as interesting as the mutation that produced it.** Entry 19
+reported a survivor on its first run and the entry was worthless, not the test:
+it *inserted* a dead `if (room < 0)` in front of the real gate and left the real
+gate in place, so it broke nothing and the "hole" said nothing about coverage.
+Zig accepts `room < 0` on a `usize` and folds it away, which is exactly why the
+result looked plausible. Rewritten to remove the thing it claims to break
+(`if (room >= 0) return .declined;`), it is caught by four tests. A mutation has
+to remove the thing it claims to break.
 
 ---
 
@@ -420,3 +442,37 @@ nothing about the guard it meant to break.
 - **The `test` step description is stale.** ~~`build.zig:77` says "Run audit +
   synth unit tests" but it runs three suites (59 tests).~~ **Fixed** alongside
   the golden fingerprints: it now runs five suites (102 tests) and says so.
+- **Darwin does not implement `TIOCOUTQ` for sockets, and the replacement is not
+  obvious.** Linux answers "how full is the send queue" with `ioctl(TIOCOUTQ)`.
+  On macOS that returns `ENOTSUP` — for *both* the `'t'` spelling from its own
+  `<sys/ttycom.h>` and the `'f'` spelling you find on FreeBSD, on a socketpair
+  and on loopback TCP alike. The same number is available as the **`SO_NWRITE`
+  socket option** (0x1024, "APPLE: Get number of bytes currently in send socket
+  buffer"). `net.zig`'s `sendRoom` asks per target and returns null where neither
+  is available, which is what makes the frame-fit pre-check skippable rather
+  than a portability lie.
+- **But on a Darwin *unix socket*, `SO_NWRITE` on the writer is always 0.** The
+  send buffer belongs to the receiving end, so the writer cannot see its own
+  queue at all. Consequence for tests: **a socketpair cannot exercise the send
+  buffer accounting on macOS** — the gate would read as "the whole capacity is
+  free" and pass every write. The frame-alignment test uses a real TCP pair for
+  exactly this reason. The byte-level test does use a socketpair, but only
+  because it does not need the queue depth: it makes the buffer's *capacity*
+  smaller than one frame, which no accounting can argue its way out of.
+- **A unix socketpair's `SO_SNDBUF` is exact; a TCP one is not.** Requested 512 →
+  512, 65536 → 65536 on `AF_UNIX`; on `AF_INET` every request up to 16384 comes
+  back as 65328, and 65536 comes back as 81660. So a socketpair is the only
+  socket whose send-buffer size is a test *knob* on both platforms, and the only
+  one where "half full" is a state you can construct by arithmetic rather than by
+  waiting for a kernel to do it. On TCP the half-full state has to be waited for,
+  and even then it moves: the room settled at 16332 free on one run and at the
+  full 81660 on the next, with nothing different in between.
+- **A test can manufacture the desynchronisation it is looking for.** The first
+  version of the frame-alignment test failed intermittently with a 1–4 byte tail,
+  for a reason that had nothing to do with the code: the helper that drives the
+  socket into its half-full state drains the peer one byte at a time, and those
+  bytes came off the *front* of the stream the parser then walked. The parser
+  started mid-frame and reported a torn frame that never existed. Two lessons, in
+  order of how much they cost: keep the bytes a helper consumed, and **do not stop
+  reading a non-blocking socket on `EAGAIN`** — that means "not right now", not
+  "no more data", and breaking there truncates the stream mid-frame.

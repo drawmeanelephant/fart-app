@@ -312,13 +312,14 @@ fn drain(fd: std.posix.socket_t, view: *ServerView, budget_ms: u32) bool {
 // #14: a frame larger than the whole socket is refused, not waited on.
 //
 // `Conn.writable()` answers "could you take a write at all?" and
-// `sendMessageBounded` answers "could you take THIS write?". They are not the
+// `sendMessageBounded` answers "could you take THIS frame?". They are not the
 // same question, and only the second one is safe to act on: a socket with room
 // for a few hundred bytes says yes to the first and no to the second, and
 // trusting the first would put a frame header on the wire followed by a
 // fragment of its body — leaving the peer holding a message it has been told is
-// longer than the bytes that followed. The drop is correct; the truncated frame
-// is the part that is not.
+// longer than the bytes that followed, which on a stream with no resync marker
+// is the end of the session. `sendMessageBounded` therefore does not consult
+// `writable()` at all: it measures the room itself.
 //
 // Whether `writable()` happens to be true in a given half-full state is a
 // kernel flow-control decision and is not asserted here. What must always hold
@@ -342,13 +343,13 @@ test "#14: a frame bigger than the whole socket is refused, not waited on" {
     // 16372 bytes of frame into a socket whose whole buffer is 8192: this can
     // never succeed, however long anyone waits for it.
     const t0 = clock.nowNs(io);
-    const ok = try conn.sendMessageBounded(proto.MSG_UPLOAD_INTERVAL_WRITE, &payload, 0);
+    const outcome = try conn.sendMessageBounded(proto.MSG_UPLOAD_INTERVAL_WRITE, &payload, 0);
     const elapsed_ns = clock.nowNs(io) - t0;
     std.debug.print(
-        \\  #14 oversize  16 KiB frame into an 8 KiB socket: accepted={any} in {d} ms
+        \\  #14 oversize  16 KiB frame into an 8 KiB socket: {any} in {d} ms
         \\
-    , .{ ok, @divTrunc(elapsed_ns, std.time.ns_per_ms) });
-    try std.testing.expect(!ok);
+    , .{ outcome, @divTrunc(elapsed_ns, std.time.ns_per_ms) });
+    try std.testing.expectEqual(net.SendOutcome.declined, outcome);
     try std.testing.expect(elapsed_ns < 500 * std.time.ns_per_ms);
 
     // the session still talks to the server on the same socket: control
@@ -357,7 +358,7 @@ test "#14: a frame bigger than the whole socket is refused, not waited on" {
     var sink: [65536]u8 = undefined;
     _ = drainSocket(fds[1], &sink);
     const small = [_]u8{0x01} ** 256;
-    try std.testing.expect(try conn.sendMessageBounded(proto.MSG_UPLOAD_INTERVAL_BEGIN, &small, 0));
+    try std.testing.expectEqual(net.SendOutcome.sent, try conn.sendMessageBounded(proto.MSG_UPLOAD_INTERVAL_BEGIN, &small, 0));
 }
 
 /// A bounded sleep on the io clock. Zig 0.16 took `std.Thread.sleep` away, so
@@ -492,6 +493,295 @@ fn fillUntilBlocked(fd: std.posix.socket_t, buf: []const u8) usize {
             else => return total,
         }
     }
+}
+
+// #14: the half-full socket — the case that tore frames.
+//
+// Every other #14 test here fills the buffer *completely*, so `writable()` is
+// false and the send is refused with zero bytes written. That is the clean-drop
+// path, and it is the easy one. The realistic slow-peer state is a buffer that
+// is partly drained: POLLOUT is set as soon as *one* byte is free, so the gate
+// says yes, and a 16 KiB frame into 6 KiB of room used to put a complete
+// 16 KB-declaring header plus 5995 bytes of payload on the wire before giving
+// up. The peer then frames by the declared length, so it eats the next bar's
+// bytes as this frame's missing tail and parses whatever follows as a header
+// from mid-stream: one dropped bar's worth of tidiness bought a session that
+// uploads nothing ever again.
+//
+// Measured on this exact code before the fix: refused, and 6000 bytes on the
+// wire. The assertion below is the whole point — *zero* is the only acceptable
+// number here, and it is an assertion about bytes rather than about a return
+// value, because a return value is what was wrong last time.
+//
+// A socketpair, deliberately. The test needs a buffer with genuine room in it
+// that still cannot take a frame, and it needs that to be true *exactly*, on
+// every platform, every run. Over TCP it is neither: Darwin frees send space in
+// 16 KiB quanta and reports the queue with `SO_NWRITE`, which lags the space
+// actually available, so the "half full" state settled at 16332 bytes on one run
+// and was unreachable on the next. A socketpair's `SO_SNDBUF` is exact on both
+// platforms, and a capacity smaller than one frame is a state no kernel
+// accounting can argue its way out of.
+test "#14: a half-full socket declines the frame with zero bytes on the wire" {
+    const io = harnessIo();
+    const fds = try socketPair(8192);
+    defer {
+        _ = std.posix.errno(std.posix.system.close(fds[0]));
+        _ = std.posix.errno(std.posix.system.close(fds[1]));
+    }
+    var conn = net.Conn{ .io = io, .fd = fds[0] };
+
+    // Fill it to exactly half. This is the state the bug needs and the one no
+    // other test here reaches: the buffer has room in it, so POLLOUT is set, so
+    // the cheap gate says yes — and yet a 16 KiB frame cannot fit.
+    var junk: [4096]u8 = undefined;
+    @memset(&junk, 0xA5);
+    const queued: usize = blk: {
+        const n = std.posix.system.write(fds[0], &junk, junk.len);
+        if (std.posix.errno(n) != .SUCCESS) return error.WriteFailed;
+        break :blk @intCast(n);
+    };
+    try std.testing.expectEqual(junk.len, queued);
+    try std.testing.expect(conn.writable()); // the liar: there IS room, just not enough
+
+    var payload: [16367]u8 = undefined;
+    @memset(&payload, 0x5A);
+    const room = conn.sendRoom().?;
+    std.debug.print(
+        \\  #14 half-full  {d} of an 8 KiB buffer queued, {d} free, {d}-byte frame
+        \\
+    , .{ queued, room, payload.len + 5 });
+    try std.testing.expect(room >= 4096); // genuinely half empty
+    try std.testing.expect(room < 5 + payload.len);
+
+    const outcome = try conn.sendMessageBounded(proto.MSG_UPLOAD_INTERVAL_WRITE, &payload, session.upload_write_budget_ms);
+    std.debug.print("  -> {any}\n", .{outcome});
+    try std.testing.expectEqual(net.SendOutcome.declined, outcome);
+
+    // The assertion that was missing: not one byte of that frame crossed the
+    // wire. A lone header is already enough to do the damage, because the peer
+    // will believe the 16 KiB that follows it.
+    var sink: [65536]u8 = undefined;
+    var seen: usize = 0;
+    while (true) {
+        const n = std.posix.read(fds[1], &sink) catch break;
+        if (n == 0) break;
+        seen += n;
+    }
+    std.debug.print("  peer received {d} bytes; the harness wrote {d}, so the frame contributed {d}\n", .{ seen, queued, seen -| queued });
+    try std.testing.expectEqual(queued, seen);
+}
+
+// #14: the same claim end to end, on the socket the session actually uses, and
+// stated in the way that is true whether the gate declines the frame or accepts
+// it.
+//
+// A torn frame does not announce itself. There is no resync marker, so the only
+// way to see one is to parse the peer's byte stream exactly as the server's
+// parser would and notice that it no longer lands on a frame boundary. That is
+// what this does, and it is strictly stronger than checking a return value: it
+// does not care *how* the outcome was reached, only that the stream is still
+// framed afterwards.
+//
+// A real TCP pair rather than a socketpair, because on Darwin a unix socket
+// keeps its buffer on the receiving end and `SO_NWRITE` on the writer stays 0 —
+// the queue depth is simply not observable there, so a socketpair would exercise
+// the fallback rather than the gate.
+test "#14: a refused frame leaves the peer's byte stream still frame-aligned" {
+    const io = harnessIo();
+    const fds = try tcpPairBuffered(65536, 4096);
+    defer {
+        _ = std.posix.errno(std.posix.system.close(fds[0]));
+        _ = std.posix.errno(std.posix.system.close(fds[1]));
+    }
+    var conn = net.Conn{ .io = io, .fd = fds[0] };
+
+    // A socketpair's exact accounting is what the previous test uses; here the
+    // sender is loaded with *valid frames* so that the peer's stream can be
+    // parsed, and so that a torn upload would be visible as a boundary error
+    // rather than as junk.
+    var frame: [13]u8 = undefined;
+    frame[0] = 0x01;
+    std.mem.writeInt(u32, frame[1..5], 8, .little);
+    @memset(frame[5..], 0x7E);
+
+    var payload: [16367]u8 = undefined;
+    @memset(&payload, 0x5A);
+    var queued: usize = 0;
+    const head = try std.testing.allocator.alloc(u8, 400_000);
+    defer std.testing.allocator.free(head);
+    var head_len: usize = 0;
+    const room = waitForPartialRoom(&conn, fds[1], 5 + payload.len, &frame, &queued, head, &head_len);
+    const outcome = try conn.sendMessageBounded(proto.MSG_UPLOAD_INTERVAL_WRITE, &payload, session.upload_write_budget_ms);
+    std.debug.print(
+        \\  #14 aligned  {d} junk frames queued, {d} free, {d}-byte frame -> {any}
+        \\
+    , .{ queued / frame.len, room, payload.len + 5, outcome });
+    // The one outcome that is not allowed. `.declined` and `.sent` are both
+    // safe; only a torn frame desynchronises the peer.
+    try std.testing.expect(outcome != .partial);
+
+    // Read the peer's stream and parse it the way the server's parser does:
+    // one type byte, a little-endian length, that many payload bytes, repeat.
+    // A partial frame shows up as a length that runs past the end of what
+    // arrived, or as a trailing tail too short to be a header.
+    //
+    // The two buffers are one stream: the helper above already read the first
+    // `head_len` bytes off the wire, so they are put back in front before
+    // parsing.
+    const sink = try std.testing.allocator.alloc(u8, 262_144);
+    defer std.testing.allocator.free(sink);
+    var seen: usize = 0;
+    var stalls: u32 = 0;
+    while (seen < sink.len - head_len and stalls < 500) {
+        const n = std.posix.read(fds[1], sink[head_len + seen ..]) catch |e| switch (e) {
+            // Not "no more data", just "not right now": the sender still has
+            // bytes in flight and will hand them over as ACKs come back. Stopping
+            // here would truncate the stream mid-frame and manufacture exactly
+            // the desynchronisation this test is looking for.
+            error.WouldBlock => {
+                stalls += 1;
+                _ = sleepMs(1);
+                continue;
+            },
+            else => break,
+        };
+        if (n == 0) break;
+        seen += n;
+        stalls = 0;
+    }
+    std.mem.copyForwards(u8, sink[head_len .. head_len + seen], sink[0..seen]);
+    @memcpy(sink[0..head_len], head[0..head_len]);
+    const total = head_len + seen;
+
+    var off: usize = 0;
+    var frames: usize = 0;
+    while (off < total) {
+        try std.testing.expect(total - off >= 5); // a torn frame's declared tail
+        const t = sink[off];
+        const len = std.mem.readInt(u32, sink[off + 1 ..][0..4], .little);
+        try std.testing.expect(t != 0xFF);
+        try std.testing.expect(len <= net.max_payload);
+        try std.testing.expect(total - off >= 5 + len);
+        off += 5 + @as(usize, len);
+        frames += 1;
+    }
+    std.debug.print("  {d} bytes parsed as {d} whole frames, no tail\n", .{ total, frames });
+    try std.testing.expect(frames > 0);
+}
+
+/// A connected TCP pair on loopback whose client end has a pinned send buffer
+/// and a peer that reads nothing until told otherwise.
+///
+/// A TCP pair rather than a socketpair specifically because of what the atomicity
+/// gate can see. On Linux `TIOCOUTQ` reports the send queue for both AF_UNIX and
+/// AF_INET, but on Darwin a unix socket keeps its buffer on the *receiving* end:
+/// `SO_NWRITE` on the writer stays 0 however much it has queued, measured. A
+/// socketpair would therefore make the gate look like it was working while
+/// actually declining to answer, and a test written against one would be
+/// measuring nothing. TCP is also what the session really uses, so it is the
+/// socket whose accounting is worth trusting.
+///
+/// Everything is non-blocking and the accept is retried on this thread rather
+/// than handed to a helper thread: a thread would have to outlive the call to
+/// keep the peer from reading, and then the test would pay for it at `join`.
+fn tcpPair(snd_buf_bytes: i32) ![2]std.posix.socket_t {
+    return tcpPairBuffered(snd_buf_bytes, 4096);
+}
+
+fn tcpPairBuffered(snd_buf_bytes: i32, rcv_buf_bytes: i32) ![2]std.posix.socket_t {
+    const lfd: std.posix.socket_t = @intCast(std.posix.system.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, std.posix.IPPROTO.TCP));
+    errdefer _ = std.posix.errno(std.posix.system.close(lfd));
+    var lo: std.c.O = @bitCast(@as(u32, @intCast(std.c.fcntl(lfd, std.c.F.GETFL, @as(c_int, 0)))));
+    lo.NONBLOCK = true;
+    _ = std.c.fcntl(lfd, std.c.F.SETFL, @as(c_int, @bitCast(lo)));
+
+    var sa: std.posix.sockaddr.in = std.mem.zeroes(std.posix.sockaddr.in);
+    sa.family = std.posix.AF.INET;
+    sa.port = 0; // let the kernel choose
+    sa.addr = @bitCast(@as([4]u8, .{ 127, 0, 0, 1 }));
+    if (std.posix.errno(std.posix.system.bind(lfd, @ptrCast(&sa), @sizeOf(@TypeOf(sa)))) != .SUCCESS) return error.BindFailed;
+    if (std.posix.errno(std.posix.system.listen(lfd, 1)) != .SUCCESS) return error.ListenFailed;
+    var bound: std.posix.sockaddr.in = undefined;
+    var blen: std.posix.socklen_t = @sizeOf(@TypeOf(bound));
+    _ = std.posix.system.getsockname(lfd, @ptrCast(&bound), &blen);
+
+    const cfd: std.posix.socket_t = @intCast(std.posix.system.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, std.posix.IPPROTO.TCP));
+    errdefer _ = std.posix.errno(std.posix.system.close(cfd));
+    var co: std.c.O = @bitCast(@as(u32, @intCast(std.c.fcntl(cfd, std.c.F.GETFL, @as(c_int, 0)))));
+    co.NONBLOCK = true;
+    _ = std.c.fcntl(cfd, std.c.F.SETFL, @as(c_int, @bitCast(co)));
+    std.posix.setsockopt(cfd, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, &std.mem.toBytes(snd_buf_bytes)) catch {};
+    switch (std.posix.errno(std.posix.system.connect(cfd, @ptrCast(&bound), @sizeOf(@TypeOf(bound))))) {
+        .SUCCESS, .INPROGRESS, .INTR => {},
+        else => return error.ConnectFailed,
+    }
+
+    var afd: std.posix.socket_t = -1;
+    var waited: u32 = 0;
+    while (afd < 0 and waited < 2000) {
+        var ca: std.posix.sockaddr.in = undefined;
+        var cl: std.posix.socklen_t = @sizeOf(@TypeOf(ca));
+        const a = std.posix.system.accept(lfd, @ptrCast(&ca), &cl);
+        switch (std.posix.errno(a)) {
+            .SUCCESS => afd = @intCast(a),
+            else => {
+                waited += 1;
+                _ = sleepMs(1);
+            },
+        }
+    }
+    _ = std.posix.errno(std.posix.system.close(lfd));
+    if (afd < 0) return error.AcceptFailed;
+    var ao: std.c.O = @bitCast(@as(u32, @intCast(std.c.fcntl(afd, std.c.F.GETFL, @as(c_int, 0)))));
+    ao.NONBLOCK = true;
+    _ = std.c.fcntl(afd, std.c.F.SETFL, @as(c_int, @bitCast(ao)));
+    // Pinned so the peer cannot quietly absorb the whole sender queue: see
+    // `waitForPartialRoom`. Loopback has been measured ignoring SO_RCVBUF on a
+    // *listening* socket, which is why the handoff accepts and this is set on the
+    // accepted fd instead.
+    std.posix.setsockopt(afd, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, &std.mem.toBytes(rcv_buf_bytes)) catch {};
+    return .{ cfd, afd };
+}
+
+/// Drive a saturated connection into a *partially* full state — some room, less
+/// than `frame_bytes` — and return that room, or 0 if it never got there.
+///
+/// This is the state the bug lives in, and getting to it took three attempts
+/// worth recording, because all three looked reasonable and all three were
+/// wrong.
+///
+/// Letting it settle on its own does not work. With a stock peer the kernel
+/// pushes everything the peer's receive buffer will take and the room goes from
+/// 0 to the full 81660 between two samples: measured, the same test settling at
+/// 52 bytes on one run and at capacity on the next, with nothing different in
+/// between.
+///
+/// Pinning the peer's receive buffer small does not work either — it just inverts
+/// the problem. The peer stops absorbing, the sender never gets an ACK, and the
+/// room sits at 0 for 400 000 straight samples.
+///
+/// What works is to make the peer give back exactly one byte per sample, so the
+/// sender's room grows one byte at a time and the loop stops in the band rather
+/// than leaping over it. `getsockopt` costs about a microsecond, so a few hundred
+/// thousand samples is a couple of seconds of very fine resolution.
+fn waitForPartialRoom(conn: *net.Conn, peer: std.posix.socket_t, frame_bytes: usize, fill: []const u8, junk_out: *usize, head: []u8, head_len: *usize) usize {
+    junk_out.* = fillUntilBlocked(conn.fd, fill);
+    var spins: u32 = 0;
+    while (spins < 400_000) : (spins += 1) {
+        const room = conn.sendRoom() orelse return 0;
+        if (room > 0 and room < frame_bytes) return room;
+        // one byte out of the peer's receive buffer, which is the only thing the
+        // sender is actually waiting for. These bytes are the *front* of the
+        // stream the caller is about to parse, so they are kept: dropping them
+        // would hand the parser a stream that starts mid-frame, which is exactly
+        // the desynchronisation this test is looking for and would manufacture
+        // one that is not there.
+        if (head_len.* < head.len) {
+            const n = std.posix.read(peer, head[head_len.*..][0..1]) catch 0;
+            head_len.* += n;
+        }
+    }
+    return 0;
 }
 
 fn drainSocket(fd: std.posix.socket_t, buf: []u8) usize {
@@ -640,13 +930,13 @@ test "#14: a full socket fails the write immediately instead of blocking forever
     // passing when someone turned it back into a second. (It did, once, and
     // this test stayed green for exactly that reason.)
     const t0 = clock.nowNs(io);
-    const ok = try conn.sendMessageBounded(proto.MSG_UPLOAD_INTERVAL_WRITE, &payload, session.upload_write_budget_ms);
+    const outcome = try conn.sendMessageBounded(proto.MSG_UPLOAD_INTERVAL_WRITE, &payload, session.upload_write_budget_ms);
     const elapsed_ns = clock.nowNs(io) - t0;
     std.debug.print(
         \\  #14 socketpair  socket full after {d} bytes; one 16 KiB upload write returned {any} in {d} ms
         \\
-    , .{ absorbed, ok, @divTrunc(elapsed_ns, std.time.ns_per_ms) });
-    try std.testing.expect(!ok);
+    , .{ absorbed, outcome, @divTrunc(elapsed_ns, std.time.ns_per_ms) });
+    try std.testing.expectEqual(net.SendOutcome.declined, outcome);
     // The number: bounded. Pre-fix this call did not return at all, and with a
     // 1000 ms budget it returns in ~1002 ms, so a 500 ms bound separates the
     // two while leaving room for a scheduling spike.
@@ -657,12 +947,58 @@ test "#14: a full socket fails the write immediately instead of blocking forever
     // makes dropping a bar recoverable rather than fatal.
     //
     // The message here is small on purpose. A 16 KiB frame can *never* go
-    // through a 4 KiB send buffer in one call — the gate would report the socket
-    // writable and the bounded write would still give up on the tail — so
-    // reusing the big payload here would be testing the pipe, not the recovery.
+    // through a 4 KiB send buffer in one call — no amount of waiting changes
+    // that — so reusing the big payload here would be testing the pipe, not the
+    // recovery. A control-sized frame still goes, which is the part that matters:
+    // the session can keep talking to the server after dropping a bar.
     var sink: [65536]u8 = undefined;
     _ = drainSocket(fds[1], &sink);
     try std.testing.expect(conn.writable());
     const small = [_]u8{0x01} ** 256;
-    try std.testing.expect(try conn.sendMessageBounded(proto.MSG_UPLOAD_INTERVAL_BEGIN, &small, 0));
+    try std.testing.expectEqual(net.SendOutcome.sent, try conn.sendMessageBounded(proto.MSG_UPLOAD_INTERVAL_BEGIN, &small, 0));
+}
+
+// #14: `sendRoom()` has to be a measurement, not an upper bound.
+//
+// #14: `sendRoom()` has to be a measurement, not a guess.
+//
+// The atomicity gate stands or falls on this being the *free* space rather than
+// the capacity. If it over-reported — say, returned `SO_SNDBUF` without
+// subtracting the queue — every write would pass the gate and every one would
+// then be a torn frame, which is precisely the bug the gate exists to stop. If
+// it under-reported, writes would be declined that could have succeeded: merely
+// a few extra dropped bars, which is the direction worth being wrong in.
+test "#14: sendRoom is never optimistic about the room it promises" {
+    const io = harnessIo();
+    const fds = try tcpPair(65536);
+    defer {
+        _ = std.posix.errno(std.posix.system.close(fds[0]));
+        _ = std.posix.errno(std.posix.system.close(fds[1]));
+    }
+    var conn = net.Conn{ .io = io, .fd = fds[0] };
+    const room = conn.sendRoom() orelse return error.SendRoomUnavailable;
+    std.debug.print("  #14 sendRoom  fresh socket reports {d} bytes free\n", .{room});
+    try std.testing.expect(room > net.max_payload);
+
+    // The other half of the contract, and the half that catches an optimistic
+    // gate: the room it promises has to be room the socket will actually take.
+    // A frame sized to fill it must go out *whole* — `.sent`, never `.partial`.
+    //
+    // This runs on a fresh socket on purpose. Saturated, the room is a moving
+    // target: the kernel keeps flushing into the peer's receive buffer, so the
+    // measurement taken a moment before the write is not the measurement the
+    // gate acts on, and a `.sent` there would be a race won rather than a
+    // property proved. On a fresh socket there is nothing in flight and the
+    // number is the number.
+    const payload_len = @min(room - 5, @as(usize, net.max_payload));
+    const payload = try std.testing.allocator.alloc(u8, payload_len);
+    defer std.testing.allocator.free(payload);
+    @memset(payload, 0x3C);
+    const outcome = try conn.sendMessageBounded(proto.MSG_UPLOAD_INTERVAL_WRITE, payload, session.upload_write_budget_ms);
+    std.debug.print("  room {d} promised -> a {d}-byte frame went {any}\n", .{ room, payload_len + 5, outcome });
+    try std.testing.expectEqual(net.SendOutcome.sent, outcome);
+
+    // And the gate must not be so eager to refuse that it breaks a healthy
+    // session: the same socket takes a second frame straight afterwards.
+    try std.testing.expectEqual(net.SendOutcome.sent, try conn.sendMessageBounded(proto.MSG_UPLOAD_INTERVAL_WRITE, payload, session.upload_write_budget_ms));
 }

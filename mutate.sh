@@ -18,6 +18,13 @@
 # needs an explicit -i extension, and a partial match silently mutates nothing)
 # and every file is restored from a pristine copy afterwards. The final run is a
 # clean `zig build test` so the evidence ends with "reverted, still green".
+#
+# A SURVIVED is only ever as interesting as the mutation that produced it. The
+# first cut of entry 19 inserted a dead `if (room < 0)` *before* the real gate
+# and left the real gate in place, so the mutation changed nothing at all and
+# "survived" for a reason that had nothing to do with the tests. Zig accepts
+# `room < 0` on a `usize` and folds it away, which is exactly why it read as a
+# hole. A mutation has to remove the thing it claims to break.
 set -u
 cd "$(dirname "$0")"
 
@@ -208,6 +215,52 @@ run src/ninjam/session.zig \
 '        self.index.complete();' \
 '        self.index.seq += 1;' \
 "#14: the grid stops advancing on a refused bar" 16
+
+# ============ #14: a refused frame must put NOTHING on the wire =============
+
+# This is the guard the whole #14 safety claim rests on, and it is the one the
+# first cut of this branch got wrong. `writeAllBounded` used to report a torn
+# frame as a plain `false`, on the stated grounds that "both ends frame by the
+# declared length, so the server simply never completes that guid" — which is
+# backwards. The server does complete the frame, with the *next* bar's bytes as
+# its missing payload, and then parses the bytes after that as a header from
+# mid-stream. Measured on the pre-fix code: a half-full socket, a 16 KiB frame, a
+# zero budget, `false` returned and 6000 bytes on the wire.
+
+run src/ninjam/net.zig \
+'        const need = 5 + payload.len;
+        if (self.sendRoom()) |room| {
+            if (room < need) return .declined;
+        }' \
+'        // gate removed: pre-fix behaviour' \
+"#14: no frame-fit check at all — a refused frame can tear the stream" 17
+
+run src/ninjam/net.zig \
+'            if (room < need) return .declined;' \
+'            if (room < need / 2) return .declined;' \
+"#14: halve the frame-fit threshold, so a half-fitting frame starts tearing" 18
+
+run src/ninjam/net.zig \
+'            if (room < need) return .declined;' \
+'            if (room < need) return .declined;
+            if (room >= 0) return .declined;' \
+"#14: gate always declines, so no bar is ever uploaded" 19
+
+# NOT MUTATED, DELIBERATELY: the `if (off > 0) return .partial;` arm in
+# `writeAllBounded`, and the `.partial => return self.failSession(...)` arm in
+# `session.sendUpload`. Both are the backstop for a torn write when the
+# pre-check is *unavailable* — `sendRoom()` returning null on a platform with
+# neither `TIOCOUTQ` nor `SO_NWRITE` — and for the kernel shrinking the send
+# buffer under us between the check and the write. With the pre-check working
+# (both CI platforms) neither arm is reachable, and on Linux the accounting
+# deliberately *under*-reports, so the write is never short.
+#
+# Removing them therefore survives, which is the honest result, and it is worth
+# being precise about what is actually holding the line: the `switch` in
+# `sendUpload` is exhaustive over `SendOutcome`, so the *compiler* refuses to
+# build if a new outcome is ever added without a policy — and a torn frame can
+# never be silently reported as a dropped bar, because the type has nowhere to
+# put that.
 
 echo "=== reverted: the suite must be green again ==="
 restore

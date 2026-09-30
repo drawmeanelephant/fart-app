@@ -3,6 +3,7 @@
 //! Built directly on std.posix to stay stable across zig std churn.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const bufmod = @import("buf.zig");
 const clock = @import("clock.zig");
 
@@ -11,6 +12,29 @@ pub const max_payload: u32 = 16384;
 pub const Message = struct {
     mtype: u8,
     payload: []const u8,
+};
+
+/// What became of a message handed to `sendMessageBounded`.
+///
+/// The distinction between the last two is the whole point, and it is not a
+/// stylistic one. The NINJAM frame is `[u8 type][u32 LE len][payload]` on a
+/// TCP byte stream with **no resync marker** — no magic word, no checksum, and
+/// nothing that would let a reader notice it is one byte out of step (#31
+/// established exactly this). So the three states are not a gradient:
+///  - `.declined` and `.sent` both leave the reader correctly framed;
+///  - `.partial` does not, and cannot be undone.
+pub const SendOutcome = enum {
+    /// Every byte of the frame is in the socket's send buffer.
+    sent,
+    /// Nothing at all was written. The socket could not take the whole frame
+    /// and not one byte of it reached the wire, so the stream is exactly where
+    /// it was. A caller may drop a bar and frame the next one normally.
+    declined,
+    /// Some but not all of the frame is on the wire. The peer is now mid-frame
+    /// and will consume the *next* frame's bytes as the tail of this one, then
+    /// parse whatever follows as a header. This is a dead connection, not a
+    /// dropped bar, and no retry can repair it.
+    partial,
 };
 
 pub const Error = error{
@@ -239,7 +263,7 @@ pub const Conn = struct {
     }
 
     /// Send `data`, giving the socket at most `budget_ms` **in total** to accept
-    /// it. Returns false if the bytes did not all go out within the budget.
+    /// it. See `SendOutcome` for what the three results mean.
     ///
     /// This exists because `writeAllRaw` cannot be used by the audio clock. The
     /// socket is non-blocking (`setNonblocking` runs right after connect), so a
@@ -253,15 +277,23 @@ pub const Conn = struct {
     /// returning, for a single 16 KiB upload against a socket with an 8 KiB
     /// buffer (see `src/kujamba_timing.zig`, #14).
     ///
-    /// A partial write is deliberately reported as a plain `false` rather than an
-    /// error: some of the bytes went out and some did not, so the frame is
-    /// incomplete. That is benign — both ends frame by the declared length, so
-    /// the server simply never completes that guid — whereas failing the session
-    /// over a peer that is briefly slow would turn a recoverable stall into a
-    /// dead performance.
-    fn writeAllBounded(self: *Conn, data: []const u8, budget_ms: i32) Error!bool {
+    /// The partial result is reported as `.partial` and is the *only* honest
+    /// answer. An earlier version of this function returned a plain `false`,
+    /// with a comment claiming a torn frame was benign because "both ends frame
+    /// by the declared length, so the server simply never completes that guid".
+    /// That is backwards, and it is the load-bearing bug #14's own mechanism
+    /// exposes. The server frames by the declared length, so it *does* complete
+    /// the frame — with the next bar's bytes as its missing payload — and then
+    /// parses whatever comes after as a header from mid-stream. A fresh guid does
+    /// not help, because the server never sees those bytes as a guid; they are
+    /// the tail of the frame before. So the first torn frame costs the rest of
+    /// the session's uploads, silently and permanently — which is the dead
+    /// performance this PR exists to prevent, minus the honesty of a disconnect.
+    /// Measured, before this fix: a half-full socket, a 16 KiB frame, a zero
+    /// budget — `false`, and 6000 bytes on the wire.
+    fn writeAllBounded(self: *Conn, data: []const u8, budget_ms: i32) Error!SendOutcome {
         if (self.fd < 0) return error.ConnectionClosed;
-        if (data.len == 0) return true;
+        if (data.len == 0) return .sent;
         // a deadline, not a per-attempt timeout: three brief stalls inside one
         // budget must not add up to three budgets
         const deadline_ms = clock.nowMs(self.io) + budget_ms;
@@ -271,8 +303,11 @@ pub const Conn = struct {
             switch (std.posix.errno(rc)) {
                 .SUCCESS => off += @intCast(rc),
                 .AGAIN => {
+                    // bytes already accepted are bytes the peer will read, so
+                    // from here on the frame is torn no matter what we do
+                    if (off > 0) return .partial;
                     const left = deadline_ms - clock.nowMs(self.io);
-                    if (left <= 0) return false;
+                    if (left <= 0) return .declined;
                     var fds = [_]std.posix.pollfd{.{
                         .fd = self.fd,
                         .events = std.posix.POLL.OUT,
@@ -285,34 +320,64 @@ pub const Conn = struct {
             }
         }
         self.last_send_ms = clock.nowMs(self.io);
-        return true;
+        return .sent;
     }
 
-    /// `sendMessage` with a hard bound on how long it may wait for the peer.
+    /// `sendMessage` with a hard bound on how long it may wait for the peer,
+    /// and with a promise the caller is allowed to rely on: **`.declined` means
+    /// not one byte of this frame reached the wire.** The stream is therefore
+    /// still correctly framed, and the caller may abandon whatever it was
+    /// sending and carry on.
     ///
-    /// Returns false when the message did not go out within `budget_ms`. The
-    /// only caller that has to care is the upload path (#14), where giving up on
-    /// a bar is strictly better than stalling the audio clock behind it; every
-    /// other message can keep using `sendMessage`.
+    /// Only the upload path (#14) uses this. Giving up on a bar is strictly
+    /// better than stalling the audio clock behind it; every other message keeps
+    /// using `sendMessage`.
     ///
     /// `budget_ms = 0` never waits at all, which is what an upload wants: it
-    /// asks the socket "can you take this?" and acts on the answer instead of
-    /// discovering the answer a second later.
-    pub fn sendMessageBounded(self: *Conn, mtype: u8, payload: []const u8, budget_ms: i32) Error!bool {
+    /// asks the socket "can you take this whole thing?" and acts on the answer
+    /// instead of discovering it a second later.
+    pub fn sendMessageBounded(self: *Conn, mtype: u8, payload: []const u8, budget_ms: i32) Error!SendOutcome {
         if (payload.len > max_payload) return error.BadFrame;
+
+        // The atomicity gate. `writable()` cannot do this job: POLLOUT means
+        // "at least one byte free", which is true of a socket with 6 KiB of room
+        // as well as one with 6 KiB *of a 16 KiB frame's worth* still owed. Ask
+        // instead whether the whole frame fits, and decline before touching the
+        // wire if it does not. Nothing is raced by doing this first: the session
+        // has exactly one writer for this socket, so the only thing that can
+        // change between the check and the write is the queue draining (which
+        // adds room) or the kernel's own autotuning shrinking the buffer (which
+        // is caught as `.partial` below, not silently).
+        const need = 5 + payload.len;
+        if (self.sendRoom()) |room| {
+            if (room < need) return .declined;
+        }
+
         var hdr: [5]u8 = undefined;
         hdr[0] = mtype;
         std.mem.writeInt(u32, hdr[1..5], @intCast(payload.len), .little);
-        if (!try self.writeAllBounded(&hdr, budget_ms)) return false;
-        if (payload.len == 0) return true;
-        return self.writeAllBounded(payload, budget_ms);
+        switch (try self.writeAllBounded(&hdr, budget_ms)) {
+            .sent => {},
+            .declined => return .declined,
+            .partial => return .partial,
+        }
+        if (payload.len == 0) return .sent;
+        switch (try self.writeAllBounded(payload, budget_ms)) {
+            .sent => return .sent,
+            // the header is already on the wire, so these bytes are not optional
+            .declined, .partial => return .partial,
+        }
     }
 
-    /// Would the socket accept a write right now?
+    /// Would the socket accept *something* right now?
     ///
-    /// A zero-timeout `poll`, i.e. the question "is the peer keeping up" asked
-    /// without paying to find out. #14 uses it to drop a bar *before* spending
-    /// any of the bar's time on a write that cannot succeed, rather than after.
+    /// A zero-timeout `poll`, i.e. "is the peer keeping up" asked without paying
+    /// to find out. Note what it is **not**: it does not say the socket can take
+    /// any particular frame. POLLOUT is set as soon as one byte is free, so a
+    /// socket with a few KiB free answers true while being unable to accept a
+    /// 16 KiB upload — and trusting it there is exactly what tore frames.
+    /// `sendMessageBounded` asks the real question itself, so this is only a
+    /// cheap pre-gate now, never the authority.
     pub fn writable(self: *Conn) bool {
         if (self.fd < 0) return false;
         var fds = [_]std.posix.pollfd{.{
@@ -323,7 +388,78 @@ pub const Conn = struct {
         const n = std.posix.poll(&fds, 0) catch return false;
         return n > 0 and (fds[0].revents & std.posix.POLL.OUT) != 0;
     }
+
+    /// Bytes the kernel can accept on this socket right now, or null if this
+    /// platform does not let us find out.
+    ///
+    /// `SO_SNDBUF` is the buffer's capacity and `TIOCOUTQ` is how much of it is
+    /// still occupied, so the difference is the room. Both are needed: the
+    /// capacity alone says nothing about how full the buffer is, which is the
+    /// half-full case that tore frames.
+    ///
+    /// Null is not a licence to tear a frame. It only means the pre-check is
+    /// unavailable, in which case `sendMessageBounded` falls back to the write
+    /// loop and relies on `.partial` to catch a tear — a worse but still
+    /// correct failure, never a silent one.
+    pub fn sendRoom(self: *Conn) ?usize {
+        if (self.fd < 0) return null;
+        const cap = sendBufBytes(self.fd) orelse return null;
+        const queued = outqBytes(self.fd) orelse return null;
+        if (queued >= cap) return 0;
+        return cap - queued;
+    }
 };
+
+/// `SO_SNDBUF`, i.e. the send buffer's capacity in bytes.
+fn sendBufBytes(fd: std.posix.socket_t) ?usize {
+    const v = sockoptI32(fd, @intCast(std.posix.SO.SNDBUF)) orelse return null;
+
+    if (v <= 0) return null;
+    return @intCast(v);
+}
+
+/// Darwin's name for the send queue depth: "APPLE: Get number of bytes
+/// currently in send socket buffer". Linux does not have it.
+const so_nwrite: u32 = 0x1024;
+
+/// `TIOCOUTQ` in the asm-generic Linux encoding, `_IOR('t', 17, int)`.
+const tiocoutq_linux: c_ulong = 0x5411;
+
+extern "c" fn ioctlTIOCOUTQ(fd: c_int, request: c_ulong, arg: *i32) c_int;
+
+fn sockoptI32(fd: std.posix.socket_t, optname: u32) ?i32 {
+    var v: i32 = 0;
+    var len: std.c.socklen_t = @sizeOf(i32);
+    const rc = std.c.getsockopt(fd, std.posix.SOL.SOCKET, optname, @ptrCast(&v), &len);
+    if (std.posix.errno(rc) != .SUCCESS) return null;
+    return v;
+}
+
+/// Bytes queued for transmission and not yet freed by the peer.
+///
+/// There is no one way to ask for this, and finding that out was its own
+/// afternoon. `TIOCOUTQ` is the obvious answer and it works on Linux — but
+/// Darwin does not implement it for sockets at all: both the `'t'` spelling from
+/// its own `<sys/ttycom.h>` and the `'f'` spelling return `ENOTSUP`, measured on
+/// a socketpair and on loopback TCP alike. The same number is available on
+/// Darwin as the `SO_NWRITE` socket option instead, which is what the other
+/// branch uses. So: spelled out per target rather than guessed, with an unknown
+/// target yielding null — which disables the pre-check and falls back to the
+/// `.partial` backstop, a worse but still safe answer.
+fn outqBytes(fd: std.posix.socket_t) ?usize {
+    var q: ?i32 = switch (builtin.os.tag) {
+        .linux => blk: {
+            var v: i32 = 0;
+            if (std.posix.errno(ioctlTIOCOUTQ(fd, tiocoutq_linux, &v)) != .SUCCESS) break :blk null;
+            break :blk v;
+        },
+        .macos, .ios, .tvos, .watchos => sockoptI32(fd, so_nwrite),
+        else => null,
+    };
+    q = q orelse return null;
+    if (q.? < 0) return 0;
+    return @intCast(q.?);
+}
 
 test "framing constants" {
     try std.testing.expectEqual(@as(u32, 16384), max_payload);
