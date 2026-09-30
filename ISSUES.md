@@ -7,10 +7,11 @@ and which decisions get made once instead of three times.
 The dependency edges below are also encoded as GitHub `blocked-by` relations on
 the issues themselves, so `gh issue view 12` shows them without reading this.
 
-**State at time of writing:** 4 milestones (M4–M8), M4 complete. `zig build test`
-→ **148/148 pass** in five suites, in both Debug and ReleaseSafe. CI gates pushes
-and PRs (build + test, `build-test`, on Linux); it is not yet required by `main`'s
-ruleset, and it does not yet run the live demo (#27).
+**State at time of writing:** 4 milestones (M4–M8), M4 complete and M5 complete
+(#13 + #14 landed together). `zig build test` → **180/180 pass** in five suites,
+in Debug, ReleaseSafe and `-Dlive=false`. CI gates pushes and PRs (build + test,
+`build-test`, on Linux); it is not yet required by `main`'s ruleset, and it does
+not yet run the live demo (#27).
 
 Two open issues (#40, #41) are crash bugs the #26 fuzzer found in the client:
 a wire-controlled `channel_id >= 32` and a `bpm=0` config both panic. Both are
@@ -37,6 +38,8 @@ unblocks them (#11) is the smallest item in M4.
 | **#19** Offline render | ✅ **done** — `kujamba render`, see below | verification harness for M6 |
 | **#8** Phrase bank | ✅ **done** — `--phrases FILE` + `!kujamba <n\|name>` | M4 complete |
 | **#27** CI demo | Extends the existing `build-test` job with the live reference-server run | #28 (flake rate), the safety net for everything |
+| **#13** Server-clock discipline | ✅ **done** — `ServerClock`, bounded slew, encode lead | M5 complete |
+| **#14** Upload backpressure | ✅ **done** — measured, then bounded write + drop-and-continue | M5 complete |
 
 Everything else is Wave 2+ and can proceed in parallel once the above land.
 
@@ -118,14 +121,25 @@ maintainable if new divergence is batched, not dripped in per-issue.
 | File | Status | Diverged by |
 |---|---|---|
 | `src/ninjam/session.zig` | **already diverged** (kujamba hooks) | #12, #13, #14, #24, #25 |
-| `src/ninjam/net.zig` | byte-identical | #23, #25 |
+| `src/ninjam/net.zig` | **already diverged** (`writeAllBounded` / `sendMessageBounded` / `writable` / `sendRoom` / `SendOutcome`) | #14, #23, #25 |
 | `src/ninjam/proto.zig` | byte-identical | #26 — *only if* the harness lands in-tree |
 | `src/ninjam/buf.zig` | byte-identical | #26 — *only if* the harness lands in-tree |
 | `src/ninjam/audio.zig` | byte-identical (live path compiled out) | #20 (`-Dlive` toggle + miniaudio) |
-| `src/ninjam_out.zig` | **new** (not vendored) | #10, #11, #12, #17, #22 |
+| `src/ninjam_out.zig` | **new** (not vendored) | #10, #11, #12, #13, #17, #22 |
 | `src/kujamba_main.zig` | **new** (not vendored) | #8, #9, #19, #20, #21, #22, #25 |
+| `src/kujamba_timing.zig` | **new** (not vendored) | #13, #14 — the M5 timing harness |
 | `src/synth.zig` | **new** (not vendored) | #15, #16, #18 |
 | `src/golden.zig` | **new** (not vendored) | guards #15, #16, #17, #18 |
+
+> **`net.zig` had to be touched, and it is worth being honest about why.** The
+> rule above is "push down into `src/ninjam/` only when there's no choice", and
+> for #14 there was not one. The stall is *inside* `writeAllRaw`: the socket is
+> non-blocking, so a peer that stops reading turns `write` into EAGAIN, and the
+> EAGAIN branch polls for 1000 ms in a loop while discarding the result. No
+> caller can bound that from outside — the only lever a caller has is whether to
+> call, and "don't call" is not the same as "call and give up". The change is
+> purely additive: `writeAllRaw`/`sendMessage` are untouched and still used by
+> every non-upload message, and three new functions sit beside them.
 
 **Rule of thumb:** if a change can live in `ninjam_out.zig` or
 `kujamba_main.zig`, it should. Push down into `src/ninjam/` only when there's no
@@ -146,6 +160,9 @@ recommended answer.
 |---|---|---|
 | **Is the voice preset part of the render key?** There is no render key today — `synth.zig:408` seeds the PRNG from `Wyhash.hash(0x5EED_F00D, phrase)`, text only. | #15, #16 | Decide once, document as a determinism claim. Keeping intensity *out* of the seed gives two intensities of one phrase identical noise — arguably better for A/B. |
 | **`interval_seq` vs `interval_idx`** | #12, #24, #29 | **Settled** — split as `IntervalIndex{seq, grid}`. See the bug section above. |
+| **Is the bar grid open or closed loop?** | #13, #24, #29 | **Settled — closed loop, correcting toward the wall clock.** `interval_start_ns += interval_ns` silently inherited every stall into the next bar. `ServerClock` measures each crossing and applies a correction bounded by both a fraction of the bar and 40 ms absolute. Deliberately *not* locked to the server's epoch: that offset is a constant of unknown one-way latency and the server re-times on arrival anyway. See "What drift actually is" above. |
+| **How long may a socket write wait?** | #14, #24 | **Settled — zero, on the audio-clock path.** A bar is worth one bar of audio and the socket is not worth any of it. Uploads get `sendMessageBounded(..., 0)`; control messages (keepalive, chat, registration) keep using the unbounded `sendMessage`, because losing those ends the session rather than skipping a bar, and they are a handful of bytes against a socket with room. |
+| **May a write be half-done and then abandoned?** | #14, #31 | **Settled — no, never.** The NINJAM frame is `[u8 type][u32 LE len][payload]` on a byte stream with **no resync marker**, so a torn frame does not merely lose one message: the peer finishes it with the *next* frame's bytes, then reads a header from mid-stream, and every message after that is garbage. A half-written frame is therefore a connection-level failure, never a bar-level one. `sendMessageBounded` returns a three-valued `SendOutcome` — `sent` / `declined` / `partial` — so a caller *cannot* mistake "nothing went out" for "some went out". Only `declined` may drop a bar, and it carries a promise that not one byte reached the wire; `partial` fails the session. The drop is made atomic by measuring the send buffer's real free space (`SO_SNDBUF` − queue depth) against the whole frame before touching the wire. |
 | **Where does the loop crossfade live?** | #17, #8 | In `Fill.copyInto` (`cursor % n` at `ninjam_out.zig:72`), **not** in `renderPhraseF32`. In the render it would double-fade and wrongly affect `repeat`/`once`. |
 | **Golden hash for the synth** | #15, #16, #17, #18 | **Settled, and not a byte hash.** An exact WAV SHA-256 was tried and rejected on measurement: Debug and ReleaseSafe render different exact bytes from identical source, because LLVM contracts the synth's `@exp`/`@sin` differently per optimization level. Measured across all 7 baseline entries, the exact WAV hash differs between modes for **3 of them** (`kujamba karibu`, `asante sana kijiji`, `shuzi seed 0`) — the shorter, simpler renders happen to be stable, so a byte-hash guard would look fine locally and go red on CI. `src/golden.zig` instead asserts syllable count, sample count, peak, zero crossings, and a SHA-256 of the 10 ms windowed RMS envelope, which is bit-identical across modes on all 7. Expect it to fire on every M6 change; that is the point. |
 | **CI gate strictness** | #27, #28 | Start report-only, flip to required after a green streak. That streak is the flake-rate data #28 needs. |
@@ -167,7 +184,11 @@ fix, the other is the harness that makes M6 verifiable without a room.
 - **M4:** #8, #9 — ✅ **M4 is complete.** A bandleader can now shape the
   performance entirely from room chat: `!kujamba <verb>` for transport,
   `!kujamba <n|name>` for the phrase, every one of them landing on a bar line.
-- **M5:** #13, #14
+- **M5:** #13, #14 — ✅ **M5 is complete.** Both landed together because they are
+  the same defect seen from two sides: a bar's audio is generated on a wall
+  clock, and the upload of that bar happens inline on the same path. #13 makes
+  the clock honest about being late; #14 stops it being late on a peer's
+  schedule. Fixing either alone leaves the other half of the stall.
 - **M6:** #15, #16, #17
 - **M8:** #26 (fuzz — keep the harness out-of-tree) — ✅ **landed**
 
@@ -179,13 +200,90 @@ fix, the other is the harness that makes M6 verifiable without a room.
 honestly a separate job (Winsock shim + console handler) — consider splitting it
 and landing Linux first.
 
-### Wave 3 — investigation close-out
-- **#28** — local repros can start immediately; the *close* waits on #27's rate.
+### Wave 3 — investigation close-out- **#28** — local repros can start immediately; the *close* waits on #27's rate.
   Do not close via #24: reconnect makes the symptom survivable, which masks a
   real server-side or local-side defect rather than fixing it.
 
 ### Wave 4 — vendored reconciliation
 - **#29** — batched, last.
+
+---
+
+- **`accept()` does not inherit `O_NONBLOCK`, and on Linux it visibly does not.**
+  Caught by CI, not by reading: the M5 timing harness set the *listener*
+  non-blocking and assumed the accepted socket came that way. It did not. The
+  server thread parked in `read` waiting for data that could not arrive — it
+  was waiting to send the auth reply, which was queued behind its own reader —
+  so the session timed out with `bars=0` and nothing else to go on. Two fixes
+  worth carrying forward: set the flag on the accepted fd, and **assert that a
+  session went live before asserting anything it produced**, so the next
+  platform difference fails naming its cause instead of three assertions later.
+  `proto_fuzz.zig` had been relying on the same false assumption and only got
+  away with it because a blocking read still returns when the client writes or
+  hangs up — it worked by luck, and its comment asserted something untrue.
+
+## Mutation testing
+
+`./mutate.sh` breaks one guard at a time and reports which tests went red. It
+exists because **a test that passes whether or not the guard is present is worse
+than no test** — it reads as coverage and is not — and because "I wrote a test
+for it" is not evidence that the test *bites*. All twenty-one mutations are
+caught. It reports four outcomes
+(`CAUGHT` / `SURVIVED` / `NO-OP` / `BUILD ERROR`), restores every file
+afterwards, and ends with a clean `zig build test` so the evidence ends where it
+should: reverted, still green.
+
+Three things it caught that reading the code did not:
+
+- The first sweep reported **8 of 12 survivors**, and every one was real. Two
+  were harness bugs (`sed -i ''` on BSD swallowing the expression as the backup
+  extension; a test-failure grep that missed `ninjam.session.test....` because
+  the module name contains a dot). The rest were tests that passed for the wrong
+  reason: the timing tests passed a literal `0` instead of the session's own
+  `upload_write_budget_ms`, so turning the budget back into a second changed
+  nothing they measured.
+- The #14 drop tests all used **one channel**, which made `if (lc.broadcast and
+  !lc.dropped)` invisible — both conjuncts agreed on every input the tests could
+  produce. The two-channel test is what closes it, and it exists now for the
+  accounting: a bar the room did not hear is one lost bar, not one per channel.
+- The **loopback** measurement turned out to be asserting the runner's encode
+  throughput rather than the code's behaviour: the same code produced 4 bars in
+  4 s on a workstation and 1 on a loaded macOS runner, and the first two floors I
+  picked (`>= 3`, then `>= 2`) were both really fitting the test to the machine.
+  The property it was standing in for — *the clock keeps walking through
+  refused bars* — is now asserted deterministically by driving `finalizeInterval`
+  twelve times against a blocked socket and counting: no wall clock, no runner,
+  and a claim strong enough to mutate.
+- One survivor turned out to be **redundant code**, not a test gap:
+  `intervals_broadcast` is only accumulated on the `else` of `if (dropped_here)`,
+  so `!lc.dropped` in the line above can never matter. It stays — a correct local
+  expression beats one that is correct only in context — and `mutate.sh` says so
+  next to the entry rather than leaving a reader to rediscover it.
+- The **first cut of the #14 fix was wrong in a way that read as a feature.** It
+  reported a torn frame as a plain `false`, with a comment saying that was benign
+  because "both ends frame by the declared length, so the server simply never
+  completes that guid". Backwards: the server *does* complete it, with the next
+  bar's bytes as the missing payload, and then parses the bytes after that as a
+  header from mid-stream. The fresh guid does not save it, because the server
+  never sees those bytes as a guid — they are the tail of the frame before. So
+  the first drop cost the rest of the session's uploads, silently, which is the
+  dead performance the issue exists to prevent minus the honesty of a
+  disconnect. Measured on that code: a half-full socket, a 16 KiB frame, a zero
+  budget — `false` returned, **6000 bytes on the wire**. The test that caught it
+  asserts on bytes, not on a return value, for the same reason.
+
+`NO-OP` and `BUILD ERROR` are failures of the *script*, not of the code, and they
+are reported separately for that reason: an entry that does not compile tells you
+nothing about the guard it meant to break.
+
+**A `SURVIVED` is only as interesting as the mutation that produced it.** Entry 19
+reported a survivor on its first run and the entry was worthless, not the test:
+it *inserted* a dead `if (room < 0)` in front of the real gate and left the real
+gate in place, so it broke nothing and the "hole" said nothing about coverage.
+Zig accepts `room < 0` on a `usize` and folds it away, which is exactly why the
+result looked plausible. Rewritten to remove the thing it claims to break
+(`if (room >= 0) return .declined;`), it is caught by four tests. A mutation has
+to remove the thing it claims to break.
 
 ---
 
@@ -251,9 +349,194 @@ and landing Linux first.
 - **#14's backpressure is already observable.** The run loop's
   `pollReadable(20)` already eats up to 20 ms of the audio budget per pass, and
   `send()` runs inline from `finalizeInterval`. Measure before fixing.
+  ✅ **Measured, and worse than "observable".** `net.zig`'s `writeAllRaw` answers
+  EAGAIN with `poll(&fds, 1000)` **inside a loop, discarding the return value** —
+  so it does not wait "up to a second", it waits a second, wakes, retries, and
+  waits again, indefinitely, until the peer reads or the socket dies. One 16 KiB
+  `sendMessage` against a socket whose peer had stopped reading **did not return
+  after 5000 ms** and would not have returned at all. `finalizeInterval` called
+  it inline. The fix is a bounded write (`writeAllBounded`, deadline not
+  per-attempt timeout) plus a **zero** millisecond budget on the upload path.
+  Same shape as #17's crossfade and #18's clamps: the guard that looked like a
+  nicety was hiding an unbounded wait.
+
+- **"Would block" is only reachable on a socket with a bounded buffer, and
+  macOS loopback has none.** A loopback peer that stops reading still absorbs
+  **654 KB** with `SO_RCVBUF` pinned to 4096 — measured, twice, at two different
+  request sizes — so `write` never returns EAGAIN on loopback and the whole drop
+  path is unreachable inside a test's patience. It is also why the hazard is a
+  *slow-peer* failure measured in seconds, not a jitter failure. A Unix
+  `socketpair` has a genuinely bounded buffer (measured: full at exactly the
+  requested `SO_SNDBUF`), so `src/kujamba_timing.zig` and the `session.zig`
+  backpressure tests use one and feed a `net.Conn` its fd. The lesson for the
+  next agent: **on macOS, reach for a socketpair before concluding a network
+  condition cannot be tested.** A related trap, already hit once here: on this
+  platform `poll(POLLOUT)` stays *false* on a socketpair that has room for a
+  few hundred bytes, so `Conn.writable()` is a reliable "is this wide open"
+  check but not a reliable "could this frame fit" check — which is exactly why
+  `sendUpload` needs both.
+
+- **What drift actually is (and why the correction does not chase the server's
+  clock).** The local bar grid and the server's grid both advance by one bar and
+  both start at the `0x02` arrival, so the difference between them is a
+  **constant** — the one-way latency of the config message — and a constant the
+  client cannot measure and does not need to: the server re-times an upload on
+  arrival. What actually accumulated was **execution lag**: the run loop's 20 ms
+  poll granularity plus whatever `finalizeInterval` spent on the wire, stolen from
+  every subsequent bar's generation budget and never given back, which
+  `advanceAudio` then repaid as one catch-up burst. So `ServerClock` corrects
+  toward the **wall clock**, not toward the server's epoch. Correcting toward the
+  epoch would have looked more faithful and been wrong.
+
+- **The bar's nanosecond length was truncated twice.** The session derived a bar
+  as `@divTrunc(interval_len_samples * 1e9 / srate)` from a sample count that had
+  itself been truncated from `srate * bpi * 60 / bpm`. At 48 kHz / 5 bpi / 137 bpm
+  that is 2 189 770 833 ns against the exact 2 189 781 021 ns — 10.2 us short,
+  every bar, forever, with nothing measuring it. One division from the wire
+  values (`kujamba_out.intervalNsFor`) has no such error. Small, systematic, and
+  entirely invisible: the kind of thing #13 exists to notice.
+
+- **A bar shorter than the run loop's poll cannot be sustained, and #13's slew
+  cannot rescue it.** Found by choosing a 10 ms bar (6000 bpm, 1 bpi) to make a
+  test faster: the run loop spends up to 20 ms per pass in `pollReadable(20)`,
+  and `advanceAudio` finalizes **at most one interval per pass**, so a bar
+  shorter than the poll can never be caught up. Measured: 126 bars in a 4 s run
+  against ~400 available, **2231 ms of accumulated drift**, and a bounded slew
+  firing on every single one of them and still losing ground — which is correct
+  behaviour, since a 1%-of-a-bar correction is *supposed* to be small, and
+  closing a 2.2 s gap at 1 ms per bar would take 2200 bars. Worth knowing, not
+  fixed here: no musical tempo has a sub-20 ms bar, and doing it properly means
+  restructuring `advanceAudio` to generate *and* finalize several intervals per
+  pass, which is a bigger change than #13/#14 should carry. If it ever matters,
+  it is a fresh issue with this measurement already in it.
+
+- **A test that asserts a wall-clock count is a test that measures the machine.**
+  The M5 timing harness asserted "at least 3 bars in a 4 s session", CI failed
+  it, it became "at least 2", CI failed it again with 1, then with 0 — same
+  code, three runners. The bar count is the machine's encode throughput, not the
+  client's behaviour, and no floor fixes that. The harness now asserts what is
+  machine-independent (the handshake completed, the upload section stayed
+  bounded, the session *came back* inside a generous cap) and **reports** the
+  bar count, while the claim it was reaching for — the clock keeps walking
+  through refused uploads — is asserted deterministically by driving
+  `finalizeInterval` twelve times against a blocked socket and counting. Same
+  lesson as the `sendMessageBounded` literal, one level up: prefer a test whose
+  result depends on the code to one whose result depends on the weather.
+
+- **An encode lead longer than the bar is a silent, permanent stall.** If the
+  encoder is asked to run more than one bar ahead, then `produced < target` in
+  `advanceAudio` is false before the bar begins, `finalizeInterval` never fires,
+  and the session sits there uploading nothing forever. It is not reachable at
+  `max_slew_div = 100` — `lead_ns ≤ interval_ns / 100`, so `lead_samples ≤
+  bar / 100` — which is why the explicit `@min(..., interval_len_samples)` is
+  defence-in-depth rather than logic, and why the test sweeps the tempo range
+  and asserts the property instead of trusting the algebra. Two related shapes
+  from the same sweep: `per_sample` is `1e9 / srate` (20.8 us at 48 kHz) for
+  *every* tempo, so a bar of a few tens of samples cannot carry a lead worth
+  naming and it correctly rounds to zero; and at 48 kHz / 1 bpi / 65535 bpm the
+  bar is 43 samples, so a guard written as "the lead is small" is meaningless
+  there and only `lead < bar` is a real property.
 - **#26's realistic bug is downstream of the parser.** The parsers are
   length-checked with `catch`; the likely panic is a consumer (e.g. `parseChat`'s
   `get(0..4)` returning empty slices). Fuzz a dispatch step, not just the parser.
 - **The `test` step description is stale.** ~~`build.zig:77` says "Run audit +
   synth unit tests" but it runs three suites (59 tests).~~ **Fixed** alongside
   the golden fingerprints: it now runs five suites (102 tests) and says so.
+- **Darwin does not implement `TIOCOUTQ` for sockets, and the replacement is not
+  obvious.** Linux answers "how full is the send queue" with `ioctl(TIOCOUTQ)`.
+  On macOS that returns `ENOTSUP` — for *both* the `'t'` spelling from its own
+  `<sys/ttycom.h>` and the `'f'` spelling you find on FreeBSD, on a socketpair
+  and on loopback TCP alike. The same number is available as the **`SO_NWRITE`
+  socket option** (0x1024, "APPLE: Get number of bytes currently in send socket
+  buffer"). `net.zig`'s `sendRoom` asks per target and returns null where neither
+  is available, which is what makes the frame-fit pre-check skippable rather
+  than a portability lie.
+- **But on a Darwin *unix socket*, `SO_NWRITE` on the writer is always 0.** The
+  send buffer belongs to the receiving end, so the writer cannot see its own
+  queue at all. Consequence for tests: **a socketpair cannot exercise the send
+  buffer accounting on macOS** — the gate would read as "the whole capacity is
+  free" and pass every write. The frame-alignment test uses a real TCP pair for
+  exactly this reason. The byte-level test does use a socketpair, but only
+  because it does not need the queue depth: it makes the buffer's *capacity*
+  smaller than one frame, which no accounting can argue its way out of.
+- **A unix socketpair's `SO_SNDBUF` is exact; a TCP one is not.** Requested 512 →
+  512, 65536 → 65536 on `AF_UNIX`; on `AF_INET` every request up to 16384 comes
+  back as 65328, and 65536 comes back as 81660. So a socketpair is the only
+  socket whose send-buffer size is a test *knob* on both platforms, and the only
+  one where "half full" is a state you can construct by arithmetic rather than by
+  waiting for a kernel to do it. On TCP the half-full state has to be waited for,
+  and even then it moves: the room settled at 16332 free on one run and at the
+  full 81660 on the next, with nothing different in between.
+- **Zig resolves an `extern` declaration by name, so a renamed libc call links on
+  one platform and not another.** `net.zig` needed `ioctl` for `TIOCOUTQ`, and
+  the natural-looking `extern "c" fn ioctlTIOCOUTQ(...)` compiles and links
+  perfectly on macOS — because macOS takes the `SO_NWRITE` branch and never
+  references the Linux one, so the declaration is dead code and the linker never
+  sees it. On Linux it fails at link time with `undefined symbol:
+  ioctlTIOCOUTQ`. Nothing in the macOS test suite, in any optimisation mode, can
+  see this: it is a *build* failure on the one target that takes that path.
+  `zig build -Dtarget=x86_64-linux-gnu -Dlive=false` cross-compiles **and links**
+  from a Mac, catches it in about a minute, and is now part of how this was
+  checked. Worth more than it sounds: the alternative is another round trip
+  through a 10-minute CI job.
+- **A harness that sleeps where it could wait is a test that measures the
+  runner.** The timing harness's scripted server answered each handshake step by
+  sleeping a fixed 200 ms rather than by waiting for the message it needed, so
+  the handshake cost 400 ms before the client could go live, inside a session
+  capped at 4 s. On the macOS runner that failed roughly half the time with
+  `msgs_recv=2` and `bars=0` — the client never received the `0x02` — and no
+  error text anywhere, because the symptom was a *missing* config rather than a
+  wrong one. It now waits for the `0x80` and then the `0x82`, which is both
+  faster (a loopback round trip, ~1 ms rather than 400) and an assertion: the
+  old code sent the config whether or not the client had registered its channel,
+  so a client that never sent `0x82` still looked healthy.
+  Honest caveat: this could not be reproduced on a workstation, with or without
+  the change, even under 8x CPU load — the runner is slower than the machine it
+  would have to be reproduced on, and the only fixed delay on that path was the
+  200 ms sleep. It is the most plausible cause and it cannot be worse, but the
+  evidence that it fixed it is CI going green, not a local reproduction.
+- **The frame walk needs two checks, and testing one of them is easy to mistake
+  for testing both.** `walkFrames` stops on a declared length that cannot be
+  believed, and separately on a frame that runs past the end of the bytes. Every
+  case the first version of the torn-frame test used tripped the *first* check —
+  the garbage behind a tear reads as a length of `0x7E7E7E7E` — so the second
+  check had no test at all, and a mutation removing it survived while the suite
+  stayed green. It needed its own input: a stream that ends in the middle of a
+  frame whose header is entirely believable. That case is not contrived, by the
+  way; it is exactly what a truncated read looks like, and it is exactly what the
+  alignment test's filler leaves behind, so the residue that test accounts for
+  *is* this one. Without the check the walk then steps past the end of the buffer
+  and the residue underflows.
+- **A test can be correct on the machine that wrote it and wrong everywhere
+  else, and the fix is to make the divergence impossible rather than to patch
+  each platform.** The frame-alignment test takes three attempts to get right on
+  two platforms, and every failure was a platform assumption rather than a code
+  bug:
+  - `fillUntilBlocked` stops on a *short* write, so the junk stream was whole
+    frames followed by a remainder, and the parser reported a tail — of the
+    test's own making. It now accounts for the remainder exactly.
+  - `writable()` was asserted to prove "the cheap gate lies here". POLLOUT is a
+    coarse signal and how coarse is the kernel's business: Linux will not
+    report a socket with 4096 bytes free out of 16384 as writable, macOS will.
+    Printed, not asserted; the property is stated in bytes.
+  - The helper drained the peer a byte at a time and checked the room *first*,
+    so it consumed nothing on a platform where one byte of room appears at once
+    and a few bytes on one where it does not. A leftover `copyForwards` was then
+    a harmless self-copy on macOS and a clobber on Linux, and the test read a
+    length of `0x01010000` out of the middle of the stream on one platform while
+    passing on the other. Draining first makes the count non-zero everywhere.
+  - `SO_SNDBUF` is exact on a Darwin socketpair and **doubled** on a Linux one,
+    so "half the requested size" is a different buffer on each.
+  The general lesson: a test whose correctness depends on a *kernel's* opinion
+  is a test with a per-platform failure mode, and the fix is to assert the
+  property you care about in units you control. `mutate.sh` entry 20 exists so
+  the last of these cannot come back silently.
+- **A test can manufacture the desynchronisation it is looking for.** The first
+  version of the frame-alignment test failed intermittently with a 1–4 byte tail,
+  for a reason that had nothing to do with the code: the helper that drives the
+  socket into its half-full state drains the peer one byte at a time, and those
+  bytes came off the *front* of the stream the parser then walked. The parser
+  started mid-frame and reported a torn frame that never existed. Two lessons, in
+  order of how much they cost: keep the bytes a helper consumed, and **do not stop
+  reading a non-blocking socket on `EAGAIN`** — that means "not right now", not
+  "no more data", and breaking there truncates the stream mid-frame.

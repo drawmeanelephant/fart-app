@@ -229,6 +229,21 @@ fn fakeServer(listener: *Listener, stream: []const u8) void {
     };
     defer _ = std.posix.errno(std.posix.system.close(cfd));
 
+    // Set O_NONBLOCK on the ACCEPTED socket explicitly, rather than relying on
+    // it coming from the listener. POSIX does not make `accept` inherit the
+    // listener's status flags and on Linux it demonstrably does not — a harness
+    // that assumed otherwise (src/kujamba_timing.zig, first cut) had a blocking
+    // accepted socket, parked its reader forever, and deadlocked its own
+    // handshake. That harness *had* to notice, because it stops reading and
+    // starts again; this one has not, because a blocking read still returns as
+    // soon as the client writes or hangs up. So it works by luck and the
+    // comment below used to assert something false.
+    {
+        var o: std.c.O = @bitCast(@as(u32, @intCast(std.c.fcntl(cfd, std.c.F.GETFL, @as(c_int, 0)))));
+        o.NONBLOCK = true;
+        _ = std.c.fcntl(cfd, std.c.F.SETFL, @as(c_int, @bitCast(o)));
+    }
+
     // Abort the connection on close (RST instead of FIN): the server sends the
     // first FIN, so a clean close would park this port in TIME_WAIT for ~15-30s
     // — a long fuzz run exhausts the ephemeral range and every later connect
@@ -257,14 +272,14 @@ fn fakeServer(listener: *Listener, stream: []const u8) void {
     var idle_polls: u32 = 0;
     while (true) {
         const n = std.posix.read(cfd, &scratch) catch |e| switch (e) {
-            // The accepted socket is non-blocking, so a read before the client
-            // has said anything returns WouldBlock. That is "not yet", not
-            // "gone": returning here closed the connection the instant the
-            // stream was written, which -- combined with the abort-on-close
-            // above -- reset the client before it could send its 0x80 reply.
-            // Every live-path corpus entry was therefore a silent no-op: the
-            // session died inside the challenge handler, and runDispatchStep's
-            // `catch {}` reported that as a pass.
+            // The accepted socket is non-blocking (set explicitly above), so a
+            // read before the client has said anything returns WouldBlock. That
+            // is "not yet", not "gone": returning here closed the connection the
+            // instant the stream was written, which -- combined with the
+            // abort-on-close above -- reset the client before it could send its
+            // 0x80 reply. Every live-path corpus entry was therefore a silent
+            // no-op: the session died inside the challenge handler, and
+            // runDispatchStep's `catch {}` reported that as a pass.
             error.WouldBlock => {
                 var fds = [_]std.posix.pollfd{.{ .fd = cfd, .events = std.posix.POLL.IN, .revents = 0 }};
                 _ = std.posix.poll(&fds, 1) catch return;
@@ -444,10 +459,53 @@ fn fillCorpus(c: *CorpusBuf) void {
     var zerobpm = StreamBuf{};
     zerobpm.msg(proto.MSG_CONFIG_CHANGE_NOTIFY, &configPayload(0, 8)) catch unreachable;
     c.entry(zerobpm.stream());
+
+    // 15. #13: a tempo the sample count cannot express. bpm=137 / bpi=5 at
+    //     48 kHz is 105109.489 samples, so `srate * bpi * 60 / bpm` truncates —
+    //     and so did the nanosecond form derived from it, by a further 10.2 us
+    //     per bar, every bar. `kujamba_out.intervalNsFor` now computes the bar
+    //     from the wire values directly, and this entry drives the whole
+    //     config-change path (anchor -> encode -> finalize -> slew) with that
+    //     tempo so the arithmetic is exercised rather than assumed.
+    var oddtempo = StreamBuf{};
+    oddtempo.msg(proto.MSG_AUTH_CHALLENGE, &challengePayload(0x00000300, proto.PROTO_VER_CUR)) catch unreachable;
+    oddtempo.msg(proto.MSG_AUTH_REPLY, &authReplyPayload(true, "fuzzer", 8)) catch unreachable;
+    oddtempo.msg(proto.MSG_CONFIG_CHANGE_NOTIFY, &configPayload(137, 5)) catch unreachable;
+    // and a mid-session tempo change onto a second odd tempo, which is where a
+    // stale interval_ns would still be in use if the re-anchor were missing
+    oddtempo.msg(proto.MSG_CONFIG_CHANGE_NOTIFY, &configPayload(101, 7)) catch unreachable;
+    oddtempo.msg(proto.MSG_CONFIG_CHANGE_NOTIFY, &configPayload(3, 1)) catch unreachable;
+    c.entry(oddtempo.stream());
+
+    // 16. #14: a tempo fast enough that a whole bar goes by between two reads.
+    //     At 48 kHz, bpi=1 / bpm=1500 is a 2000-sample bar — shorter than the
+    //     run loop's 20 ms poll. This is the shape that used to make every pass
+    //     finalize a bar it had not really started, and it is the shape the
+    //     bounded write path has to survive without a peer ever stalling: every
+    //     interval boundary here is an opportunity to drop.
+    var fasttempo = StreamBuf{};
+    fasttempo.msg(proto.MSG_AUTH_CHALLENGE, &challengePayload(0x00000300, proto.PROTO_VER_CUR)) catch unreachable;
+    fasttempo.msg(proto.MSG_AUTH_REPLY, &authReplyPayload(true, "fuzzer", 8)) catch unreachable;
+    fasttempo.msg(proto.MSG_CONFIG_CHANGE_NOTIFY, &configPayload(1500, 1)) catch unreachable;
+    c.entry(fasttempo.stream());
+
+    // 17. #13/#14: a session that never stops re-anchoring. Alternating config
+    //     changes with no bar in between is the adversarial shape for the
+    //     drift ledger: `ServerClock.anchor` resets `bars`, and if the session
+    //     were still advancing the old one the bar counter would walk away from
+    //     the grid it claims to be on. Bounded (the stream buffer is 1024 bytes)
+    //     so this is a handful of changes, not a loop.
+    var reanchor = StreamBuf{};
+    reanchor.msg(proto.MSG_AUTH_CHALLENGE, &challengePayload(0x00000300, proto.PROTO_VER_CUR)) catch unreachable;
+    reanchor.msg(proto.MSG_AUTH_REPLY, &authReplyPayload(true, "fuzzer", 8)) catch unreachable;
+    inline for ([_][2]u16{ .{ 100, 4 }, .{ 133, 6 }, .{ 99, 2 }, .{ 149, 8 }, .{ 127, 3 } }) |cfg| {
+        reanchor.msg(proto.MSG_CONFIG_CHANGE_NOTIFY, &configPayload(cfg[0], cfg[1])) catch unreachable;
+    }
+    c.entry(reanchor.stream());
 }
 
 const CorpusBuf = struct {
-    const max_entries = 16;
+    const max_entries = 20;
 
     data: [8192]u8 = undefined,
     used: usize = 0,
