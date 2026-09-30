@@ -254,8 +254,8 @@ through the vendored miniaudio path (`-Dlive`; on by default on macOS) — no
 `afplay`, no shell-out:
 
 ```bash
-./zig-out/bin/kujamba play --phrase "kujamba karibu" --play once
-./zig-out/bin/kujamba play --phrase "po" --device 1   # by index or name substring
+./zig-out/bin/kujamba play "kujamba karibu" --play once   # bare phrase = --phrase
+./zig-out/bin/kujamba play --phrase "po" --device 1       # by index or name substring
 ```
 
 No output device (or a bad `--device`) exits 1 with a clear message; a build
