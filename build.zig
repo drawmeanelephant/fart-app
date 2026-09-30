@@ -113,6 +113,19 @@ pub fn build(b: *std.Build) void {
     kujambaDeps(b, kujamba_tests.root_module);
     const run_kujamba_tests = b.addRunArtifact(kujamba_tests);
     test_step.dependOn(&run_kujamba_tests.step);
+
+    // fart app platform glue (#25): the audio player probe and sound command
+    // builder are testable without a display, so they join `zig build test`
+    const fart_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    fart_tests.root_module.link_libc = true;
+    const run_fart_tests = b.addRunArtifact(fart_tests);
+    test_step.dependOn(&run_fart_tests.step);
 }
 
 // ---------------------------------------------------------------------------

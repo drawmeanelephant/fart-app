@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const synth = @import("synth.zig");
 const libc = @cImport({
     @cInclude("stdio.h");
@@ -68,8 +69,8 @@ const colors = [_][]const u8{
 };
 
 const bg_colors = [_][]const u8{
-    "\x1b[41m", "\x1b[42m", "\x1b[43m", "\x1b[44m",
-    "\x1b[45m", "\x1b[46m", "\x1b[101m", "\x1b[102m",
+    "\x1b[41m",  "\x1b[42m", "\x1b[43m",  "\x1b[44m",
+    "\x1b[45m",  "\x1b[46m", "\x1b[101m", "\x1b[102m",
     "\x1b[103m",
 };
 
@@ -78,6 +79,70 @@ var is_running = std.atomic.Value(bool).init(true);
 // Flatlophone v2: fixed seeds for the six pre-rendered shuzi (wordless farts)
 // that replace the retired Basso.aiff library. Deterministic per seed.
 const shuzi_seeds = [_]u64{ 0xF4277D01, 0xF4277D02, 0xF4277D03, 0xF4277D04, 0xF4277D05, 0xF4277D06 };
+
+// ---- platform: sound + speech (#25) --------------------------------------------
+// The butt is visual anywhere a terminal is; the sounds are shell-outs to
+// whatever the host offers. macOS ships afplay + say; Linux uses paplay /
+// aplay / ffplay (whichever is found first) and espeak. With none of them the
+// app still runs — it says so once and goes silent.
+
+const AudioPlayer = enum { afplay, paplay, aplay, ffplay, none };
+
+var audio_player: AudioPlayer = .none; // probed once in main()
+var speech_available: bool = false; // probed once in main()
+
+fn haveCommand(cmd: []const u8) bool {
+    var buf: [128]u8 = undefined;
+    const probe = std.fmt.bufPrintZ(&buf, "command -v {s} >/dev/null 2>&1", .{cmd}) catch return false;
+    return libc.system(probe.ptr) == 0;
+}
+
+fn probeAudio() AudioPlayer {
+    if (builtin.os.tag == .macos) {
+        return if (haveCommand("afplay")) .afplay else .none;
+    }
+    if (haveCommand("paplay")) return .paplay;
+    if (haveCommand("aplay")) return .aplay;
+    if (haveCommand("ffplay")) return .ffplay;
+    return .none;
+}
+
+fn probeSpeech() bool {
+    return haveCommand(if (builtin.os.tag == .macos) "say" else "espeak");
+}
+
+/// The shell line that plays `path` at `volume` (afplay and paplay have a
+/// volume knob; aplay and ffplay play at their default), or null when there is
+/// nothing to play with.
+fn soundCommand(buf: []u8, player: AudioPlayer, path: []const u8, volume: u8) ?[:0]const u8 {
+    return switch (player) {
+        .afplay => std.fmt.bufPrintZ(buf, "afplay -v {d} {s} &", .{ volume, path }) catch null,
+        .paplay => std.fmt.bufPrintZ(buf, "paplay --volume={d} {s} &", .{ volume, path }) catch null,
+        .aplay => std.fmt.bufPrintZ(buf, "aplay -q {s} &", .{path}) catch null,
+        .ffplay => std.fmt.bufPrintZ(buf, "ffplay -loglevel quiet -nodisp -autoexit {s} &", .{path}) catch null,
+        .none => null,
+    };
+}
+
+fn playSound(path: [:0]const u8, volume: u8) void {
+    var buf: [160]u8 = undefined;
+    if (soundCommand(&buf, audio_player, path, volume)) |cmd| {
+        _ = libc.system(cmd.ptr);
+    }
+}
+
+/// The voice lines. macOS keeps its `say` voices (the jokes are
+/// voice-specific); Linux falls back to espeak's default voice when installed.
+fn speak(voice: []const u8, text: []const u8) void {
+    var buf: [256]u8 = undefined;
+    const cmd = if (builtin.os.tag == .macos)
+        std.fmt.bufPrintZ(&buf, "say -v '{s}' '{s}' &", .{ voice, text }) catch return
+    else if (speech_available)
+        std.fmt.bufPrintZ(&buf, "espeak '{s}' &", .{text}) catch return
+    else
+        return;
+    _ = libc.system(cmd.ptr);
+}
 
 fn writeWavFile(path: [*:0]const u8, bytes: []const u8) bool {
     const f = libc.fopen(path, "wb") orelse return false;
@@ -112,7 +177,7 @@ fn runKujamba(phrase: []const u8) void {
     }
 
     _ = libc.printf("\x1b[?25l");
-    _ = libc.system("afplay /tmp/fart_kujamba.wav &");
+    playSound("/tmp/fart_kujamba.wav", 1);
 
     var i: usize = 0;
     while (i < plan.items.len) : (i += 1) {
@@ -189,6 +254,16 @@ pub fn main(init: std.process.Init) !void {
     _ = libc.signal(libc.SIGINT, handleSigInt);
     _ = libc.srand(@as(u32, @intCast(libc.time(null))) ^ @as(u32, @intCast(libc.getpid())));
 
+    // probe the host's sound + speech once; every playSound/speak after this
+    // is a no-op when the host has nothing to offer (#25)
+    audio_player = probeAudio();
+    speech_available = probeSpeech();
+    if (audio_player == .none) {
+        _ = libc.printf("💨 no audio player found — running silent (want afplay, paplay, aplay or ffplay)\n");
+    } else if (!speech_available) {
+        _ = libc.printf("💨 no speech synth found — the butt is mute (want say or espeak)\n");
+    }
+
     // kujamba mode: fart kujamba <swahili phrase> — the butt speaks.
     var args_iter = init.minimal.args.iterate();
     _ = args_iter.skip(); // program name
@@ -222,8 +297,8 @@ pub fn main(init: std.process.Init) !void {
         const path = std.fmt.bufPrintZ(&path_buf, "/tmp/fart_shuzi_{d}.wav", .{idx}) catch continue;
         _ = writeWavFile(path, wav);
     }
-    _ = libc.system("afplay -v 3 /tmp/fart_shuzi_0.wav &");
-    _ = libc.system("say -v 'Bad News' 'Pfffffft!' &");
+    playSound("/tmp/fart_shuzi_0.wav", 3);
+    speak("Bad News", "Pfffffft!");
 
     var frame: usize = 0;
     while (is_running.load(.acquire)) {
@@ -237,7 +312,7 @@ pub fn main(init: std.process.Init) !void {
         if (rand_val % 300 == 0) {
             _ = libc.printf("\x1b[41m\x1b[93m");
             _ = libc.printf("\x1b[2J\x1b[H");
-            
+
             _ = libc.printf("\x1b[%d;%dH", clamp(12 + shake_y), clamp(30 + shake_x));
             _ = libc.printf("      _.-^^---....,,--\n");
             _ = libc.printf("\x1b[%d;%dH", clamp(13 + shake_y), clamp(30 + shake_x));
@@ -250,7 +325,13 @@ pub fn main(init: std.process.Init) !void {
             _ = libc.printf("    ```--. . , ; .--'''  \n");
             _ = libc.fflush(null);
 
-            _ = libc.system("say -v 'Bad News' 'TACTICAL NUKE INCOMING' & afplay -v 5 /System/Library/Sounds/Blow.aiff &");
+            if (builtin.os.tag == .macos) {
+                _ = libc.system("say -v 'Bad News' 'TACTICAL NUKE INCOMING' & afplay -v 5 /System/Library/Sounds/Blow.aiff &");
+            } else {
+                // no Blow.aiff outside macOS; the loudest shuzi steps in
+                speak("Bad News", "TACTICAL NUKE INCOMING");
+                playSound("/tmp/fart_shuzi_0.wav", 5);
+            }
             _ = libc.usleep(1000 * 1000);
             frame += 1;
             continue;
@@ -301,7 +382,7 @@ pub fn main(init: std.process.Init) !void {
 
         const c_col = colors[getRandU(colors.len)];
         _ = libc.printf("%s", c_col.ptr);
-        
+
         const current_butt = butt_frames[frame % butt_frames.len];
         var lines = std.mem.splitScalar(u8, current_butt, '\n');
         var row = clamp(10 + shake_y);
@@ -323,13 +404,13 @@ pub fn main(init: std.process.Init) !void {
         }
 
         if (getRandU(15) == 0) {
-            var buf: [128]u8 = undefined;
-            _ = libc.sprintf(&buf[0], "afplay -v 2 /tmp/fart_shuzi_%d.wav &", @as(c_int, @intCast(getRandU(shuzi_seeds.len))));
-            _ = libc.system(&buf[0]);
+            var path_buf: [32]u8 = undefined;
+            const shuzi_path = std.fmt.bufPrintZ(&path_buf, "/tmp/fart_shuzi_{d}.wav", .{getRandU(shuzi_seeds.len)}) catch continue;
+            playSound(shuzi_path, 2);
         }
-        
+
         if (getRandU(20) == 0) {
-            _ = libc.system("say -v 'Ralph' 'pfffffft' &");
+            speak("Ralph", "pfffffft");
         }
 
         var dummy_var: i32 = 42;
@@ -344,4 +425,22 @@ pub fn main(init: std.process.Init) !void {
 
     restoreTerminal();
     _ = libc.printf("\n💨 PFFFFFT! DONE.\n");
+}
+
+// ---- tests ---------------------------------------------------------------------
+
+const testing = std.testing;
+
+test "sound command per player" {
+    var buf: [160]u8 = undefined;
+    try testing.expectEqualStrings("afplay -v 3 /tmp/fart.wav &", soundCommand(&buf, .afplay, "/tmp/fart.wav", 3).?);
+    try testing.expectEqualStrings("paplay --volume=3 /tmp/fart.wav &", soundCommand(&buf, .paplay, "/tmp/fart.wav", 3).?);
+    try testing.expectEqualStrings("aplay -q /tmp/fart.wav &", soundCommand(&buf, .aplay, "/tmp/fart.wav", 3).?);
+    try testing.expectEqualStrings("ffplay -loglevel quiet -nodisp -autoexit /tmp/fart.wav &", soundCommand(&buf, .ffplay, "/tmp/fart.wav", 3).?);
+    try testing.expectEqual(@as(?[:0]const u8, null), soundCommand(&buf, .none, "/tmp/fart.wav", 3));
+}
+
+test "command probe finds sh and misses nonsense" {
+    try testing.expect(haveCommand("sh"));
+    try testing.expect(!haveCommand("definitely-not-a-command-xyzzy"));
 }
