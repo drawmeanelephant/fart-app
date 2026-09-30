@@ -530,34 +530,33 @@ test "#14: a half-full socket declines the frame with zero bytes on the wire" {
     }
     var conn = net.Conn{ .io = io, .fd = fds[0] };
 
-    // Saturate, then hand back a fixed slice. This is the state the bug needs
-    // and the one no other test here reaches: the buffer has room in it, so
-    // POLLOUT is set, so the cheap gate says yes — and yet a 16 KiB frame cannot
-    // fit.
+    // Saturate, then hand back a fixed slice: a buffer with some room left in
+    // it, and not enough for the frame. That is the state the bug needs and the
+    // one no other test here reaches.
     //
-    // The sizes are chosen to work on both platforms without knowing either
-    // one's accounting, which took three attempts. A socketpair's SO_SNDBUF is
-    // reported exactly on Darwin (8192) and **doubled** on Linux (16384), so a
-    // half-full buffer is 4096 free there and 8192 here — both comfortably under
-    // a 16372-byte frame, which is the only thing the test needs. Filling to
-    // *exactly half the requested size* instead was the version that failed on
-    // Linux, because a socket with 4096 free out of 16384 does not report
-    // itself writable the way one with 4096 free out of 8192 does.
+    // `writable()` is printed but deliberately **not** asserted. Its whole
+    // character is that it is a coarse gate — "at least one byte free" — and how
+    // coarse is the kernel's business: an earlier cut asserted it here and passed
+    // on macOS while failing on Linux, where a socket with 4096 bytes free out
+    // of a 16384-byte buffer does not report itself writable. The property the
+    // test actually needs is the one below it, and that is stated in bytes
+    // rather than in the kernel's opinion.
     var junk: [4096]u8 = undefined;
     @memset(&junk, 0xA5);
     const absorbed = fillUntilBlocked(fds[0], &junk);
     var sink: [65536]u8 = undefined;
     const drained = drainSocket(fds[1], sink[0..4096]);
     try std.testing.expect(drained > 0);
-    try std.testing.expect(conn.writable()); // the liar: there IS room, just not enough
 
     var payload: [16367]u8 = undefined;
     @memset(&payload, 0x5A);
     const room = conn.sendRoom().?;
     std.debug.print(
-        \\  #14 half-full  {d} of {d} bytes queued, {d} reported free, {d}-byte frame
+        \\  #14 half-full  {d} of {d} bytes queued, {d} reported free, POLLOUT={any}, {d}-byte frame
         \\
-    , .{ absorbed - drained, absorbed, room, payload.len + 5 });
+    , .{ absorbed - drained, absorbed, room, conn.writable(), payload.len + 5 });
+    // room to spare, and not enough for the frame: exactly the condition in
+    // which the old code put a header on the wire and a fragment of its body
     try std.testing.expect(room > 0);
     try std.testing.expect(room < 5 + payload.len);
 
@@ -689,6 +688,15 @@ test "#14: a refused frame leaves the peer's byte stream still frame-aligned" {
         off += 5 + @as(usize, len);
         frames += 1;
     }
+    // Whatever is left over has to be the filler's own short final write and
+    // nothing else. `fillUntilBlocked` stops on a short write, so the junk is
+    // whole frames followed by a remainder — on macOS that remainder is 0 and on
+    // Linux it is whatever was left, which is why the first version of this
+    // reported a torn frame that the test had put there itself. A torn *upload*
+    // would show up as a different number here, or as a frame that runs past
+    // the end.
+    try std.testing.expect(total - off < frame.len);
+    try std.testing.expectEqual(queued % frame.len, total - off);
     std.debug.print("  {d} bytes parsed as {d} whole frames, no tail\n", .{ total, frames });
     try std.testing.expect(frames > 0);
 }
