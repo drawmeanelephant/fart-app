@@ -189,7 +189,17 @@ pub const PlanAdapter = struct {
 /// at `synth.SAMPLE_RATE`, with a short linear fade-out so phrase tails and
 /// loop wraps don't click. Deterministic: same phrase -> same samples.
 pub fn renderPhraseF32(alloc: std.mem.Allocator, phrase: []const u8) ![]f32 {
-    const pcm16 = try synth.renderPhraseSamples(alloc, phrase);
+    return renderPhraseF32With(alloc, phrase, .{});
+}
+
+/// `renderPhraseF32` with the synth's voice knobs applied (#18). The default
+/// `{}` is the identity and byte-identical to `renderPhraseF32`.
+pub fn renderPhraseF32With(
+    alloc: std.mem.Allocator,
+    phrase: []const u8,
+    knobs: synth.VoiceKnobs,
+) ![]f32 {
+    const pcm16 = try synth.renderPhraseSamplesWith(alloc, phrase, knobs);
     defer alloc.free(pcm16);
     const out = try alloc.alloc(f32, pcm16.len);
     for (pcm16, out) |v, *o| o.* = @as(f32, @floatFromInt(v)) / 32768.0;
@@ -215,6 +225,8 @@ pub const OfflineOpts = struct {
     /// samples per bar. 0 means "one bar exactly as long as the phrase", so the
     /// defaults render the phrase untouched rather than truncating it at 1s.
     bar_samples: u64 = 0,
+    /// voice tuning for the synth (#18); the default is the identity
+    knobs: synth.VoiceKnobs = .{},
 };
 
 /// Render a phrase to the bar-shaped audio `join` would upload, with no server.
@@ -235,7 +247,7 @@ pub fn renderOfflineF32(
     phrase: []const u8,
     opts: OfflineOpts,
 ) ![]f32 {
-    const samples = try renderPhraseF32(alloc, phrase);
+    const samples = try renderPhraseF32With(alloc, phrase, opts.knobs);
     defer alloc.free(samples);
 
     const bar: u64 = if (opts.bar_samples != 0) opts.bar_samples else @max(1, samples.len);

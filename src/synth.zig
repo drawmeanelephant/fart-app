@@ -84,6 +84,74 @@ pub fn voiceSpec(cls: VoiceClass) VoiceSpec {
     };
 }
 
+/// Per-run tuning of the three onset characters the class table sets: attack,
+/// noise mix and wobble depth. Multipliers rather than absolutes, so an onset
+/// class keeps its character — `--voice wobble=2` doubles the wobble of every
+/// class instead of flattening them all to one number.
+///
+/// The default is 1.0 on every axis, and `x * 1.0` is exact in IEEE-754, so an
+/// untouched `VoiceKnobs` reproduces the class table bit for bit. That is
+/// load-bearing, not decorative: the golden fingerprints in `src/golden.zig`
+/// assert it, and all seven of them have to keep passing unchanged.
+pub const VoiceKnobs = struct {
+    /// scales `attack_s`
+    attack: f32 = 1.0,
+    /// scales `noise_mix`
+    noise: f32 = 1.0,
+    /// scales `wobble_depth` — how deep the flutter is, not how fast
+    wobble: f32 = 1.0,
+
+    /// Bounds on the *resulting* spec, not on the multipliers. Each one exists
+    /// because the value feeds arithmetic that breaks outside its range.
+    pub const min_attack_s: f32 = 0.0005; // 0.5ms; 0 makes sample 0 compute 0/0 -> NaN
+    pub const max_attack_s: f32 = 0.200;
+    pub const max_noise_mix: f32 = 1.0; // past 1 it is the same noise, just clipped
+    /// past 2, `wob = 1 - depth * (...)` goes negative and flips the
+    /// waveform's polarity — that is distortion, not chaos
+    pub const max_wobble_depth: f32 = 1.0;
+
+    /// The class table with the knobs applied. `wobble_hz` is deliberately
+    /// untouched: the knob is on the depth of the flutter, and the rate is
+    /// part of each class's character.
+    pub fn apply(self: VoiceKnobs, spec: VoiceSpec) VoiceSpec {
+        return .{
+            .attack_s = std.math.clamp(spec.attack_s * self.attack, min_attack_s, max_attack_s),
+            .noise_mix = std.math.clamp(spec.noise_mix * self.noise, 0.0, max_noise_mix),
+            .wobble_hz = spec.wobble_hz,
+            .wobble_depth = std.math.clamp(spec.wobble_depth * self.wobble, 0.0, max_wobble_depth),
+            .level = spec.level,
+        };
+    }
+};
+
+pub const KnobsError = error{ UnknownKnob, MalformedKnob, NotFinite, Negative };
+
+/// Parse `attack=1.2,noise=0.8,wobble=2` into multipliers. Order is free and
+/// whitespace around keys and values is ignored; an empty string is the
+/// identity, which is what `--voice ""` and an omitted flag both mean.
+pub fn parseKnobs(s: []const u8) KnobsError!VoiceKnobs {
+    var knobs = VoiceKnobs{};
+    var it = std.mem.splitScalar(u8, s, ',');
+    while (it.next()) |part| {
+        const trimmed = std.mem.trim(u8, part, " \t");
+        if (trimmed.len == 0) continue;
+        const eq = std.mem.indexOfScalar(u8, trimmed, '=') orelse return error.MalformedKnob;
+        const key = std.mem.trim(u8, trimmed[0..eq], " \t");
+        const v = std.fmt.parseFloat(f32, std.mem.trim(u8, trimmed[eq + 1 ..], " \t")) catch
+            return error.MalformedKnob;
+        if (!std.math.isFinite(v)) return error.NotFinite;
+        if (v < 0) return error.Negative;
+        if (std.mem.eql(u8, key, "attack")) {
+            knobs.attack = v;
+        } else if (std.mem.eql(u8, key, "noise")) {
+            knobs.noise = v;
+        } else if (std.mem.eql(u8, key, "wobble")) {
+            knobs.wobble = v;
+        } else return error.UnknownKnob;
+    }
+    return knobs;
+}
+
 pub fn classify(onset: []const u8) VoiceClass {
     if (onset.len == 0) return .none;
     return switch (onset[0]) {
@@ -155,13 +223,16 @@ fn synthInto(out: []i16, p: VoiceParams, prng: *std.Random.DefaultPrng) void {
     }
 }
 
-fn renderSyllableInto(out: []i16, syl: *const Syll, stressed: bool, prng: *std.Random.DefaultPrng) void {
+fn renderSyllableInto(out: []i16, syl: *const Syll, stressed: bool, prng: *std.Random.DefaultPrng, knobs: VoiceKnobs) void {
     var p: VoiceParams = undefined;
     if (syl.vowel == 0) {
-        // Consonant-only tail: a short whisper, not a buzz.
-        p = .{ .f0 = 88.0, .attack_s = 0.006, .noise_mix = 0.85, .wobble_hz = 31.0, .wobble_depth = 0.30, .level = 0.65, .glide = 0.15 };
+        // Consonant-only tail: a short whisper, not a buzz. The knobs reach this
+        // literal too, so `--voice noise=0` means "no noise anywhere" rather
+        // than "no noise except on the rare breath syllable".
+        const spec = knobs.apply(.{ .attack_s = 0.006, .noise_mix = 0.85, .wobble_hz = 31.0, .wobble_depth = 0.30, .level = 0.65 });
+        p = .{ .f0 = 88.0, .attack_s = spec.attack_s, .noise_mix = spec.noise_mix, .wobble_hz = spec.wobble_hz, .wobble_depth = spec.wobble_depth, .level = spec.level, .glide = 0.15 };
     } else {
-        const spec = voiceSpec(classify(syl.onset()));
+        const spec = knobs.apply(voiceSpec(classify(syl.onset())));
         p = .{
             .f0 = vowelBaseFreq(syl.vowel).?,
             .attack_s = spec.attack_s,
@@ -399,6 +470,13 @@ pub fn phraseDurationMs(allocator: std.mem.Allocator, phrase: []const u8) !f64 {
 /// Renders a whole phrase as interleaved i16 samples. Deterministic: the same
 /// phrase yields byte-identical samples on every call, every run.
 pub fn renderPhraseSamples(allocator: std.mem.Allocator, phrase: []const u8) ![]i16 {
+    return renderPhraseSamplesWith(allocator, phrase, .{});
+}
+
+/// `renderPhraseSamples` with the voice knobs applied. The default `{}` is the
+/// identity and is byte-identical to `renderPhraseSamples` — the golden
+/// fingerprints in `src/golden.zig` depend on that and assert it.
+pub fn renderPhraseSamplesWith(allocator: std.mem.Allocator, phrase: []const u8, knobs: VoiceKnobs) ![]i16 {
     var plan = try planPhrase(allocator, phrase);
     defer plan.deinit(allocator);
     if (plan.items.len == 0) return error.NoSyllables;
@@ -407,14 +485,20 @@ pub fn renderPhraseSamples(allocator: std.mem.Allocator, phrase: []const u8) ![]
     @memset(samples, 0);
     var prng = std.Random.DefaultPrng.init(std.hash.Wyhash.hash(0x5EED_F00D, phrase));
     for (plan.items) |item| {
-        renderSyllableInto(samples[item.start..][0..item.len], &item.syl, item.stressed, &prng);
+        renderSyllableInto(samples[item.start..][0..item.len], &item.syl, item.stressed, &prng, knobs);
     }
     return samples;
 }
 
 /// Renders a phrase straight to complete WAV bytes (44-byte header + data).
 pub fn renderPhraseWav(allocator: std.mem.Allocator, phrase: []const u8) ![]u8 {
-    const samples = try renderPhraseSamples(allocator, phrase);
+    return renderPhraseWavWith(allocator, phrase, .{});
+}
+
+/// `renderPhraseWav` with the voice knobs applied. `{}` is byte-identical to
+/// `renderPhraseWav`.
+pub fn renderPhraseWavWith(allocator: std.mem.Allocator, phrase: []const u8, knobs: VoiceKnobs) ![]u8 {
+    const samples = try renderPhraseSamplesWith(allocator, phrase, knobs);
     defer allocator.free(samples);
     return writeWavBytes(allocator, samples, SAMPLE_RATE);
 }
@@ -422,6 +506,12 @@ pub fn renderPhraseWav(allocator: std.mem.Allocator, phrase: []const u8) ![]u8 {
 /// A wordless shuzi (a fart): 1-3 rumble syllables with random-ish timing,
 /// pitch and onset character. Deterministic per seed.
 pub fn renderShuziWav(allocator: std.mem.Allocator, seed: u64) ![]u8 {
+    return renderShuziWavWith(allocator, seed, .{});
+}
+
+/// `renderShuziWav` with the voice knobs applied. `{}` is byte-identical to
+/// `renderShuziWav`.
+pub fn renderShuziWavWith(allocator: std.mem.Allocator, seed: u64, knobs: VoiceKnobs) ![]u8 {
     var prng = std.Random.DefaultPrng.init(seed);
     const r = prng.random();
     const n_syl: usize = 1 + r.uintLessThan(usize, 3);
@@ -432,7 +522,7 @@ pub fn renderShuziWav(allocator: std.mem.Allocator, seed: u64) ![]u8 {
     while (i < n_syl) : (i += 1) {
         const dur_ms: usize = (16 + r.uintLessThan(usize, 19)) * 10; // 160..340 ms
         const classes = [_]VoiceClass{ .stop_voiced, .stop_voiceless, .fricative, .nasal, .liquid };
-        const spec = voiceSpec(classes[r.uintLessThan(usize, classes.len)]);
+        const spec = knobs.apply(voiceSpec(classes[r.uintLessThan(usize, classes.len)]));
         const gap_ms: usize = if (i + 1 < n_syl) (3 + r.uintLessThan(usize, 5)) * 10 else 0; // 30..70 ms
         segs[i] = .{
             .params = .{
@@ -718,8 +808,8 @@ fn expectRoundTrip(allocator: std.mem.Allocator, word: []const u8) !void {
 test "splitter round-trip: corpus and fuzzed bytes never lose a byte" {
     const allocator = testing.allocator;
     const corpus = [_][]const u8{
-        "habari", "yako", "asante", "karibu", "kujamba", "shuzi",
-        "ng'oma", "mtu",   "nyumba", "kwenda", "ndiyo",  "mbwa",
+        "habari", "yako",   "asante", "karibu", "kujamba", "shuzi",
+        "ng'oma", "mtu",    "nyumba", "kwenda", "ndiyo",   "mbwa",
         "HaBaRI", "Ng'OMA",
     };
     for (corpus) |word| try expectRoundTrip(allocator, word);
@@ -743,4 +833,167 @@ test "splitter round-trip: corpus and fuzzed bytes never lose a byte" {
     const wav = try renderPhraseWav(allocator, corpus[0]);
     defer allocator.free(wav);
     try expectNotSilence(wav);
+}
+
+// --------------------------------------------------------------------------
+// voice knobs (#18)
+// --------------------------------------------------------------------------
+
+test "voice knobs: the default is the identity, byte for byte" {
+    const alloc = testing.allocator;
+
+    // The acceptance criterion for #18 is that defaults reproduce today's sound
+    // exactly. Assert it at the byte level rather than trusting that `x * 1.0`
+    // is a no-op, and cover all three public entry points.
+    const plain = try renderPhraseSamples(alloc, "kujamba karibu");
+    defer alloc.free(plain);
+    const knobbed = try renderPhraseSamplesWith(alloc, "kujamba karibu", .{});
+    defer alloc.free(knobbed);
+    try testing.expectEqualSlices(i16, plain, knobbed);
+
+    const plain_wav = try renderPhraseWav(alloc, "asante sana");
+    defer alloc.free(plain_wav);
+    const knobbed_wav = try renderPhraseWavWith(alloc, "asante sana", .{});
+    defer alloc.free(knobbed_wav);
+    try testing.expectEqualSlices(u8, plain_wav, knobbed_wav);
+
+    const plain_shuzi = try renderShuziWav(alloc, 42);
+    defer alloc.free(plain_shuzi);
+    const knobbed_shuzi = try renderShuziWavWith(alloc, 42, .{});
+    defer alloc.free(knobbed_shuzi);
+    try testing.expectEqualSlices(u8, plain_shuzi, knobbed_shuzi);
+}
+
+test "voice knobs: spelling out 1,1,1 is still the identity" {
+    const alloc = testing.allocator;
+    // a preset that sets every knob explicitly to its default must not move a
+    // single sample, or every saved preset becomes a silent audio change
+    const plain = try renderPhraseWav(alloc, "kujamba karibu");
+    defer alloc.free(plain);
+    const explicit = try renderPhraseWavWith(
+        alloc,
+        "kujamba karibu",
+        .{ .attack = 1.0, .noise = 1.0, .wobble = 1.0 },
+    );
+    defer alloc.free(explicit);
+    try testing.expectEqualSlices(u8, plain, explicit);
+
+    // and the empty string parses to the same identity
+    const from_flag = try renderPhraseWavWith(alloc, "kujamba karibu", try parseKnobs(""));
+    defer alloc.free(from_flag);
+    try testing.expectEqualSlices(u8, plain, from_flag);
+    const round_trip = try renderPhraseWavWith(alloc, "kujamba karibu", try parseKnobs("attack=1, noise=1 ,wobble=1"));
+    defer alloc.free(round_trip);
+    try testing.expectEqualSlices(u8, plain, round_trip);
+}
+
+test "voice knobs: each axis actually changes the audio" {
+    const alloc = testing.allocator;
+    const plain = try renderPhraseWav(alloc, "kujamba karibu");
+    defer alloc.free(plain);
+
+    const axes = [_]struct { name: []const u8, knobs: VoiceKnobs }{
+        .{ .name = "attack", .knobs = .{ .attack = 2.0 } },
+        .{ .name = "noise", .knobs = .{ .noise = 0.0 } },
+        .{ .name = "noise up", .knobs = .{ .noise = 2.0 } },
+        .{ .name = "wobble", .knobs = .{ .wobble = 0.0 } },
+        .{ .name = "wobble up", .knobs = .{ .wobble = 2.0 } },
+    };
+    for (axes) |ax| {
+        const out = try renderPhraseWavWith(alloc, "kujamba karibu", ax.knobs);
+        defer alloc.free(out);
+        try testing.expect(!std.mem.eql(u8, plain, out));
+    }
+}
+
+test "voice knobs: extremes are clamped, never NaN and never inverted" {
+    const alloc = testing.allocator;
+    // attack=0 would make sample 0 compute 0/0, and `@intFromFloat(NaN)` is a
+    // panic, so this test passing at all is the proof there is no NaN.
+    // wobble=10 would drive `wob` negative and flip the waveform's polarity.
+    const wild = [_]VoiceKnobs{
+        .{ .attack = 0.0, .noise = 0.0, .wobble = 0.0 },
+        .{ .attack = 0.0, .noise = 99.0, .wobble = 99.0 },
+        .{ .attack = 1e9, .noise = 1e9, .wobble = 1e9 },
+    };
+    for (wild) |knobs| {
+        const out = try renderPhraseSamplesWith(alloc, "kujamba karibu", knobs);
+        defer alloc.free(out);
+        try testing.expect(out.len > 1000);
+        try testing.expect(rmsOf(out) > 1.0); // still real audio, not silence
+    }
+
+    // the bounds themselves, so a future edit to the clamps is visible
+    const base = voiceSpec(.stop_voiceless); // attack 4ms, noise 0.40, wobble 0.55
+    const zeroed = (VoiceKnobs{ .attack = 0, .noise = 0, .wobble = 0 }).apply(base);
+    try testing.expectEqual(VoiceKnobs.min_attack_s, zeroed.attack_s);
+    try testing.expectEqual(@as(f32, 0.0), zeroed.noise_mix);
+    try testing.expectEqual(@as(f32, 0.0), zeroed.wobble_depth);
+
+    const huge = (VoiceKnobs{ .attack = 1e6, .noise = 1e6, .wobble = 1e6 }).apply(base);
+    try testing.expectEqual(VoiceKnobs.max_attack_s, huge.attack_s);
+    try testing.expect(huge.noise_mix <= VoiceKnobs.max_noise_mix);
+    try testing.expect(huge.wobble_depth <= VoiceKnobs.max_wobble_depth);
+
+    // wobble_depth at the cap must keep `wob = 1 - depth * (...)` non-negative
+    try testing.expectEqual(@as(f32, 0.0), 1.0 - huge.wobble_depth * 1.0);
+    // and `wobble_hz` is the class's, never scaled
+    try testing.expectEqual(base.wobble_hz, huge.wobble_hz);
+}
+
+test "voice knobs reach the consonant-only breath syllable" {
+    const alloc = testing.allocator;
+    // A breath syllable has no vowel, so it renders from a literal spec rather
+    // than from voiceSpec, and it is the one place the knobs could be missed.
+    //
+    // Rendering a whole word would NOT isolate it: "mtu" splits into the breath
+    // "m" plus the vowel "tu", and "tu" responds to the knobs either way, so the
+    // comparison passes even with the breath path hardcoded to ignore them.
+    // That is a test that lies, so drive the syllable renderer directly.
+    var syl = Syll{ .text_len = 1, .onset_len = 1, .vowel = 0 };
+    @memcpy(syl.text_buf[0..1], "m");
+    const n: usize = SAMPLE_RATE * 90 / 1000; // the breath syllable's length
+
+    const plain = try alloc.alloc(i16, n);
+    defer alloc.free(plain);
+    var prng_a = std.Random.DefaultPrng.init(1);
+    renderSyllableInto(plain, &syl, false, &prng_a, .{});
+
+    const quiet = try alloc.alloc(i16, n);
+    defer alloc.free(quiet);
+    var prng_b = std.Random.DefaultPrng.init(1);
+    // same seed, so the noise sequence matches and the only difference is the
+    // knob: renderSyllableInto draws a fixed number of prng values regardless
+    renderSyllableInto(quiet, &syl, false, &prng_b, .{ .noise = 0.0 });
+
+    var diffs: usize = 0;
+    for (plain, quiet) |a, b| {
+        if (a != b) diffs += 1;
+    }
+    try testing.expect(diffs > n / 2); // a whisper is mostly noise, so most of it moves
+}
+
+test "voice knob parsing accepts order, whitespace and rejects nonsense" {
+    try testing.expectEqual(
+        @as(f32, 1.5),
+        (try parseKnobs("attack=1.5")).attack,
+    );
+    const all = try parseKnobs("wobble=3, attack=0.5 ,noise=2");
+    try testing.expectEqual(@as(f32, 0.5), all.attack);
+    try testing.expectEqual(@as(f32, 2.0), all.noise);
+    try testing.expectEqual(@as(f32, 3.0), all.wobble);
+
+    // partial specs leave the other axes alone
+    const partial = try parseKnobs("noise=0.25");
+    try testing.expectEqual(@as(f32, 1.0), partial.attack);
+    try testing.expectEqual(@as(f32, 0.25), partial.noise);
+    try testing.expectEqual(@as(f32, 1.0), partial.wobble);
+
+    try testing.expectError(error.UnknownKnob, parseKnobs("pitch=2"));
+    try testing.expectError(error.MalformedKnob, parseKnobs("attack"));
+    try testing.expectError(error.MalformedKnob, parseKnobs("attack="));
+    try testing.expectError(error.MalformedKnob, parseKnobs("attack=abc"));
+    try testing.expectError(error.Negative, parseKnobs("noise=-1"));
+    try testing.expectError(error.NotFinite, parseKnobs("noise=nan"));
+    try testing.expectError(error.NotFinite, parseKnobs("noise=inf"));
 }

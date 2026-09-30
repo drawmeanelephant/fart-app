@@ -8,7 +8,7 @@ The dependency edges below are also encoded as GitHub `blocked-by` relations on
 the issues themselves, so `gh issue view 12` shows them without reading this.
 
 **State at time of writing:** 22 open issues (#8–#29), 4 milestones (M4–M8).
-`zig build test` → **84/84 pass** in five suites, in both Debug and ReleaseSafe.
+`zig build test` → **102/102 pass** in five suites, in both Debug and ReleaseSafe.
 CI exists and gates pushes and PRs (build + test, `build-test`); it is not yet
 required by `main`'s ruleset.
 
@@ -27,7 +27,7 @@ unblocks them (#11) is the smallest item in M4.
 |---|---|---|
 | **#11** Bar-accurate switching | The per-bar decision point already exists in `startIntervalEncoders`; widening its return type is the whole change | #8, #9 |
 | **#10** Render caching | Depends only on `renderPhraseF32` | #8 |
-| **#18** voiceSpec knobs | `VoiceSpec` is already a struct; knobs are fields + a multiplier | #15, #16 |
+| **#18** voiceSpec knobs | ✅ **done** — `--voice` multipliers, see below | #15, #16 |
 | **#12** Re-anchor on config change | ✅ **done** — split the counters, see below | #24, #29 |
 | **#19** Offline render | ✅ **done** — `kujamba render`, see below | verification harness for M6 |
 | **#27** CI demo | Extends the existing `build-test` job with the live reference-server run | #28 (flake rate), the safety net for everything |
@@ -148,7 +148,7 @@ recommended answer.
 ## Sequencing
 
 ### Wave 0 — the unblocked six
-`#11` · `#10` · `#18` · `#12`✅ · `#19`✅ · `#27`
+`#11` · `#10` · `#18`✅ · `#12`✅ · `#19`✅ · `#27`
 
 Six independent items; in practice three or four people can work in parallel
 with zero collisions. `#12` and `#19` are the two that paid off fastest and both
@@ -181,6 +181,19 @@ and landing Linux first.
 
 ## Non-obvious findings worth keeping
 
+- **#18's knobs need clamps, and both bounds come from arithmetic that breaks.**
+  `synthInto` computes `attack = min(1, t / attack_s)`, so `attack_s = 0` makes
+  sample 0 evaluate `0/0` — and `@intFromFloat(NaN)` is a panic, not a quiet
+  zero. And `wob = 1 - wobble_depth * (0.5 + 0.5·sin)`, so any `wobble_depth`
+  above 2 drives `wob` negative and **flips the waveform's polarity**: that is
+  distortion, not the chaos `--voice wobble=3` sounds like it should be.
+- **The breath syllable is a second, separate spec path.** A consonant-only
+  syllable (the *m* of *mtu*) has no vowel, so it renders from a literal rather
+  than from `voiceSpec`. Knobs that miss it leave `--voice noise=0` hissing on
+  exactly the syllable that is nothing but a hiss. A whole-word test cannot
+  catch this, because the word's vowel syllable responds either way — the test
+  has to drive `renderSyllableInto` with `vowel = 0` directly.
+
 - **#19's default bar length is a trap, not a detail.** The obvious default —
   one bar = one second — silently truncates any phrase longer than a second, and
   `kujamba karibu` is 1.8s. The landed default is "one bar exactly as long as
@@ -211,4 +224,4 @@ and landing Linux first.
   `get(0..4)` returning empty slices). Fuzz a dispatch step, not just the parser.
 - **The `test` step description is stale.** ~~`build.zig:77` says "Run audit +
   synth unit tests" but it runs three suites (59 tests).~~ **Fixed** alongside
-  the golden fingerprints: it now runs five suites (84 tests) and says so.
+  the golden fingerprints: it now runs five suites (102 tests) and says so.
