@@ -848,3 +848,56 @@ test "offline WAV is the synth WAV plus the session's fade-out, and nothing else
     }
     try testing.expect(offline_tail * 10 < direct_tail * 9);
 }
+
+// ---- loop seam (#17) ---------------------------------------------------------
+
+test "loop mode wraps through zero: the seam is click-free with no crossfade (#17)" {
+    const alloc = testing.allocator;
+    // Why this test exists. #17 asked for a crossfade at the loop wrap. Measured,
+    // the wrap is *already* perfectly click-free, because the phrase is zero at
+    // *both* ends. That is the synth's own envelopes, not any crossfade: the
+    // attack term `min(1, t/attack_s)` is 0 at t=0, and the decay term
+    // `pow(1-u, 1.3)` is 0 at u=1, so the first and last i16 samples round to 0.
+    // (I first assumed the 8 ms end fade in `renderPhraseF32` was what zeroed
+    // the tail; mutating it away proved otherwise — removing that fade leaves
+    // the tail at 0 regardless, because the synth has already zeroed it. The
+    // render fade is belt-and-braces on top.) So the wrap is the one point in
+    // the signal that is continuous through zero.
+    //
+    // A crossfade does not help — it makes it worse. It blends the (already
+    // zero) tail into the head, so the loop ends mid-head and then jumps back to
+    // head[0]: measured wrap step goes 0.000 (none) -> 0.080 (5 ms) -> 0.250
+    // (2 ms), the last being larger than the biggest natural step in the file
+    // (0.091). So this locks in the property instead of adding a feature that
+    // would reintroduce the click #17 was meant to remove.
+    //
+    // This catches a broken attack envelope (the head stops starting at 0). It
+    // does NOT catch removal of the 8 ms render fade, because the synth's decay
+    // envelope keeps the tail at 0 either way — that case is covered by the
+    // #19 test comparing the offline WAV against the direct synth WAV.
+    //
+    // It matters going forward: this invariant is the *only* reason `loop` mode
+    // is seamless, and M6 (#15/#16/#17/#18) is about to reshape exactly the
+    // voice tables and fades that create it. If one of those changes breaks the
+    // zero-termination, this turns red instead of the seam going clicky in a
+    // room where nobody is looking at a waveform.
+    const phrases = [_][]const u8{ "kujamba karibu", "a", "mtu", "asante sana kijiji", "habari yako", "ng'oma" };
+    for (phrases) |p| {
+        const phrase = try renderPhraseF32(alloc, p);
+        defer alloc.free(phrase);
+        try testing.expect(phrase.len > 0);
+
+        // the tail is faded to silence and the head starts from silence
+        try testing.expectEqual(@as(f32, 0.0), phrase[phrase.len - 1]);
+        try testing.expect(@abs(phrase[0]) < 1e-6);
+
+        // ...which is exactly what makes the wrap step zero through `Fill`
+        var fill = Fill{ .samples = phrase, .mode = .loop };
+        const total = phrase.len * 2 + 1;
+        const out = try alloc.alloc(f32, total);
+        defer alloc.free(out);
+        fill.copyInto(0, out);
+        const wrap_step = @abs(out[phrase.len] - out[phrase.len - 1]);
+        try testing.expect(wrap_step == 0.0);
+    }
+}

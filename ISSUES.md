@@ -181,6 +181,16 @@ and landing Linux first.
 
 ## Non-obvious findings worth keeping
 
+- **#17's crossfade would make the loop seam worse, not better.** The wrap is
+  already *exactly* click-free (step 0.000000 on every phrase) because the synth
+  is zero at both ends: the attack term `min(1, t/attack_s)` is 0 at t=0 and the
+  decay term `pow(1-u, 1.3)` is 0 at u=1. A crossfade blends the already-zero tail
+  into the head, so the loop ends mid-head and then jumps back to head[0]:
+  measured wrap step 0.000 (none) → 0.080 (5 ms) → 0.250 (2 ms), the last larger
+  than the file's biggest natural step. Correctly placed in `Fill.copyInto` it
+  still double-fades against the synth's own zero-termination. Lesson: a test or
+  a "fix" for a perceived click should measure the actual discontinuity first —
+  here the click the issue was filed against does not exist.
 - **#18's knobs need clamps, and both bounds come from arithmetic that breaks.**
   `synthInto` computes `attack = min(1, t / attack_s)`, so `attack_s = 0` makes
   sample 0 evaluate `0/0` — and `@intFromFloat(NaN)` is a panic, not a quiet
