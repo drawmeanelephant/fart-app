@@ -11,6 +11,7 @@
 //!       [--out-dir DIR] [--dump-dir DIR] [--transcript FILE] [--duration S]
 //!   kujamba render --phrase "kujamba karibu" --out karibu.wav
 //!       [--play repeat|loop|once] [--pattern N+M] [--bars N] [--bar-ms MS] [--seed N]
+//!       [--voice "attack=1,noise=0,wobble=2"]
 //!       render a phrase to WAV/OGG offline, shaped as `join` would play it
 //!   kujamba check-ogg FILE [--min-rms R]   decode a raw interval; exit 1 if silent
 //!   kujamba encode-silence FILE [--seconds S]
@@ -39,6 +40,9 @@ fn printUsage(io: std.Io) void {
         \\    --seed N           determinism seed: ids + payloads derive from it
         \\    --pattern P        bar pattern, e.g. 3+1 = 3 fart bars + 1 rest bar
         \\                       (default 3+1)
+        \\    --voice SPEC       synth voice knobs (#18), e.g. "noise=0,wobble=2".
+        \\                       Multipliers on each onset class's attack, noise mix
+        \\                       and wobble depth; 1 is today's sound exactly.
         \\    --play MODE        how the phrase maps onto bars:
         \\                       repeat  restart at every fart bar (default)
         \\                       loop    play continuously, wrapping at the end
@@ -53,7 +57,7 @@ fn printUsage(io: std.Io) void {
         \\    --duration S       hard safety cap in seconds (default 120)
         \\    --out-dir DIR      directory for decoded peer WAVs (default dump)
         \\    --transcript FILE  transcript log (default <out-dir>/transcript.log)
-        \\  kujamba render --phrase "..." --out FILE.wav|.ogg [--play MODE]
+        \\  kujamba render --phrase "..." --out FILE.wav|.ogg [--play MODE] [--voice SPEC]
         \\                       [--pattern P] [--bars N] [--bar-ms MS] [--seed N]
         \\      render a phrase offline, shaped as join would play it. A rest bar
         \\      is exact silence and freezes the phrase cursor, matching the room.
@@ -117,6 +121,7 @@ fn cmdJoin(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: [
     var seed: u64 = 1;
     var pattern_str: []const u8 = "3+1";
     var play_mode: kujamba_out.Mode = .repeat;
+    var knobs: synth.VoiceKnobs = .{};
     var intervals: u64 = 8;
     var duration_ms: i64 = 120_000;
     var out_dir: []const u8 = "dump";
@@ -150,6 +155,10 @@ fn cmdJoin(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: [
         } else if (std.mem.eql(u8, a, "--play")) {
             play_mode = kujamba_out.parseMode(next orelse fail(io, "--play needs a value", .{})) catch
                 fail(io, "bad --play '{s}' (want repeat, loop or once)", .{next.?});
+            i += 1;
+        } else if (std.mem.eql(u8, a, "--voice")) {
+            knobs = synth.parseKnobs(next orelse fail(io, "--voice needs a value", .{})) catch |e|
+                fail(io, "bad --voice '{s}': {s} (want attack=N,noise=N,wobble=N)", .{ next.?, @errorName(e) });
             i += 1;
         } else if (std.mem.eql(u8, a, "--user")) {
             user = next orelse fail(io, "--user needs a value", .{});
@@ -195,7 +204,7 @@ fn cmdJoin(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: [
 
     // The synth is the capture device: render the phrase once (deterministic),
     // then read it out interval by interval.
-    const phrase_samples = kujamba_out.renderPhraseF32(gpa, phrase) catch |e| fail(io, "phrase render failed: {s}", .{@errorName(e)});
+    const phrase_samples = kujamba_out.renderPhraseF32With(gpa, phrase, knobs) catch |e| fail(io, "phrase render failed: {s}", .{@errorName(e)});
     defer gpa.free(phrase_samples);
     var fill = kujamba_out.Fill{ .samples = phrase_samples, .mode = play_mode };
 
@@ -322,6 +331,7 @@ fn cmdRender(io: std.Io, gpa: std.mem.Allocator, argv: []const []const u8) !void
     var bars: u32 = 1;
     var bar_ms: u64 = 0;
     var seed: u64 = 0;
+    var knobs: synth.VoiceKnobs = .{};
     var i: usize = 0;
     while (i < argv.len) : (i += 1) {
         const a = argv[i];
@@ -332,6 +342,10 @@ fn cmdRender(io: std.Io, gpa: std.mem.Allocator, argv: []const []const u8) !void
         } else if (std.mem.eql(u8, a, "--play")) {
             play_mode = kujamba_out.parseMode(next orelse fail(io, "--play needs a value", .{})) catch
                 fail(io, "bad --play '{s}' (want repeat, loop or once)", .{next.?});
+            i += 1;
+        } else if (std.mem.eql(u8, a, "--voice")) {
+            knobs = synth.parseKnobs(next orelse fail(io, "--voice needs a value", .{})) catch |e|
+                fail(io, "bad --voice '{s}': {s} (want attack=N,noise=N,wobble=N)", .{ next.?, @errorName(e) });
             i += 1;
         } else if (std.mem.eql(u8, a, "--pattern")) {
             pattern_str = next orelse fail(io, "--pattern needs a value", .{});
@@ -365,6 +379,7 @@ fn cmdRender(io: std.Io, gpa: std.mem.Allocator, argv: []const []const u8) !void
             0
         else
             @as(u64, kujamba_out.sample_rate) * bar_ms / 1000,
+        .knobs = knobs,
     };
 
     const pcm = kujamba_out.renderOfflineF32(gpa, phrase, opts) catch |e|

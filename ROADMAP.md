@@ -15,7 +15,7 @@ own.
 
 > **Build order lives in [ISSUES.md](ISSUES.md)** — which issues block
 > which, the recommended sequencing, and the vendored-file ledger. Short version:
-> start with **#11, #10, #18, #12, #19, #27**; everything else is downstream.
+> start with **#11, #10, #27**; **#12, #18 and #19** are landed. Everything else is downstream.
 > The `blocked-by` edges are encoded on the issues themselves. Tracked as
 > [#31](https://github.com/drawmeanelephant/fart-app/issues/31).
 
@@ -79,8 +79,14 @@ real instrument is **control while it runs**.
       (`vowelBaseFreq`) up/down in cents for different "instruments."
 - [ ] **Loop seam crossfade.** (#17) The 8 ms end fade stops clicks; a short
       crossfade at the wrap point would make `loop` mode seamless.
-- [ ] **Onset/decay knobs** (#18) exposed from `voiceSpec` (attack, noise, wobble) so
-      the fart can be tuned from clean to chaotic without editing tables.
+- [x] **Onset/decay knobs** (#18) exposed from `voiceSpec` (attack, noise, wobble) so
+      the fart can be tuned from clean to chaotic without editing tables. ✅
+      **Landed** as `--voice "attack=N,noise=N,wobble=N"` on `join` and `render`:
+      multipliers, not absolutes, so each onset class keeps its character. The
+      default `1` is a true bit-level identity — all 7 golden fingerprints pass
+      unchanged — and each axis is clamped, because `attack=0` makes sample 0
+      compute `0/0` and `wobble>2` drives the flutter term negative, flipping the
+      waveform's polarity. Unblocks #15 and #16.
 
 ## M7 — Standalone instrument (not just a NINJAM client)
 
@@ -126,7 +132,7 @@ real instrument is **control while it runs**.
 
 ## Testing status (this pass)
 
-- Unit suites: **84/84 pass** (`zig build test`) — audit + synth + **golden
+- Unit suites: **102/102 pass** (`zig build test`) — audit + synth + **golden
   fingerprints** + kujamba glue + the vendored NINJAM modules, in five targets.
   Synth tests are fail-against-silence enforced. Also green under
   `-Doptimize=ReleaseSafe`, which is the mode the demo builds in.

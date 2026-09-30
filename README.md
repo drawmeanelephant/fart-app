@@ -117,6 +117,43 @@ Split examples: `habari` → ha·ba·ri · `yako` → ya·ko · `asante` → a·
 | liquid/glide | l r w y | 14 ms | 0.18 | 28 Hz | 0.90 |
 | none (bare vowel) | — | 8 ms | 0.25 | 28 Hz | 0.90 |
 
+#### Tuning the voice (`--voice`)
+
+Those five columns are the defaults, and the table is the source of truth: the
+knobs scale it, they do not replace it. `--voice SPEC` takes a comma-separated
+list of **multipliers**, so an onset class keeps its character —
+`wobble=2` doubles the wobble of every class rather than flattening them all to
+one number.
+
+| Knob | Scales | Bounds | Why the bound |
+|---|---|---|---|
+| `attack` | `attack_s` | 0.5 ms – 200 ms | at 0 the first sample computes `0/0`, and `NaN` → i16 is a panic |
+| `noise` | `noise_mix` | 0 – 1 | past 1 it is the same noise, just clipped |
+| `wobble` | `wobble_depth` | 0 – 1 | past 2, `wob = 1 - depth·(…)` goes negative and **flips the waveform's polarity** — that is distortion, not chaos |
+
+`wobble_hz` is deliberately not a knob: the wobble knob is on how *deep* the
+flutter is, and the rate is part of each class's character.
+
+```bash
+# today's sound, exactly — every axis at 1
+./zig-out/bin/kujamba render --phrase "kujamba karibu" --out a.wav
+
+# clean and pure: no noise, no flutter, faster onset
+./zig-out/bin/kujamba render --phrase "kujamba karibu" --out clean.wav \
+  --voice "noise=0,wobble=0,attack=0.5"
+
+# chaotic
+./zig-out/bin/kujamba render --phrase "kujamba karibu" --out wild.wav \
+  --voice "noise=2,wobble=2,attack=3"
+```
+
+**Leaving the knobs alone reproduces today's sound bit for bit.** That is
+asserted, not assumed: `src/golden.zig` pins the rendered audio of four phrases
+and three shuzi seeds, and all seven fingerprints pass unchanged with this
+feature in place. `x * 1.0` is exact in IEEE-754, so the default `1.0` on every
+axis is a true identity — which also means a saved preset that spells out
+`attack=1,noise=1,wobble=1` is also byte-identical.
+
 ### Timing policy (syllable count sets total duration)
 
 | Element | Duration |
