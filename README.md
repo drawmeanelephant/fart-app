@@ -14,6 +14,7 @@ fart-app/
 │   ├── audit.zig      — The RAG manifest generator / adversarial auditor
 │   ├── kujamba_main.zig — The NINJAM instrument CLI (headless: no mic, no speaker)
 │   ├── kujamba_config.zig — kujamba config/preset file parser (TOML-style, #22)
+│   ├── proto_fuzz.zig — Fuzz harness: hostile server bytes through the full dispatch (#26)
 │   ├── ninjam_out.zig — Instrument glue: phrase sequencer + deterministic ids
 │   └── ninjam/        — Vendored zclient subset (protocol + encode, see below)
 ├── vendor/          — Vendored C deps (libogg, libvorbis, stb_vorbis)
@@ -213,6 +214,55 @@ zig build
   two runs.
 * `kujamba check-ogg FILE --min-rms R` decodes a raw interval and fails if it
   is silent; `kujamba encode-silence FILE` is the negative-control generator.
+
+### Fuzzing the protocol path (#26)
+
+`proto.zig`/`buf.zig` are length-checked with `catch`, so the likelier crash is
+not in a parser but in a **downstream consumer** doing arithmetic on
+wire-controlled values. `src/proto_fuzz.zig` therefore fuzzes a **full dispatch
+step**: the fuzz input is the raw server-side byte stream of a real session,
+delivered over a loopback socket to a real `Session.run()`, so it passes
+through the actual framing (`readMessage`), the actual `dispatch` switch, and
+every handler exactly as bytes from a hostile or broken server would. Any
+panic — or any memory leak, via the test allocator — fails the test.
+
+The harness lives **outside `src/ninjam/`** on purpose: that tree is vendored,
+and #26 adds nothing to the vendoring debt tracked in #29.
+
+```bash
+# runs in every `zig build test`, CI included:
+#   - a 12-entry corpus of scripted server streams (one per message class,
+#     plus framing-violation and silent-server scenarios), and
+#   - 256 seeded random execs through the same dispatch path.
+zig build test
+
+# to explore deeper, raise the constants in src/proto_fuzz.zig and rerun —
+# a found crash becomes a fixed corpus entry, or a filed issue if it lives in
+# vendored code (20k execs ran clean apart from the two filed crashes below).
+```
+
+(`zig build test --fuzz` would coverage-guide the same callback — the harness
+keeps its `std.testing.fuzz` shape for that — but it is currently unusable for
+this test binary due to two zig 0.16.0 upstream bugs: the Debug fuzz runner
+does not compile, and a binary that links C misses the sanitizer-coverage
+runtime at link time.)
+
+The corpus is pinned: a unit test walks every entry as frames, so a corpus
+typo cannot silently skip a scenario.
+
+**Findings so far** — two wire-triggered panics in the vendored dispatcher,
+filed rather than fixed in place (the file ledger gives #26 no edits there;
+fixes ride #29's upstream batch):
+
+| Crash | Trigger | Filed |
+|---|---|---|
+| `@as(u32, 1) << @intCast(rec.channel_id)` | userinfo record with `channel_id >= 32` | [#40](https://github.com/drawmeanelephant/fart-app/issues/40) |
+| `@divTrunc(srate * bpi * 60, bpm)` | `0x02 CONFIG` with `bpm = 0` | [#41](https://github.com/drawmeanelephant/fart-app/issues/41) |
+
+The corpus and the random generator deliberately avoid both shapes so the
+suite stays green until they are fixed; the minimal repro bytes live in the
+issues and should move into the corpus once fixed (see the findings note at
+the bottom of `src/proto_fuzz.zig`).
 
 ### Config file / presets (#22)
 
