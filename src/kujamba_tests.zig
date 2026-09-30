@@ -9,5 +9,6 @@ test {
     std.testing.refAllDecls(@import("ninjam_out.zig"));
     _ = @import("ninjam_out.zig");
     std.testing.refAllDecls(@import("kujamba_main.zig"));
+    _ = @import("kujamba_main.zig");
     _ = @import("ninjam/tests.zig");
 }

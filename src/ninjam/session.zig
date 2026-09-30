@@ -278,7 +278,13 @@ pub const Session = struct {
     locals: []LocalChannel = &.{},
     interval_len_samples: u64 = 0,
     interval_start_ns: i128 = 0,
-    interval_idx: u64 = 0,
+    // kujamba adaptation (#12): the old single `interval_idx` conflated
+    // interval identity with grid position, so a mid-session 0x02 config
+    // change re-issued guids already sent (different payload bytes) and
+    // overwrote earlier payload dumps. `index.seq` is identity (guids,
+    // dump filenames, --intervals) and is monotonic for the whole session;
+    // `index.grid` is the bar position and drives only the pattern decision.
+    index: kujamba_out.IntervalIndex = .{},
 
     start_ns: i128 = 0,
     chat_sent: bool = false,
@@ -554,7 +560,8 @@ pub const Session = struct {
 
     fn startIntervalEncoders(self: *Session) !void {
         if (self.opts.plan) |pl| {
-            const bcast = pl.broadcastFor(pl.ctx, self.interval_idx);
+            // kujamba (#12): grid position decides play vs. rest, nothing else
+            const bcast = pl.broadcastFor(pl.ctx, self.index.grid);
             for (self.locals) |*lc| lc.broadcast = bcast;
         }
         for (self.locals) |*lc| {
@@ -569,8 +576,10 @@ pub const Session = struct {
             if (self.opts.id_seed) |seed| {
                 // deterministic ids: byte-identical payloads across runs
                 const ci = self.channelIndex(lc);
-                kujamba_out.deriveGuid(seed, self.interval_idx, ci, &lc.guid);
-                serial = kujamba_out.deriveSerial(seed, self.interval_idx, ci);
+                // kujamba (#12): ids key off the monotonic sequence, so a grid
+                // re-anchor can never re-issue a guid already sent this session
+                kujamba_out.deriveGuid(seed, self.index.seq, ci, &lc.guid);
+                serial = kujamba_out.deriveSerial(seed, self.index.seq, ci);
             } else {
                 self.io.random(&lc.guid);
                 self.io.random(std.mem.asBytes(&serial));
@@ -651,7 +660,8 @@ pub const Session = struct {
         try self.send(proto.MSG_UPLOAD_INTERVAL_BEGIN, f.slice());
         lc.begun = true;
         self.log.line("C>S 0x83 UPLOAD_BEGIN guid={s} chidx={d} interval={d}", .{
-            hexBuf(&lc.guid, &self.hex_scratch), self.channelIndex(lc), self.interval_idx,
+            // kujamba (#12): the guid's sequence number, not the grid position
+            hexBuf(&lc.guid, &self.hex_scratch), self.channelIndex(lc), self.index.seq,
         });
     }
 
@@ -701,8 +711,10 @@ pub const Session = struct {
     fn writePayloadDump(self: *Session, lc: *LocalChannel, dump_dir: []const u8) !void {
         if (lc.dump.len == 0) return;
         defer lc.dump.clear();
-        var name_buf: [512]u8 = undefined;
-        const path = std.fmt.bufPrint(&name_buf, "{s}/interval_{d:0>4}.ogg", .{ dump_dir, self.interval_idx }) catch return;
+        // kujamba (#12): name by monotonic sequence, so a grid re-anchor cannot
+        // overwrite an earlier interval's dump
+        const path = kujamba_out.payloadDumpName(self.alloc, dump_dir, self.index.seq) catch return;
+        defer self.alloc.free(path);
         if (std.Io.Dir.cwd().createFile(self.io, path, .{})) |f| {
             var wrote_ok = true;
             f.writeStreamingAll(self.io, lc.dump.items()) catch |e| {
@@ -772,15 +784,18 @@ pub const Session = struct {
         }
         self.stats.upload_channels = @max(self.stats.upload_channels, streaming);
         self.stats.intervals_broadcast += streaming;
-        self.log.line("interval {d} complete ({d} samples, {d}ms)", .{
-            self.interval_idx, self.interval_len_samples, self.interval_len_samples * 1000 / self.opts.srate,
+        self.log.line("interval {d} complete (grid bar {d}, {d} samples, {d}ms)", .{
+            // kujamba (#12): seq and grid are distinct, so log both
+            self.index.seq, self.index.grid, self.interval_len_samples, self.interval_len_samples * 1000 / self.opts.srate,
         });
-        self.interval_idx += 1;
+        self.index.complete();
         // re-anchor on the exact grid to avoid drift
         const interval_ns: i128 = @divTrunc(@as(i128, @intCast(self.interval_len_samples)) * 1_000_000_000, @as(i128, self.opts.srate));
         self.interval_start_ns += interval_ns;
         if (self.opts.stop_after_intervals) |n_stop| {
-            if (self.interval_idx >= n_stop) {
+            // kujamba (#12): the cap counts intervals, so it reads the
+            // monotonic sequence — a config change must not extend the run
+            if (self.index.seq >= n_stop) {
                 self.stats.ok = true;
                 self.state = .done;
                 return;
@@ -947,11 +962,16 @@ pub const Session = struct {
             }
             self.interval_len_samples = @intCast(@divTrunc(@as(u64, self.opts.srate) * @as(u64, cfg.bpi) * 60, @as(u64, cfg.bpm)));
             self.interval_start_ns = clock.nowNs(self.io);
-            self.interval_idx = 0;
+            // kujamba (#12): only the grid geometry moves. The bar counter and
+            // the phrase cursor stay put, and the interval sequence keeps
+            // climbing, so no guid repeats and no payload dump is overwritten.
             self.dropCapturePreRoll();
             try self.startIntervalEncoders();
             self.log.line("interval clock started: {d} samples ({d}ms)", .{
                 self.interval_len_samples, self.interval_len_samples * 1000 / self.opts.srate,
+            });
+            self.log.line("re-anchored to bpm={d} bpi={d}: next interval {d} at grid bar {d} (phrase continues)", .{
+                cfg.bpm, cfg.bpi, self.index.seq, self.index.grid,
             });
         }
     }
@@ -1049,7 +1069,23 @@ pub const Session = struct {
         while (self.state != .done) {
             const now_ns = clock.nowNs(self.io);
             if (now_ns >= deadline_ns) {
-                self.stats.ok = true;
+                // kujamba instrument hook: hitting the cap with zero intervals
+                // uploaded is a failed run, not a success
+                self.stats.ok = self.stats.intervals_uploaded > 0;
+                self.state = .done;
+                break;
+            }
+
+            // kujamba instrument hook: cooperative stop (Ctrl+C) — finish the
+            // current interval cleanly instead of dying mid-upload.
+            if (kujamba_out.stopRequested()) {
+                self.log.line("stop requested: finishing current interval", .{});
+                if (self.state == .active and self.interval_len_samples != 0 and
+                    self.locals.len > 0 and self.locals[0].produced > 0)
+                {
+                    try self.finalizeInterval();
+                }
+                self.stats.ok = self.stats.intervals_uploaded > 0;
                 self.state = .done;
                 break;
             }
@@ -1123,6 +1159,129 @@ test "multi-channel live capture shares one block per step (channels stay aligne
     for (ba, bb) |x, y| try std.testing.expectEqual(x, y);
     try std.testing.expectEqual(shared[0], ba[0]);
     try std.testing.expectEqual(shared[63], ba[63]);
+}
+
+// kujamba (#12): the config-change seam. Before the fix `onConfig` zeroed the
+// single `interval_idx`, which re-issued a guid the server had already seen
+// under different payload bytes, renamed later payload dumps onto earlier
+// files, and restarted bar numbering. Counters start part-way through the
+// session so a reset is visible; finalizing a *mid-interval* config change
+// needs a socket, so the in-flight interval is left empty. The `--intervals` cap
+// reads the same field as the guid derivation but lives in `finalizeInterval`,
+// which is not reachable without a socket; #24 should cover it end to end.
+test "kujamba: a config change moves the grid without renumbering intervals or cutting the phrase" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var phrase = [_]f32{ 0.1, 0.2, 0.3, 0.4 };
+    var fill = kujamba_out.Fill{ .samples = &phrase, .mode = .loop };
+    const pattern = try kujamba_out.parsePattern("3+1");
+    var adapter = kujamba_out.PlanAdapter{ .pattern = &pattern };
+
+    var s = try Session.init(alloc, io, .{
+        .srate = @intCast(kujamba_out.sample_rate),
+        .channel_names = &.{"kujamba"},
+        .source = .{ .kujamba = &fill },
+        .id_seed = 42,
+        .plan = .{ .ctx = @ptrCast(&adapter), .broadcastFor = kujamba_out.PlanAdapter.broadcastForFn },
+    });
+    defer s.deinit();
+    s.log.quiet = true; // these tests assert on state, not on the transcript
+
+    // Three intervals have gone out and the grid was re-anchored once already
+    // (the #24 shape), so identity and position deliberately differ: seq 3,
+    // grid bar 7. Bar 7 of a 3+1 pattern is a rest bar.
+    s.index.seq = 3;
+    s.index.grid = 7;
+    fill.cursor = 1234; // the phrase is mid-word
+
+    var f = Fixed{};
+    try proto.buildConfig(.{ .bpm = 120, .bpi = 4 }, &f);
+    try s.dispatch(.{ .mtype = proto.MSG_CONFIG_CHANGE_NOTIFY, .payload = f.slice() });
+
+    // identity: monotonic, so no guid repeats and no dump gets renamed
+    try std.testing.expectEqual(@as(u64, 3), s.index.seq);
+    // grid position: continuous, so the pattern does not stutter
+    try std.testing.expectEqual(@as(u64, 7), s.index.grid);
+    // the phrase was not cut: the cursor still points into the middle of it
+    try std.testing.expectEqual(@as(u64, 1234), fill.cursor);
+    // ...and the new geometry really did take effect
+    try std.testing.expectEqual(@as(u16, 120), s.bpm);
+    try std.testing.expectEqual(@as(u16, 4), s.bpi);
+    try std.testing.expectEqual(
+        @as(u64, kujamba_out.sample_rate) * 4 * 60 / 120,
+        s.interval_len_samples,
+    );
+    // bar 7 of a 3+1 pattern is a rest bar, and the re-anchor kept it that way
+    try std.testing.expect(!s.locals[0].broadcast);
+
+    // The guid the re-anchored interval is now uploading under is the one that
+    // belongs to sequence 3 -- not the one the grid position 7 would produce.
+    var by_seq: [16]u8 = undefined;
+    var by_grid: [16]u8 = undefined;
+    kujamba_out.deriveGuid(42, s.index.seq, 0, &by_seq);
+    kujamba_out.deriveGuid(42, s.index.grid, 0, &by_grid);
+    try std.testing.expect(!std.mem.eql(u8, &by_seq, &by_grid));
+    try std.testing.expectEqualSlices(u8, &by_seq, &s.locals[0].guid);
+
+    // ...and so is the payload dump: it must land on the sequence's filename,
+    // not overwrite interval_0007.ogg from an earlier stretch of the session.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer alloc.free(dir);
+    try s.locals[0].dump.add("payload");
+    try s.writePayloadDump(&s.locals[0], dir);
+    try std.testing.expectError(
+        error.FileNotFound,
+        tmp.dir.access(io, "interval_0007.ogg", .{}),
+    );
+    _ = try tmp.dir.access(io, "interval_0003.ogg", .{});
+}
+
+// kujamba (#12): the re-anchored interval continues the slot it was already in,
+// so it re-derives exactly the id (guid + dump name) that slot owns.
+test "kujamba: a re-anchored interval keeps the id of the slot it re-uses" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var phrase = [_]f32{ 0.1, 0.2, 0.3, 0.4 };
+    var fill = kujamba_out.Fill{ .samples = &phrase, .mode = .repeat };
+    const pattern = try kujamba_out.parsePattern("1");
+    var adapter = kujamba_out.PlanAdapter{ .pattern = &pattern };
+
+    var s = try Session.init(alloc, io, .{
+        .srate = @intCast(kujamba_out.sample_rate),
+        .channel_names = &.{"kujamba"},
+        .source = .{ .kujamba = &fill },
+        .id_seed = 42,
+        .plan = .{ .ctx = @ptrCast(&adapter), .broadcastFor = kujamba_out.PlanAdapter.broadcastForFn },
+    });
+    defer s.deinit();
+    s.log.quiet = true; // these tests assert on state, not on the transcript
+
+    // the guid the server would already be receiving under, and the dump name
+    // that interval slot owns
+    var in_flight: [16]u8 = undefined;
+    kujamba_out.deriveGuid(42, s.index.seq, 0, &in_flight);
+    const name = try kujamba_out.payloadDumpName(alloc, "dump", s.index.seq);
+    defer alloc.free(name);
+
+    var f = Fixed{};
+    try proto.buildConfig(.{ .bpm = 90, .bpi = 12 }, &f);
+    try s.dispatch(.{ .mtype = proto.MSG_CONFIG_CHANGE_NOTIFY, .payload = f.slice() });
+
+    // grid moved; interval identity did not
+    var after: [16]u8 = undefined;
+    kujamba_out.deriveGuid(42, s.index.seq, 0, &after);
+    try std.testing.expectEqualSlices(u8, &in_flight, &after);
+    const name_after = try kujamba_out.payloadDumpName(alloc, "dump", s.index.seq);
+    defer alloc.free(name_after);
+    try std.testing.expectEqualStrings(name, name_after);
 }
 
 test "synthetic sources keep an independent phase per channel" {
