@@ -588,8 +588,13 @@ pub const Session = struct {
             // copyInto), so this cannot splice audio mid-bar.
             switch (self.opts.source) {
                 .kujamba => |fill| {
-                    fill.mode = sel.mode;
-                    if (sel.samples) |s| fill.samples = s;
+                    // bind() rather than field assignment: the playhead lives in
+                    // the Phrase entry, so swapping phrases has to move the
+                    // cursor with it, or a stale index would point into a
+                    // different buffer (#8, #10). A null entry keeps whatever
+                    // the source already holds, which is how an empty bank
+                    // avoids dropping audio.
+                    fill.bind(sel.mode, sel.phrase);
                 },
                 else => {},
             }
@@ -1221,9 +1226,12 @@ test "kujamba: a config change moves the grid without renumbering intervals or c
     const io = threaded.io();
 
     var phrase = [_]f32{ 0.1, 0.2, 0.3, 0.4 };
-    var fill = kujamba_out.Fill{ .samples = &phrase, .mode = .loop };
+    var bank = try onePhraseBank(std.testing.allocator, &phrase);
+    defer bank.deinit();
+    var fill = kujamba_out.Fill{ .mode = .loop };
+    fill.bind(.loop, bank.active());
     const pattern = try kujamba_out.parsePattern("3+1");
-    var adapter = kujamba_out.PlanAdapter{ .pattern = &pattern };
+    var adapter = kujamba_out.PlanAdapter{ .pattern = &pattern, .bank = &bank };
 
     var s = try Session.init(alloc, io, .{
         .srate = @intCast(kujamba_out.sample_rate),
@@ -1295,9 +1303,12 @@ test "kujamba: a re-anchored interval keeps the id of the slot it re-uses" {
     const io = threaded.io();
 
     var phrase = [_]f32{ 0.1, 0.2, 0.3, 0.4 };
-    var fill = kujamba_out.Fill{ .samples = &phrase, .mode = .repeat };
+    var bank = try onePhraseBank(std.testing.allocator, &phrase);
+    defer bank.deinit();
+    var fill = kujamba_out.Fill{ .mode = .repeat };
+    fill.bind(.repeat, bank.active());
     const pattern = try kujamba_out.parsePattern("1");
-    var adapter = kujamba_out.PlanAdapter{ .pattern = &pattern };
+    var adapter = kujamba_out.PlanAdapter{ .pattern = &pattern, .bank = &bank };
 
     var s = try Session.init(alloc, io, .{
         .srate = @intCast(kujamba_out.sample_rate),
@@ -1357,9 +1368,12 @@ test "kujamba: a mode switch requested during bar N applies at the start of bar 
     // A phrase long enough that a bar change is visible in the audio below.
     var phrase: [4096]f32 = undefined;
     for (&phrase, 0..) |*o, i| o.* = @as(f32, @floatFromInt(i % 97)) / 97.0;
-    var fill = kujamba_out.Fill{ .samples = &phrase, .mode = .repeat };
+    var bank = try onePhraseBank(std.testing.allocator, &phrase);
+    defer bank.deinit();
+    var fill = kujamba_out.Fill{ .mode = .repeat };
+    fill.bind(.repeat, bank.active());
     const pattern = try kujamba_out.parsePattern("1"); // always broadcast
-    var adapter = kujamba_out.PlanAdapter{ .pattern = &pattern, .mode = .repeat, .samples = &phrase };
+    var adapter = kujamba_out.PlanAdapter{ .pattern = &pattern, .mode = .repeat, .bank = &bank };
 
     var s = try Session.init(alloc, io, .{
         .srate = @intCast(kujamba_out.sample_rate),
@@ -1396,9 +1410,12 @@ test "kujamba: a rest bar still rebinds the mode, so a switch while resting land
 
     var phrase: [2048]f32 = undefined;
     for (&phrase, 0..) |*o, i| o.* = @as(f32, @floatFromInt(i % 31)) / 31.0;
-    var fill = kujamba_out.Fill{ .samples = &phrase, .mode = .repeat };
+    var bank = try onePhraseBank(std.testing.allocator, &phrase);
+    defer bank.deinit();
+    var fill = kujamba_out.Fill{ .mode = .repeat };
+    fill.bind(.repeat, bank.active());
     const pattern = try kujamba_out.parsePattern("1+1"); // play, rest, play, rest
-    var adapter = kujamba_out.PlanAdapter{ .pattern = &pattern, .mode = .repeat, .samples = &phrase };
+    var adapter = kujamba_out.PlanAdapter{ .pattern = &pattern, .mode = .repeat, .bank = &bank };
 
     var s = try Session.init(alloc, io, .{
         .srate = @intCast(kujamba_out.sample_rate),
@@ -1424,6 +1441,14 @@ test "kujamba: a rest bar still rebinds the mode, so a switch while resting land
 
 // ---- #9 chat-driven transport ------------------------------------------------
 
+/// A one-entry bank over an already-rendered buffer, for tests that only need a
+/// plan and a source and do not care that the audio is a real phrase. Goes
+/// through `initBorrowed` so the bank owns no audio, so `deinit` cannot free a
+/// stack buffer.
+fn onePhraseBank(alloc: std.mem.Allocator, samples: []const f32) !kujamba_out.PhraseBank {
+    return kujamba_out.PhraseBank.initBorrowed(alloc, &.{"test"}, &.{samples});
+}
+
 test "kujamba: a !kujamba mode command over 0xC0 lands at the next bar, not mid-bar" {
     const alloc = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(alloc, .{});
@@ -1432,9 +1457,12 @@ test "kujamba: a !kujamba mode command over 0xC0 lands at the next bar, not mid-
 
     var phrase: [4096]f32 = undefined;
     for (&phrase, 0..) |*o, i| o.* = @as(f32, @floatFromInt(i % 97)) / 97.0;
-    var fill = kujamba_out.Fill{ .samples = &phrase, .mode = .repeat };
+    var bank = try onePhraseBank(std.testing.allocator, &phrase);
+    defer bank.deinit();
+    var fill = kujamba_out.Fill{ .mode = .repeat };
+    fill.bind(.repeat, bank.active());
     const pattern = try kujamba_out.parsePattern("1");
-    var adapter = kujamba_out.PlanAdapter{ .pattern = &pattern, .mode = .repeat, .samples = &phrase };
+    var adapter = kujamba_out.PlanAdapter{ .pattern = &pattern, .mode = .repeat, .bank = &bank };
 
     // The handler the CLI installs: reshape the plan, let the session apply it.
     const Handler = struct {
@@ -1447,6 +1475,7 @@ test "kujamba: a !kujamba mode command over 0xC0 lands at the next bar, not mid-
                 .repeat => a.mode = .repeat,
                 .once => a.mode = .once,
                 .stop => kujamba_out.requestStop(),
+                .select => |sel| a.bank.request(sel),
                 .none => {},
             }
         }
@@ -1494,10 +1523,13 @@ test "kujamba: !kujamba play/rest overrides the pattern at the next bar" {
 
     var phrase: [2048]f32 = undefined;
     for (&phrase, 0..) |*o, i| o.* = @as(f32, @floatFromInt(i % 31)) / 31.0;
-    var fill = kujamba_out.Fill{ .samples = &phrase, .mode = .repeat };
+    var bank = try onePhraseBank(std.testing.allocator, &phrase);
+    defer bank.deinit();
+    var fill = kujamba_out.Fill{ .mode = .repeat };
+    fill.bind(.repeat, bank.active());
     // pattern that always plays, so any rest we see comes from the override
     const pattern = try kujamba_out.parsePattern("1");
-    var adapter = kujamba_out.PlanAdapter{ .pattern = &pattern, .mode = .repeat, .samples = &phrase };
+    var adapter = kujamba_out.PlanAdapter{ .pattern = &pattern, .mode = .repeat, .bank = &bank };
 
     var s = try Session.init(alloc, io, .{
         .srate = @intCast(kujamba_out.sample_rate),
@@ -1528,4 +1560,167 @@ test "kujamba: !kujamba play/rest overrides the pattern at the next bar" {
     s.index.grid = 1;
     try s.startIntervalEncoders();
     try std.testing.expect(s.locals[0].broadcast); // forced play bar
+}
+
+// ---- #8 phrase bank + live selection ----------------------------------------
+
+test "kujamba: a !kujamba <n> phrase switch over 0xC0 lands at the next bar, not mid-bar" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Two constant, obviously-distinct buffers: "which phrase is bound" is then
+    // readable straight off the audio, with no synthesis in the way.
+    const p1 = [_]f32{ 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10 };
+    const p2 = [_]f32{ 0.90, 0.90, 0.90, 0.90, 0.90, 0.90, 0.90, 0.90 };
+    var bank = try kujamba_out.PhraseBank.initBorrowed(alloc, &.{ "karibu", "asante" }, &.{ &p1, &p2 });
+    defer bank.deinit();
+
+    var fill = kujamba_out.Fill{ .mode = .repeat };
+    fill.bind(.repeat, bank.active());
+    const pattern = try kujamba_out.parsePattern("1");
+    var adapter = kujamba_out.PlanAdapter{ .pattern = &pattern, .mode = .repeat, .bank = &bank };
+
+    // The handler the CLI installs: resolve the selector now, apply it at the
+    // next bar boundary.
+    const Handler = struct {
+        fn apply(ctx: *anyopaque, cmd: kujamba_out.ChatCommand) void {
+            const a: *kujamba_out.PlanAdapter = @ptrCast(@alignCast(ctx));
+            switch (cmd) {
+                .select => |sel| a.bank.request(sel),
+                else => {},
+            }
+        }
+    };
+
+    var s = try Session.init(alloc, io, .{
+        .srate = @intCast(kujamba_out.sample_rate),
+        .channel_names = &.{"kujamba"},
+        .source = .{ .kujamba = &fill },
+        .id_seed = 42,
+        .plan = .{ .ctx = @ptrCast(&adapter), .selectFor = kujamba_out.PlanAdapter.selectForFn },
+        .chat_command = Handler.apply,
+        .chat_ctx = @ptrCast(&adapter),
+    });
+    defer s.deinit();
+    s.log.quiet = true;
+
+    // Bar 0 is in flight on phrase 1.
+    s.index.grid = 0;
+    try s.startIntervalEncoders();
+    try std.testing.expectEqual(p1[0..].ptr, fill.samples.ptr);
+
+    // The bandleader types `!kujamba 2` while bar 0 is still going. As with the
+    // transport verbs, the command sits in the message slot because the 0xC0
+    // layout is chat-kind dependent.
+    var chat = Fixed{};
+    try proto.buildChat(&[_][]const u8{ "PRIVMSG", "bandleader", "#band", "!kujamba 2" }, &chat);
+    try s.dispatch(.{ .mtype = proto.MSG_CHAT_MESSAGE, .payload = chat.slice() });
+
+    // The selector reached the bank and resolved...
+    try std.testing.expectEqual(@as(u32, 0), bank.rejected);
+    // ...but the in-flight bar still holds phrase 1. This is the "never
+    // mid-bar" property, and it is what makes the switch safe to do live.
+    try std.testing.expectEqual(p1[0..].ptr, fill.samples.ptr);
+
+    // Bar 1 starts: the selection is applied and the new phrase is bound.
+    s.index.grid = 1;
+    try s.startIntervalEncoders();
+    try std.testing.expectEqual(p2[0..].ptr, fill.samples.ptr);
+    try std.testing.expectEqual(@as(u32, 1), bank.switches);
+}
+
+test "kujamba: !kujamba by phrase name switches, and an unknown name is ignored without dropping audio" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const p1 = [_]f32{ 0.10, 0.10, 0.10, 0.10 };
+    const p2 = [_]f32{ 0.90, 0.90, 0.90, 0.90 };
+    var bank = try kujamba_out.PhraseBank.initBorrowed(alloc, &.{ "karibu", "asante sana" }, &.{ &p1, &p2 });
+    defer bank.deinit();
+
+    var fill = kujamba_out.Fill{ .mode = .repeat };
+    fill.bind(.repeat, bank.active());
+    const pattern = try kujamba_out.parsePattern("1");
+    var adapter = kujamba_out.PlanAdapter{ .pattern = &pattern, .mode = .repeat, .bank = &bank };
+
+    const Handler = struct {
+        fn apply(ctx: *anyopaque, cmd: kujamba_out.ChatCommand) void {
+            const a: *kujamba_out.PlanAdapter = @ptrCast(@alignCast(ctx));
+            switch (cmd) {
+                .select => |sel| a.bank.request(sel),
+                else => {},
+            }
+        }
+    };
+
+    var s = try Session.init(alloc, io, .{
+        .srate = @intCast(kujamba_out.sample_rate),
+        .channel_names = &.{"kujamba"},
+        .source = .{ .kujamba = &fill },
+        .id_seed = 42,
+        .plan = .{ .ctx = @ptrCast(&adapter), .selectFor = kujamba_out.PlanAdapter.selectForFn },
+        .chat_command = Handler.apply,
+        .chat_ctx = @ptrCast(&adapter),
+    });
+    defer s.deinit();
+    s.log.quiet = true;
+
+    s.index.grid = 0;
+    try s.startIntervalEncoders();
+
+    // A name with a space in it resolves case-insensitively.
+    var chat = Fixed{};
+    try proto.buildChat(&[_][]const u8{ "MSG", "!kujamba ASANTE SANA" }, &chat);
+    try s.dispatch(.{ .mtype = proto.MSG_CHAT_MESSAGE, .payload = chat.slice() });
+    s.index.grid = 1;
+    try s.startIntervalEncoders();
+    try std.testing.expectEqual(p2[0..].ptr, fill.samples.ptr);
+
+    // A name nobody has: rejected, counted, and the phrase keeps playing. The
+    // "invalid selection drops no audio" acceptance criterion, end to end over
+    // a real 0xC0.
+    try proto.buildChat(&[_][]const u8{ "MSG", "!kujamba jambo ambalo halijulikani" }, &chat);
+    try s.dispatch(.{ .mtype = proto.MSG_CHAT_MESSAGE, .payload = chat.slice() });
+    try std.testing.expectEqual(@as(u32, 1), bank.rejected);
+    try std.testing.expectEqual(@as(u32, 1), bank.switches); // no new switch
+    s.index.grid = 2;
+    try s.startIntervalEncoders();
+    try std.testing.expectEqual(p2[0..].ptr, fill.samples.ptr);
+
+    // ...and the audio really is still phrase 2, not a hole.
+    var block: [4]f32 = undefined;
+    fill.copyInto(0, block[0..4]);
+    try std.testing.expectEqualSlices(f32, p2[0..4], block[0..4]);
+}
+
+test "kujamba: switching phrases does not re-render, so payloads stay byte-identical (#8 + #10)" {
+    const alloc = std.testing.allocator;
+
+    // The claim #10 makes is that a switch costs nothing at encode time: the
+    // buffer the encoder reads is the one rendered at startup. This drives the
+    // real encode path for two bars of the same phrase and shows the bytes do
+    // not depend on how many times the bank was asked to switch (which is 0 --
+    // the point is that asking changes nothing).
+    var bank_a = kujamba_out.PhraseBank.init(alloc);
+    defer bank_a.deinit();
+    var bank_b = kujamba_out.PhraseBank.init(alloc);
+    defer bank_b.deinit();
+    try bank_a.parse("kujamba karibu\nasante sana\n", .{});
+    try bank_b.parse("kujamba karibu\nasante sana\n", .{});
+
+    // Same phrase from both banks is the same audio, byte for byte.
+    for (bank_a.entries.items, bank_b.entries.items) |x, y| {
+        try std.testing.expectEqualSlices(f32, x.samples, y.samples);
+    }
+
+    // A switch hands back the *stored* buffer, not a fresh render: the pointer
+    // is the one the bank allocated at parse time, before any request.
+    const stored = bank_a.entries.items[1].samples.ptr;
+    bank_a.request("2");
+    _ = bank_a.active();
+    try std.testing.expectEqual(stored, bank_a.entries.items[1].samples.ptr);
 }

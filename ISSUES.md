@@ -7,10 +7,15 @@ and which decisions get made once instead of three times.
 The dependency edges below are also encoded as GitHub `blocked-by` relations on
 the issues themselves, so `gh issue view 12` shows them without reading this.
 
-**State at time of writing:** 22 open issues (#8–#29), 4 milestones (M4–M8).
-`zig build test` → **102/102 pass** in five suites, in both Debug and ReleaseSafe.
-CI exists and gates pushes and PRs (build + test, `build-test`); it is not yet
-required by `main`'s ruleset.
+**State at time of writing:** 4 milestones (M4–M8), M4 complete. `zig build test`
+→ **148/148 pass** in five suites, in both Debug and ReleaseSafe. CI gates pushes
+and PRs (build + test, `build-test`, on Linux); it is not yet required by `main`'s
+ruleset, and it does not yet run the live demo (#27).
+
+Two open issues (#40, #41) are crash bugs the #26 fuzzer found in the client:
+a wire-controlled `channel_id >= 32` and a `bpm=0` config both panic. Both are
+small, and both belong in `src/ninjam/session.zig` — so they cannot be picked up
+in parallel with each other, or with #8's branch, which also edits that file.
 
 Tracking issue for this map: [#31](https://github.com/drawmeanelephant/fart-app/issues/31).
 
@@ -26,10 +31,11 @@ unblocks them (#11) is the smallest item in M4.
 | Start here | Why it's unblocked | What it unblocks |
 |---|---|---|
 | **#11** Bar-accurate switching | ✅ **done** — one-time hook reshape, `Selection{broadcast,mode,samples}` | #8, #9 |
-| **#10** Render caching | Depends only on `renderPhraseF32` | #8 |
+| **#10** Render caching | ✅ **done** — folded into #8's `PhraseBank` | #8 |
 | **#18** voiceSpec knobs | ✅ **done** — `--voice` multipliers, see below | #15, #16 |
 | **#12** Re-anchor on config change | ✅ **done** — split the counters, see below | #24, #29 |
 | **#19** Offline render | ✅ **done** — `kujamba render`, see below | verification harness for M6 |
+| **#8** Phrase bank | ✅ **done** — `--phrases FILE` + `!kujamba <n\|name>` | M4 complete |
 | **#27** CI demo | Extends the existing `build-test` job with the live reference-server run | #28 (flake rate), the safety net for everything |
 
 Everything else is Wave 2+ and can proceed in parallel once the above land.
@@ -150,18 +156,20 @@ recommended answer.
 ## Sequencing
 
 ### Wave 0 — the unblocked six
-`#11`✅ · `#10` · `#18`✅ · `#12`✅ · `#19`✅ · `#27`
+`#11`✅ · `#10`✅ · `#18`✅ · `#12`✅ · `#19`✅ · `#27`
 
 Six independent items; in practice three or four people can work in parallel
-with zero collisions. `#12` and `#19` are the two that paid off fastest and both
-have landed: one was a bug fix, the other is the harness that makes M6
-verifiable without a room.
+with zero collisions. Five have landed; `#27` is the last one standing. `#12`
+and `#19` are the two that paid off fastest and both have landed: one was a bug
+fix, the other is the harness that makes M6 verifiable without a room.
 
 ### Wave 1 — milestone payoffs, once Wave 0 lands
-- **M4:** #8, #9 (now unblocked together)
+- **M4:** #8, #9 — ✅ **M4 is complete.** A bandleader can now shape the
+  performance entirely from room chat: `!kujamba <verb>` for transport,
+  `!kujamba <n|name>` for the phrase, every one of them landing on a bar line.
 - **M5:** #13, #14
 - **M6:** #15, #16, #17
-- **M8:** #26 (fuzz — keep the harness out-of-tree)
+- **M8:** #26 (fuzz — keep the harness out-of-tree) — ✅ **landed**
 
 ### Wave 2 — standalone instrument + hardening
 - **M7:** #21, #22, #20
@@ -206,6 +214,18 @@ and landing Linux first.
   catch this, because the word's vowel syllable responds either way — the test
   has to drive `renderSyllableInto` with `vowel = 0` directly.
 
+- **#8's bank cost is audio, not text — so the 1 MiB file cap bounds nothing
+  that matters.** `--phrases` is capped at 1 MiB of *text*, but every line is
+  synthesized to f32 and stays resident for the whole run. A one-word line is
+  ~8 bytes and ~0.5 s of audio, so text-to-audio passes 20 000:1: a 900 KB file
+  of short lines clears the text cap and then asks for gigabytes. The landed fix
+  budgets `rendered` samples (64 MiB ≈ 6 min at 44.1 kHz) and refuses the phrase
+  that would cross it, checked *after* the render because the length is only
+  known then — a pre-flight estimate would have to model syllable timing, and
+  being wrong permissively is the failure being fixed. Same shape as #18's
+  clamps: the cheap-looking check (bytes) is the wrong one; measure the resource
+  (samples). The bank also reports the failing *line*, because `failed:
+  BankTooLarge` on a 500-line file tells the user nothing.
 - **#19's default bar length is a trap, not a detail.** The obvious default —
   one bar = one second — silently truncates any phrase longer than a second, and
   `kujamba karibu` is 1.8s. The landed default is "one bar exactly as long as

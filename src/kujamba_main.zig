@@ -46,6 +46,13 @@ fn printUsage(io: std.Io) void {
         \\                       it, ./kujamba.toml is used when present
         \\    --phrase TEXT      Swahili phrase the butt speaks in fart
         \\                       (default "kujamba karibu")
+        \\    --phrases FILE     a bank of phrases, one per line ('#' comments
+        \\                       and blank lines skipped), any of which the room
+        \\                       can pick live with !kujamba <n|name>. Mutually
+        \\                       exclusive with --phrase. Every phrase is
+        \\                       rendered once at startup, so switching is instant
+        \\                       -- and so the whole bank is resident in memory at
+        \\                       once (64 MiB of audio, ~6 min, is the ceiling)
         \\    --seed N           determinism seed: ids + payloads derive from it
         \\    --pattern P        bar pattern, e.g. 3+1 = 3 fart bars + 1 rest bar
         \\                       (default 3+1)
@@ -73,6 +80,18 @@ fn printUsage(io: std.Io) void {
         \\      is exact silence and freezes the phrase cursor, matching the room.
         \\  kujamba check-ogg FILE [--min-rms R]   analyze an interval; exit 1 if rms < R
         \\  kujamba encode-silence FILE [--seconds S]   write a silent interval
+        \\
+        \\CHAT (#9, #8): a `kujamba ...` command in room chat shapes the
+        \\performance live, and every one of them lands on the next bar, so
+        \\nothing ever splices mid-phrase:
+        \\  kujamba play|rest       force a play bar / a silence-marker bar
+        \\  kujamba loop|repeat|once how the phrase maps onto bars (--play)
+        \\  kujamba <n>|<name>      play another phrase from --phrases
+        \\  kujamba stop            finish the current interval and exit
+        \\An unknown <n>/<name> is ignored and counted, never a dropped bar.
+        \\A leading "!" is accepted but NOT required: ninjamsrv swallows any
+        \\"!"-prefixed room message as an unknown command, so "!kujamba loop"
+        \\never reaches the room. Say it without the sigil.
         \\
         \\CONFIG (#22): a TOML-style file of defaults for join and render —
         \\  host (same syntax as --host, so "name:port" / "[::1]:port"), user,
@@ -179,6 +198,23 @@ fn loadConfigFile(io: std.Io, arena: std.mem.Allocator, argv: []const []const u8
         fail(io, "{s}:{d}: {s}", .{ diag.file, diag.line, diag.message() });
 }
 
+/// Read a whole text file into the arena, for `--phrases` (#8). The arena keeps
+/// the text alive for the run, and the bank's `Phrase.name` slices borrow from
+/// it, so no per-name copy is needed.
+///
+/// The size cap is the same 1 MiB as the config file, and for the same reason:
+/// these are hand-written files, and `--phrases /var/log/thing` should say so
+/// rather than try to render a few hundred thousand phrases.
+fn readTextFile(io: std.Io, arena: std.mem.Allocator, path: []const u8) ![]u8 {
+    var f = std.Io.Dir.cwd().openFile(io, path, .{}) catch return error.ReadFailed;
+    defer f.close(io);
+    const size = f.length(io) catch return error.ReadFailed;
+    if (size > max_config_bytes) return error.Rejected;
+    const data = arena.alloc(u8, @intCast(size)) catch return error.OutOfMemory;
+    const got = f.readPositionalAll(io, data, 0) catch return error.ReadFailed;
+    return data[0..got];
+}
+
 /// Canonical "N" / "N+M" text for a parsed pattern — what `render`'s summary
 /// line prints when the pattern came from the config file rather than a flag.
 fn formatPattern(arena: std.mem.Allocator, p: kujamba_out.Pattern) ![]const u8 {
@@ -206,6 +242,9 @@ const JoinSettings = struct {
     out_dir: []const u8 = "dump",
     dump_dir: ?[]const u8 = null,
     transcript: ?[]const u8 = null,
+    /// --phrases FILE: a phrase bank to pick from live (#8). Mutually exclusive
+    /// with --phrase, and the flag wins over a config-file phrase (#22's rule).
+    phrases_file: ?[]const u8 = null,
 
     /// Lay the config file's values over the defaults. Runs BEFORE the flag
     /// loop, which overwrites the same fields — that ordering *is* the
@@ -222,19 +261,22 @@ const JoinSettings = struct {
     }
 };
 
-/// Apply a `!kujamba <verb>` transport command from room chat to the plan (#9).
-/// Mode/rest changes reshape the plan here; the session picks them up at the next
-/// bar boundary (the selection is applied there), so nothing splices mid-bar.
-/// `stop` reuses the same cooperative-stop path as Ctrl+C.
-fn applyChatCommand(ctx: *anyopaque, verb: kujamba_out.ChatCommand) void {
+/// Apply a `!kujamba <verb>` command from room chat to the plan (#9, #8).
+/// Mode/rest/phrase changes reshape the plan here; the session picks them up at
+/// the next bar boundary (the selection is applied there), so nothing splices
+/// mid-bar. `stop` reuses the same cooperative-stop path as Ctrl+C.
+fn applyChatCommand(ctx: *anyopaque, cmd: kujamba_out.ChatCommand) void {
     const adapter: *kujamba_out.PlanAdapter = @ptrCast(@alignCast(ctx));
-    switch (verb) {
+    switch (cmd) {
         .play => adapter.rest = false,
         .rest => adapter.rest = true,
         .loop => adapter.mode = .loop,
         .repeat => adapter.mode = .repeat,
         .once => adapter.mode = .once,
         .stop => kujamba_out.requestStop(),
+        // #8: resolve the selector now, apply it at the next bar boundary. An
+        // unresolvable one is counted in the bank and leaves audio untouched.
+        .select => |sel| adapter.bank.request(sel),
         .none => {},
     }
 }
@@ -246,6 +288,14 @@ fn cmdJoin(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: [
     // always wins over the file wherever it appears (#22)
     const cfg = loadConfigFile(io, arena, argv);
     if (cfg) |*c| s.applyConfig(c);
+
+    // --phrase and --phrases are two ways to fill the same slot (which phrases
+    // the instrument can play), so giving both on one command line is a mistake
+    // worth reporting rather than silently resolving. This is the "flag-over-
+    // file precedence" question #8's body flagged: against the *config* file
+    // the usual rule applies unchanged (a flag wins), and only a flag-vs-flag
+    // collision is an error.
+    var phrase_flag = false;
 
     var i: usize = 0;
     while (i < argv.len) : (i += 1) {
@@ -280,6 +330,7 @@ fn cmdJoin(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: [
             i += 1;
         } else if (std.mem.eql(u8, a, "--phrase")) {
             s.phrase = next orelse fail(io, "--phrase needs a value", .{});
+            phrase_flag = true;
             i += 1;
         } else if (std.mem.eql(u8, a, "--seed")) {
             s.seed = std.fmt.parseInt(u64, next orelse fail(io, "--seed needs a value", .{}), 10) catch fail(io, "bad --seed", .{});
@@ -307,20 +358,61 @@ fn cmdJoin(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: [
         } else if (std.mem.eql(u8, a, "--transcript")) {
             s.transcript = next orelse fail(io, "--transcript needs a value", .{});
             i += 1;
+        } else if (std.mem.eql(u8, a, "--phrases")) {
+            s.phrases_file = next orelse fail(io, "--phrases needs a value", .{});
+            i += 1;
         } else {
             fail(io, "unknown option '{s}'", .{a});
         }
     }
 
-    // The synth is the capture device: render the phrase once (deterministic),
-    // then read it out interval by interval.
-    const phrase_samples = kujamba_out.renderPhraseF32With(gpa, s.phrase, s.knobs) catch |e| fail(io, "phrase render failed: {s}", .{@errorName(e)});
-    defer gpa.free(phrase_samples);
-    var fill = kujamba_out.Fill{ .samples = phrase_samples, .mode = s.play_mode };
+    // The synth is the capture device: render every phrase once, up front, then
+    // read them out interval by interval. With no --phrases that is a bank of
+    // one, so a live switch and the single-phrase case are the same code path
+    // (#8).
+    if (s.phrases_file != null and phrase_flag)
+        fail(io, "--phrase and --phrases both given: pick one", .{});
+
+    var bank = kujamba_out.PhraseBank.init(gpa);
+    defer bank.deinit();
+    if (s.phrases_file) |path| {
+        const text = readTextFile(io, arena, path) catch |e| switch (e) {
+            error.OutOfMemory => fail(io, "out of memory reading {s}", .{path}),
+            error.Rejected => fail(io, "refusing to read {s} as a phrase bank", .{path}),
+            error.ReadFailed => fail(io, "cannot read phrases file '{s}'", .{path}),
+        };
+        bank.parse(text, s.knobs) catch |e| switch (e) {
+            // The budget is on rendered audio, not file size, so this is the
+            // one failure a user reaches by having *too many good phrases* —
+            // worth saying what to do about it rather than naming an error set.
+            error.BankTooLarge => fail(io, "phrase bank '{s}' renders to more than {d} MiB of audio across {d} phrases — split the file or drop some", .{
+                path,
+                // Ceiling division: a budget that is not a whole number of MiB
+                // would otherwise floor to "0 MiB" and name no limit at all.
+                (kujamba_out.max_bank_samples * @sizeOf(f32) + 1024 * 1024 - 1) / (1024 * 1024),
+                bank.entries.items.len,
+            }),
+            // Anything else is attributable to a line, the same way a config
+            // error is: `file:line: why` is the convention the loader sets.
+            else => if (bank.fail_line) |ln|
+                fail(io, "{s}:{d}: {s}", .{ path, ln, @errorName(e) })
+            else
+                fail(io, "phrase bank '{s}' failed: {s}", .{ path, @errorName(e) }),
+        };
+        if (bank.entries.items.len == 0)
+            fail(io, "phrases file '{s}' has no phrases (only comments or blank lines?)", .{path});
+    } else {
+        bank.add(s.phrase, s.knobs) catch |e| fail(io, "phrase render failed: {s}", .{@errorName(e)});
+    }
+
+    // The first phrase is live before the first bar; bind it into the fill so
+    // the very first interval is not silent.
+    var fill = kujamba_out.Fill{ .mode = s.play_mode };
+    fill.bind(s.play_mode, bank.active());
     // kujamba (#11): the plan owns the selection — the pattern (rest bars) plus
     // the mode and phrase the session should bind each bar. A live switch just
     // updates the adapter; the session picks it up at the next bar boundary.
-    var adapter = kujamba_out.PlanAdapter{ .pattern = &s.pattern, .mode = s.play_mode, .samples = phrase_samples };
+    var adapter = kujamba_out.PlanAdapter{ .pattern = &s.pattern, .mode = s.play_mode, .bank = &bank };
 
     var opts = session.Options{
         .host = s.host,
@@ -363,12 +455,16 @@ fn cmdJoin(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: [
     var out_buf: [2048]u8 = undefined;
     const line = std.fmt.bufPrint(
         &out_buf,
-        "RESULT ok={} err=\"{s}\" seed={d} play={s} intervals_uploaded={d} intervals_broadcast={d} silence_markers={d} payload_dumps={d} upload_chunks={d} upload_bytes={d} intervals_downloaded={d} msgs_sent={d} msgs_recv={d}\n",
+        "RESULT ok={} err=\"{s}\" seed={d} play={s} phrases={d} phrase={d} phrase_switches={d} phrase_rejected={d} intervals_uploaded={d} intervals_broadcast={d} silence_markers={d} payload_dumps={d} upload_chunks={d} upload_bytes={d} intervals_downloaded={d} msgs_sent={d} msgs_recv={d}\n",
         .{
             ok,
             err_text,
             s.seed,
             @tagName(s.play_mode),
+            bank.entries.items.len,
+            bank.current,
+            bank.switches,
+            bank.rejected,
             stats.intervals_uploaded,
             stats.intervals_broadcast,
             stats.silence_markers,
