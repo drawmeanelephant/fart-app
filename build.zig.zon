@@ -9,6 +9,7 @@
         "src",
         "vendor",
         "demo",
+        "examples",
         "README.md",
     },
 }

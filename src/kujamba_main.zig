@@ -16,12 +16,19 @@
 //!   kujamba check-ogg FILE [--min-rms R]   decode a raw interval; exit 1 if silent
 //!   kujamba encode-silence FILE [--seconds S]
 //!       write one silent interval as Ogg (the negative control for check-ogg)
+//!
+//! Config / presets (#22): a TOML-style defaults file supplies join + instrument
+//! settings (host, user, pass, phrase, pattern, [voice] knobs). `--config FILE`
+//! names it explicitly; without that, ./kujamba.toml is used when present.
+//! Values apply defaults <- config <- flags, so a flag always wins over the
+//! file. See examples/kujamba.toml.
 
 const std = @import("std");
 const session = @import("ninjam/session.zig");
 const vorbis = @import("ninjam/vorbis.zig");
 const synth = @import("synth.zig");
 const kujamba_out = @import("ninjam_out.zig");
+const kujamba_config = @import("kujamba_config.zig");
 const libc = @cImport({
     @cInclude("signal.h");
 });
@@ -35,6 +42,8 @@ fn printUsage(io: std.Io) void {
     const usage =
         \\usage:
         \\  kujamba join --host 127.0.0.1[:port] --user NAME --pass PASS [options]
+        \\    --config FILE      TOML defaults file (see CONFIG below); without
+        \\                       it, ./kujamba.toml is used when present
         \\    --phrase TEXT      Swahili phrase the butt speaks in fart
         \\                       (default "kujamba karibu")
         \\    --seed N           determinism seed: ids + payloads derive from it
@@ -57,12 +66,20 @@ fn printUsage(io: std.Io) void {
         \\    --duration S       hard safety cap in seconds (default 120)
         \\    --out-dir DIR      directory for decoded peer WAVs (default dump)
         \\    --transcript FILE  transcript log (default <out-dir>/transcript.log)
-        \\  kujamba render --phrase "..." --out FILE.wav|.ogg [--play MODE] [--voice SPEC]
+        \\  kujamba render --phrase "..." --out FILE.wav|.ogg [--config FILE]
+        \\                       [--play MODE] [--voice SPEC]
         \\                       [--pattern P] [--bars N] [--bar-ms MS] [--seed N]
         \\      render a phrase offline, shaped as join would play it. A rest bar
         \\      is exact silence and freezes the phrase cursor, matching the room.
         \\  kujamba check-ogg FILE [--min-rms R]   analyze an interval; exit 1 if rms < R
         \\  kujamba encode-silence FILE [--seconds S]   write a silent interval
+        \\
+        \\CONFIG (#22): a TOML-style file of defaults for join and render —
+        \\  host (same syntax as --host, so "name:port" / "[::1]:port"), user,
+        \\  pass, phrase, pattern, and a [voice] table with attack/noise/wobble
+        \\  multipliers. Values apply defaults <- config <- flags, so a flag
+        \\  always wins over the file; a --voice flag replaces the whole
+        \\  [voice] table. Example: examples/kujamba.toml in the repo.
         \\
         \\join exits 0 only if at least one interval was uploaded; Ctrl+C finishes
         \\the current interval cleanly and reports the same way.
@@ -99,7 +116,7 @@ pub fn main(init: std.process.Init) !void {
         }
         return cmdJoin(io, gpa, arena, args[2..]);
     } else if (std.mem.eql(u8, args[1], "render")) {
-        return cmdRender(io, gpa, args[2..]);
+        return cmdRender(io, gpa, arena, args[2..]);
     } else if (std.mem.eql(u8, args[1], "check-ogg")) {
         return cmdCheckOgg(io, args[2..]);
     } else if (std.mem.eql(u8, args[1], "encode-silence")) {
@@ -112,21 +129,106 @@ pub fn main(init: std.process.Init) !void {
     std.process.exit(2);
 }
 
+// ---- config / preset file (#22) ---------------------------------------------
+
+/// File loaded when `--config` is not given; its absence is fine.
+const config_file_name = kujamba_config.default_file;
+/// A hand-edited defaults file should never be big; this is just a guard
+/// against pointing --config at a log file by mistake.
+const max_config_bytes: u64 = 1024 * 1024;
+
+/// Find and parse the config file for a join/render run: `--config FILE` names
+/// it explicitly (missing or malformed is an error), otherwise `./kujamba.toml`
+/// is used when it exists (its absence is the normal no-config case). Returns
+/// null when no file applies. Any failure exits via fail().
+fn loadConfigFile(io: std.Io, arena: std.mem.Allocator, argv: []const []const u8) ?kujamba_config.Config {
+    // the pre-scan means --config works wherever it appears, even before the
+    // flags it must not lose to
+    var path: ?[]const u8 = null;
+    var i: usize = 0;
+    while (i < argv.len) : (i += 1) {
+        if (!std.mem.eql(u8, argv[i], "--config")) continue;
+        if (path != null) fail(io, "--config given twice", .{});
+        if (i + 1 >= argv.len) fail(io, "--config needs a value", .{});
+        path = argv[i + 1];
+        i += 1;
+    }
+
+    const opened: ?std.Io.File = if (path) |p|
+        std.Io.Dir.cwd().openFile(io, p, .{}) catch |e|
+            fail(io, "cannot open config '{s}': {s}", .{ p, @errorName(e) })
+    else
+        std.Io.Dir.cwd().openFile(io, config_file_name, .{}) catch |e| switch (e) {
+            error.FileNotFound => null,
+            else => fail(io, "cannot open ./{s}: {s}", .{ config_file_name, @errorName(e) }),
+        };
+    const f = opened orelse return null;
+    defer f.close(io);
+
+    const size = f.length(io) catch fail(io, "cannot stat config '{s}'", .{path orelse config_file_name});
+    if (size > max_config_bytes)
+        fail(io, "config '{s}' is larger than 1 MiB — is this the right file?", .{path orelse config_file_name});
+    const data = arena.alloc(u8, @intCast(size)) catch fail(io, "out of memory reading config", .{});
+    const got = f.readPositionalAll(io, data, 0) catch
+        fail(io, "cannot read config '{s}'", .{path orelse config_file_name});
+
+    // The strings in the Config point into `data`, which lives in the arena
+    // for the rest of the run — as long as the settings that use them.
+    var diag = kujamba_config.Diag{ .file = path orelse config_file_name };
+    return kujamba_config.parse(data[0..got], &diag) catch
+        fail(io, "{s}:{d}: {s}", .{ diag.file, diag.line, diag.message() });
+}
+
+/// Canonical "N" / "N+M" text for a parsed pattern — what `render`'s summary
+/// line prints when the pattern came from the config file rather than a flag.
+fn formatPattern(arena: std.mem.Allocator, p: kujamba_out.Pattern) ![]const u8 {
+    if (p.rest == 0) return std.fmt.allocPrint(arena, "{d}", .{p.play});
+    return std.fmt.allocPrint(arena, "{d}+{d}", .{ p.play, p.rest });
+}
+
+/// The `join` option set: built-in defaults, then the config file
+/// (applyConfig), then flags — each layer overwrites the previous one, so a
+/// flag always wins over the config file and the file always wins over the
+/// defaults (#22).
+const JoinSettings = struct {
+    host: []const u8 = "127.0.0.1",
+    port: u16 = 20531,
+    user: []const u8 = "kujamba",
+    pass: []const u8 = "secret",
+    phrase: []const u8 = "kujamba karibu",
+    seed: u64 = 1,
+    /// "3+1"
+    pattern: kujamba_out.Pattern = .{ .play = 3, .rest = 1 },
+    play_mode: kujamba_out.Mode = .repeat,
+    knobs: synth.VoiceKnobs = .{},
+    intervals: u64 = 8,
+    duration_ms: i64 = 120_000,
+    out_dir: []const u8 = "dump",
+    dump_dir: ?[]const u8 = null,
+    transcript: ?[]const u8 = null,
+
+    /// Lay the config file's values over the defaults. Runs BEFORE the flag
+    /// loop, which overwrites the same fields — that ordering *is* the
+    /// "flags win" rule. Absent keys are null/identity, so an untouched
+    /// setting keeps its default.
+    fn applyConfig(self: *JoinSettings, cfg: *const kujamba_config.Config) void {
+        if (cfg.host) |h| self.host = h;
+        if (cfg.port) |p| self.port = p;
+        if (cfg.user) |v| self.user = v;
+        if (cfg.pass) |v| self.pass = v;
+        if (cfg.phrase) |v| self.phrase = v;
+        if (cfg.pattern) |p| self.pattern = p;
+        self.knobs = cfg.knobs;
+    }
+};
+
 fn cmdJoin(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: []const []const u8) !void {
-    var host: []const u8 = "127.0.0.1";
-    var port: u16 = 20531;
-    var user: []const u8 = "kujamba";
-    var pass: []const u8 = "secret";
-    var phrase: []const u8 = "kujamba karibu";
-    var seed: u64 = 1;
-    var pattern_str: []const u8 = "3+1";
-    var play_mode: kujamba_out.Mode = .repeat;
-    var knobs: synth.VoiceKnobs = .{};
-    var intervals: u64 = 8;
-    var duration_ms: i64 = 120_000;
-    var out_dir: []const u8 = "dump";
-    var dump_dir: ?[]const u8 = null;
-    var transcript: ?[]const u8 = null;
+    var s = JoinSettings{};
+
+    // config file first, flags second: the loop below overwrites, so a flag
+    // always wins over the file wherever it appears (#22)
+    const cfg = loadConfigFile(io, arena, argv);
+    if (cfg) |*c| s.applyConfig(c);
 
     var i: usize = 0;
     while (i < argv.len) : (i += 1) {
@@ -134,106 +236,99 @@ fn cmdJoin(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: [
         const next: ?[]const u8 = if (i + 1 < argv.len) argv[i + 1] else null;
         if (std.mem.eql(u8, a, "--host")) {
             const v = next orelse fail(io, "--host needs a value", .{});
-            if (v.len > 0 and v[0] == '[') {
-                // bracketed IPv6: [::1]:20531 or [::1]
-                const close = std.mem.indexOfScalar(u8, v, ']') orelse
-                    fail(io, "bad --host: missing ']'", .{});
-                host = v[1..close];
-                if (close + 1 < v.len) {
-                    if (v[close + 1] != ':') fail(io, "bad --host after ']'", .{});
-                    port = std.fmt.parseInt(u16, v[close + 2 ..], 10) catch fail(io, "bad port in --host", .{});
-                }
-            } else if (std.mem.indexOfScalar(u8, v, ':')) |colon| {
-                if (std.mem.indexOfScalarPos(u8, v, colon + 1, ':') != null)
-                    fail(io, "IPv6 host needs brackets: --host [::1]:port", .{});
-                host = v[0..colon];
-                port = std.fmt.parseInt(u16, v[colon + 1 ..], 10) catch fail(io, "bad port in --host", .{});
-            } else {
-                host = v;
-            }
+            const p = kujamba_config.splitHostPort(v, &s.host) catch |e| switch (e) {
+                // the same wording --host has always used
+                error.MissingBracket => fail(io, "bad --host: missing ']'", .{}),
+                error.BadHostAfterBracket => fail(io, "bad --host after ']'", .{}),
+                error.BadPort => fail(io, "bad port in --host", .{}),
+                error.Ipv6NeedsBrackets => fail(io, "IPv6 host needs brackets: --host [::1]:port", .{}),
+            };
+            if (p) |pp| s.port = pp;
             i += 1;
+        } else if (std.mem.eql(u8, a, "--config")) {
+            i += 1; // consumed by loadConfigFile; skip the value here
         } else if (std.mem.eql(u8, a, "--play")) {
-            play_mode = kujamba_out.parseMode(next orelse fail(io, "--play needs a value", .{})) catch
+            s.play_mode = kujamba_out.parseMode(next orelse fail(io, "--play needs a value", .{})) catch
                 fail(io, "bad --play '{s}' (want repeat, loop or once)", .{next.?});
             i += 1;
         } else if (std.mem.eql(u8, a, "--voice")) {
-            knobs = synth.parseKnobs(next orelse fail(io, "--voice needs a value", .{})) catch |e|
+            s.knobs = synth.parseKnobs(next orelse fail(io, "--voice needs a value", .{})) catch |e|
                 fail(io, "bad --voice '{s}': {s} (want attack=N,noise=N,wobble=N)", .{ next.?, @errorName(e) });
             i += 1;
         } else if (std.mem.eql(u8, a, "--user")) {
-            user = next orelse fail(io, "--user needs a value", .{});
+            s.user = next orelse fail(io, "--user needs a value", .{});
             i += 1;
         } else if (std.mem.eql(u8, a, "--pass")) {
-            pass = next orelse fail(io, "--pass needs a value", .{});
+            s.pass = next orelse fail(io, "--pass needs a value", .{});
             i += 1;
         } else if (std.mem.eql(u8, a, "--phrase")) {
-            phrase = next orelse fail(io, "--phrase needs a value", .{});
+            s.phrase = next orelse fail(io, "--phrase needs a value", .{});
             i += 1;
         } else if (std.mem.eql(u8, a, "--seed")) {
-            seed = std.fmt.parseInt(u64, next orelse fail(io, "--seed needs a value", .{}), 10) catch fail(io, "bad --seed", .{});
+            s.seed = std.fmt.parseInt(u64, next orelse fail(io, "--seed needs a value", .{}), 10) catch fail(io, "bad --seed", .{});
             i += 1;
         } else if (std.mem.eql(u8, a, "--pattern")) {
-            pattern_str = next orelse fail(io, "--pattern needs a value", .{});
+            const v = next orelse fail(io, "--pattern needs a value", .{});
+            s.pattern = kujamba_out.parsePattern(v) catch fail(io, "bad --pattern '{s}' (want N or N+M)", .{v});
             i += 1;
         } else if (std.mem.eql(u8, a, "--intervals")) {
-            intervals = std.fmt.parseInt(u64, next orelse fail(io, "--intervals needs a value", .{}), 10) catch fail(io, "bad --intervals", .{});
+            s.intervals = std.fmt.parseInt(u64, next orelse fail(io, "--intervals needs a value", .{}), 10) catch fail(io, "bad --intervals", .{});
             i += 1;
         } else if (std.mem.eql(u8, a, "--duration")) {
             const secs = std.fmt.parseFloat(f64, next orelse fail(io, "--duration needs a value", .{})) catch fail(io, "bad --duration", .{});
             // NaN/negative would panic in @intFromFloat
             if (!(secs > 0.0) or secs > 86400.0)
                 fail(io, "--duration must be in (0, 86400] seconds", .{});
-            duration_ms = @intFromFloat(secs * 1000.0);
+            s.duration_ms = @intFromFloat(secs * 1000.0);
             i += 1;
         } else if (std.mem.eql(u8, a, "--out-dir")) {
-            out_dir = next orelse fail(io, "--out-dir needs a value", .{});
+            s.out_dir = next orelse fail(io, "--out-dir needs a value", .{});
             i += 1;
         } else if (std.mem.eql(u8, a, "--dump-dir")) {
-            dump_dir = next orelse fail(io, "--dump-dir needs a value", .{});
+            s.dump_dir = next orelse fail(io, "--dump-dir needs a value", .{});
             i += 1;
         } else if (std.mem.eql(u8, a, "--transcript")) {
-            transcript = next orelse fail(io, "--transcript needs a value", .{});
+            s.transcript = next orelse fail(io, "--transcript needs a value", .{});
             i += 1;
         } else {
             fail(io, "unknown option '{s}'", .{a});
         }
     }
 
-    const pattern = kujamba_out.parsePattern(pattern_str) catch fail(io, "bad --pattern '{s}' (want N or N+M)", .{pattern_str});
-    var adapter = kujamba_out.PlanAdapter{ .pattern = &pattern };
+    var adapter = kujamba_out.PlanAdapter{ .pattern = &s.pattern };
 
     // The synth is the capture device: render the phrase once (deterministic),
     // then read it out interval by interval.
-    const phrase_samples = kujamba_out.renderPhraseF32With(gpa, phrase, knobs) catch |e| fail(io, "phrase render failed: {s}", .{@errorName(e)});
+    const phrase_samples = kujamba_out.renderPhraseF32With(gpa, s.phrase, s.knobs) catch |e| fail(io, "phrase render failed: {s}", .{@errorName(e)});
     defer gpa.free(phrase_samples);
-    var fill = kujamba_out.Fill{ .samples = phrase_samples, .mode = play_mode };
+    var fill = kujamba_out.Fill{ .samples = phrase_samples, .mode = s.play_mode };
 
     var opts = session.Options{
-        .host = host,
-        .port = port,
-        .user = user,
-        .pass = pass,
+        .host = s.host,
+        .port = s.port,
+        .user = s.user,
+        .pass = s.pass,
         .srate = synth.SAMPLE_RATE,
         .channel_names = &.{"kujamba"},
         .source = .{ .kujamba = &fill },
-        .id_seed = seed,
+        .id_seed = s.seed,
         .plan = .{ .ctx = @ptrCast(&adapter), .broadcastFor = kujamba_out.PlanAdapter.broadcastForFn },
-        .out_dir = out_dir,
-        .payload_dump_dir = dump_dir,
-        .stop_after_intervals = intervals,
-        .duration_ms = duration_ms,
+        .out_dir = s.out_dir,
+        .payload_dump_dir = s.dump_dir,
+        .stop_after_intervals = s.intervals,
+        .duration_ms = s.duration_ms,
         .quality = 0.0,
     };
-    if (transcript) |t| {
+    if (s.transcript) |t| {
         opts.transcript_path = t;
     } else {
-        opts.transcript_path = try std.fmt.allocPrint(arena, "{s}/transcript.log", .{out_dir});
+        opts.transcript_path = try std.fmt.allocPrint(arena, "{s}/transcript.log", .{s.out_dir});
     }
 
-    var s = session.Session.init(gpa, io, opts) catch |e| fail(io, "init failed: {s}", .{@errorName(e)});
-    defer s.deinit();
+    var sess = session.Session.init(gpa, io, opts) catch |e| fail(io, "init failed: {s}", .{@errorName(e)});
+    defer sess.deinit();
 
-    const stats = s.run() catch s.stats;
+    const stats = sess.run() catch sess.stats;
 
     // exit-code honesty: a run that uploaded nothing is a failure even if the
     // duration cap was reached without an error
@@ -251,8 +346,8 @@ fn cmdJoin(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: [
         .{
             ok,
             err_text,
-            seed,
-            @tagName(play_mode),
+            s.seed,
+            @tagName(s.play_mode),
             stats.intervals_uploaded,
             stats.intervals_broadcast,
             stats.silence_markers,
@@ -323,15 +418,30 @@ fn cmdCheckOgg(io: std.Io, argv: []const []const u8) !void {
 
 /// Offline render: a phrase to a WAV or OGG file, shaped exactly as `join`
 /// would have played it, with no server and no room in the way.
-fn cmdRender(io: std.Io, gpa: std.mem.Allocator, argv: []const []const u8) !void {
+fn cmdRender(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: []const []const u8) !void {
     var phrase: []const u8 = "kujamba karibu";
     var out_path: ?[]const u8 = null;
-    var pattern_str: []const u8 = "1";
+    var pattern: kujamba_out.Pattern = .{ .play = 1, .rest = 0 }; // "1"
+    var pattern_label: []const u8 = "1";
     var play_mode = kujamba_out.Mode.repeat;
     var bars: u32 = 1;
     var bar_ms: u64 = 0;
     var seed: u64 = 0;
     var knobs: synth.VoiceKnobs = .{};
+
+    // config first, flags second — the same rule join follows. Render takes
+    // the instrument keys (phrase, pattern, [voice]); the connection keys are
+    // simply not read here.
+    const cfg = loadConfigFile(io, arena, argv);
+    if (cfg) |*c| {
+        if (c.phrase) |v| phrase = v;
+        if (c.pattern) |p| {
+            pattern = p;
+            pattern_label = try formatPattern(arena, p);
+        }
+        knobs = c.knobs;
+    }
+
     var i: usize = 0;
     while (i < argv.len) : (i += 1) {
         const a = argv[i];
@@ -339,6 +449,8 @@ fn cmdRender(io: std.Io, gpa: std.mem.Allocator, argv: []const []const u8) !void
         if (std.mem.eql(u8, a, "--phrase")) {
             phrase = next orelse fail(io, "--phrase needs a value", .{});
             i += 1;
+        } else if (std.mem.eql(u8, a, "--config")) {
+            i += 1; // consumed by loadConfigFile; skip the value here
         } else if (std.mem.eql(u8, a, "--play")) {
             play_mode = kujamba_out.parseMode(next orelse fail(io, "--play needs a value", .{})) catch
                 fail(io, "bad --play '{s}' (want repeat, loop or once)", .{next.?});
@@ -348,7 +460,9 @@ fn cmdRender(io: std.Io, gpa: std.mem.Allocator, argv: []const []const u8) !void
                 fail(io, "bad --voice '{s}': {s} (want attack=N,noise=N,wobble=N)", .{ next.?, @errorName(e) });
             i += 1;
         } else if (std.mem.eql(u8, a, "--pattern")) {
-            pattern_str = next orelse fail(io, "--pattern needs a value", .{});
+            const v = next orelse fail(io, "--pattern needs a value", .{});
+            pattern = kujamba_out.parsePattern(v) catch fail(io, "bad --pattern '{s}' (want N or N+M)", .{v});
+            pattern_label = v;
             i += 1;
         } else if (std.mem.eql(u8, a, "--bars")) {
             bars = std.fmt.parseInt(u32, next orelse fail(io, "--bars needs a value", .{}), 10) catch fail(io, "bad --bars", .{});
@@ -369,8 +483,6 @@ fn cmdRender(io: std.Io, gpa: std.mem.Allocator, argv: []const []const u8) !void
     }
     const p = out_path orelse fail(io, "render needs --out FILE", .{});
 
-    const pattern = kujamba_out.parsePattern(pattern_str) catch
-        fail(io, "bad --pattern '{s}' (want N or N+M)", .{pattern_str});
     const opts = kujamba_out.OfflineOpts{
         .mode = play_mode,
         .pattern = pattern,
@@ -407,7 +519,7 @@ fn cmdRender(io: std.Io, gpa: std.mem.Allocator, argv: []const []const u8) !void
     const seconds = @as(f64, @floatFromInt(pcm.len)) / @as(f64, @floatFromInt(kujamba_out.sample_rate));
     var buf: [512]u8 = undefined;
     const line = std.fmt.bufPrint(&buf, "wrote {s}: {d} bars x {d}ms pattern {s} play {s} -> {d} bytes, {d:.3}s, peak {d:.3} rms {d:.4}\n", .{
-        p,                       bars,                   bar_ms, pattern_str, @tagName(play_mode), bytes.len, seconds,
+        p,                       bars,                   bar_ms, pattern_label, @tagName(play_mode), bytes.len, seconds,
         kujamba_out.peakOf(pcm), kujamba_out.rmsOf(pcm),
     }) catch return;
     std.Io.File.stdout().writeStreamingAll(io, line) catch {};
@@ -458,4 +570,108 @@ fn cmdEncodeSilence(io: std.Io, gpa: std.mem.Allocator, argv: []const []const u8
     var buf: [256]u8 = undefined;
     const line = std.fmt.bufPrint(&buf, "wrote silent interval: {s} bytes={d} seconds={d:.3}\n", .{ p, ogg.items.len, seconds }) catch return;
     std.Io.File.stdout().writeStreamingAll(io, line) catch {};
+}
+
+// ---- config / preset tests (#22) --------------------------------------------
+
+/// Parse a config file for a test, failing with the diagnostic on error.
+fn parseConfigForTest(text: []const u8) kujamba_config.Config {
+    var diag = kujamba_config.Diag{ .file = "test.toml" };
+    return kujamba_config.parse(text, &diag) catch |e| {
+        std.debug.print("config parse failed: {s}:{d}: {s}\n", .{ diag.file, diag.line, diag.message() });
+        @panic(@errorName(e));
+    };
+}
+
+test "join settings keep the flag defaults when no config file applies" {
+    const s = JoinSettings{};
+    try std.testing.expectEqualStrings("127.0.0.1", s.host);
+    try std.testing.expectEqual(@as(u16, 20531), s.port);
+    try std.testing.expectEqualStrings("kujamba", s.user);
+    try std.testing.expectEqualStrings("secret", s.pass);
+    try std.testing.expectEqualStrings("kujamba karibu", s.phrase);
+    try std.testing.expectEqual(@as(u64, 1), s.seed);
+    try std.testing.expectEqual(kujamba_out.Pattern{ .play = 3, .rest = 1 }, s.pattern);
+    try std.testing.expectEqual(kujamba_out.Mode.repeat, s.play_mode);
+    try std.testing.expectEqual(synth.VoiceKnobs{}, s.knobs);
+    try std.testing.expectEqual(@as(u64, 8), s.intervals);
+    try std.testing.expectEqual(@as(i64, 120_000), s.duration_ms);
+    try std.testing.expectEqualStrings("dump", s.out_dir);
+    try std.testing.expectEqual(@as(?[]const u8, null), s.dump_dir);
+    try std.testing.expectEqual(@as(?[]const u8, null), s.transcript);
+}
+
+test "config supplies join defaults; flags overwrite them (#22)" {
+    const cfg = parseConfigForTest(
+        \\host = "nas.example.com:20531"
+        \\user = "dj"
+        \\pass = "pw"
+        \\phrase = "habari yako"
+        \\pattern = "2+2"
+        \\
+        \\[voice]
+        \\attack = 2
+        \\noise = 0.5
+        \\wobble = 3
+        \\
+    );
+
+    var s = JoinSettings{};
+    s.applyConfig(&cfg);
+    try std.testing.expectEqualStrings("nas.example.com", s.host);
+    try std.testing.expectEqual(@as(u16, 20531), s.port);
+    try std.testing.expectEqualStrings("dj", s.user);
+    try std.testing.expectEqualStrings("pw", s.pass);
+    try std.testing.expectEqualStrings("habari yako", s.phrase);
+    try std.testing.expectEqual(kujamba_out.Pattern{ .play = 2, .rest = 2 }, s.pattern);
+    try std.testing.expectEqual(@as(f32, 2.0), s.knobs.attack);
+    try std.testing.expectEqual(@as(f32, 0.5), s.knobs.noise);
+    try std.testing.expectEqual(@as(f32, 3.0), s.knobs.wobble);
+
+    // The flag loop assigns the very same fields through the very same
+    // helpers, so "flags win over the config file" is literally this:
+    const p = try kujamba_config.splitHostPort("127.0.0.1:9", &s.host);
+    s.port = p.?;
+    s.knobs = try synth.parseKnobs("noise=0");
+    s.pattern = try kujamba_out.parsePattern("1");
+    try std.testing.expectEqualStrings("127.0.0.1", s.host);
+    try std.testing.expectEqual(@as(u16, 9), s.port);
+    try std.testing.expectEqual(kujamba_out.Pattern{ .play = 1, .rest = 0 }, s.pattern);
+    // --voice replaces the whole table, not just the axes it names
+    try std.testing.expectEqual(@as(f32, 1.0), s.knobs.attack);
+    try std.testing.expectEqual(@as(f32, 0.0), s.knobs.noise);
+    try std.testing.expectEqual(@as(f32, 1.0), s.knobs.wobble);
+}
+
+test "config sets only the keys it names" {
+    const cfg = parseConfigForTest("user = \"dj\"\n");
+
+    var s = JoinSettings{};
+    s.applyConfig(&cfg);
+    try std.testing.expectEqualStrings("dj", s.user);
+    // everything else keeps its built-in default
+    try std.testing.expectEqualStrings("127.0.0.1", s.host);
+    try std.testing.expectEqual(@as(u16, 20531), s.port);
+    try std.testing.expectEqual(synth.VoiceKnobs{}, s.knobs);
+}
+
+test "a config host without a port keeps the default port" {
+    const cfg = parseConfigForTest("host = \"nas.example.com\"\n");
+
+    var s = JoinSettings{};
+    s.applyConfig(&cfg);
+    try std.testing.expectEqualStrings("nas.example.com", s.host);
+    try std.testing.expectEqual(@as(u16, 20531), s.port);
+}
+
+test "a config host port survives a flag that names a bare host" {
+    const cfg = parseConfigForTest("host = \"nas.example.com:20531\"\n");
+
+    var s = JoinSettings{};
+    s.applyConfig(&cfg);
+    // --host without its own port replaces the host name, not the configured port
+    const p = try kujamba_config.splitHostPort("127.0.0.1", &s.host);
+    try std.testing.expectEqual(@as(?u16, null), p);
+    try std.testing.expectEqualStrings("127.0.0.1", s.host);
+    try std.testing.expectEqual(@as(u16, 20531), s.port);
 }
