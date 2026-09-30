@@ -25,13 +25,25 @@
 
 const std = @import("std");
 const session = @import("ninjam/session.zig");
+const audio = @import("ninjam/audio.zig");
 const vorbis = @import("ninjam/vorbis.zig");
 const synth = @import("synth.zig");
 const kujamba_out = @import("ninjam_out.zig");
 const kujamba_config = @import("kujamba_config.zig");
 const libc = @cImport({
     @cInclude("signal.h");
+    @cInclude("unistd.h"); // usleep — the drain loops' 10 ms ticks (#20)
 });
+
+/// The playback device period kujamba's local path opens with (#20): 480
+/// frames at 44.1 kHz is ~10.9 ms, the same default the live session uses.
+const play_period_frames: u32 = 480;
+/// Extra silence queued after the rendered audio so its final samples are
+/// still in the ring when the drain loop's grace period ends (#20).
+const play_tail_seconds: f64 = 0.15;
+/// How long the drain loop waits after the ring first reports empty before
+/// declaring playback done (#20).
+const play_grace_ms: u64 = 120;
 
 fn handleStop(sig: c_int) callconv(.c) void {
     _ = sig;
@@ -78,6 +90,19 @@ fn printUsage(io: std.Io) void {
         \\                       [--pattern P] [--bars N] [--bar-ms MS] [--seed N]
         \\      render a phrase offline, shaped as join would play it. A rest bar
         \\      is exact silence and freezes the phrase cursor, matching the room.
+        \\  kujamba play <phrase> [--config FILE] [--play MODE] [--pattern P]
+        \\                       [--bars N] [--bar-ms MS] [--seed N] [--voice SPEC]
+        \\                       [--device NAME|INDEX]
+        \\      render like `render` and play it on the local output device
+        \\      (#20, vendored miniaudio — no afplay shell-out). Exits 1 with a
+        \\      clear message when no output device is available.
+        \\  kujamba trigger [--config FILE] [--device NAME|INDEX] [--script FILE]
+        \\      the #21 sampler: stdin lines drive it — `on <N>` plays the sound
+        \\      [map] binds to note N (phrase or shuzi:<seed>), `off <N>` is
+        \\      accepted and ignored, `q` or EOF exits. With --script FILE the
+        \\      lines come from a file instead (same protocol), which is how
+        \\      headless runs and tests drive it. Renders happen on the note-on
+        \\      itself (<50 ms), so a sound starts within one bar of its note-on.
         \\  kujamba check-ogg FILE [--min-rms R]   analyze an interval; exit 1 if rms < R
         \\  kujamba encode-silence FILE [--seconds S]   write a silent interval
         \\
@@ -93,10 +118,12 @@ fn printUsage(io: std.Io) void {
         \\"!"-prefixed room message as an unknown command, so "!kujamba loop"
         \\never reaches the room. Say it without the sigil.
         \\
-        \\CONFIG (#22): a TOML-style file of defaults for join and render —
+        \\CONFIG (#22): a TOML-style file of defaults for join, render, play
+        \\and trigger —
         \\  host (same syntax as --host, so "name:port" / "[::1]:port"), user,
-        \\  pass, phrase, pattern, and a [voice] table with attack/noise/wobble
-        \\  multipliers. Values apply defaults <- config <- flags, so a flag
+        \\  pass, phrase, pattern, a [voice] table with attack/noise/wobble
+        \\  multipliers, and a [map] table binding `noteN = phrase|shuzi:seed`
+        \\  for `trigger` (#21). Values apply defaults <- config <- flags, so a flag
         \\  always wins over the file; a --voice flag replaces the whole
         \\  [voice] table. Example: examples/kujamba.toml in the repo.
         \\
@@ -136,6 +163,10 @@ pub fn main(init: std.process.Init) !void {
         return cmdJoin(io, gpa, arena, args[2..]);
     } else if (std.mem.eql(u8, args[1], "render")) {
         return cmdRender(io, gpa, arena, args[2..]);
+    } else if (std.mem.eql(u8, args[1], "play")) {
+        return cmdPlay(io, gpa, arena, args[2..]);
+    } else if (std.mem.eql(u8, args[1], "trigger")) {
+        return cmdTrigger(io, gpa, arena, args[2..]);
     } else if (std.mem.eql(u8, args[1], "check-ogg")) {
         return cmdCheckOgg(io, args[2..]);
     } else if (std.mem.eql(u8, args[1], "encode-silence")) {
@@ -640,6 +671,460 @@ fn cmdRender(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv:
         kujamba_out.peakOf(pcm), kujamba_out.rmsOf(pcm),
     }) catch return;
     std.Io.File.stdout().writeStreamingAll(io, line) catch {};
+}
+
+/// #20: local audition. Render exactly like `render` (same OfflineOpts, same
+/// config file), then queue the PCM on the vendored miniaudio playback device
+/// and wait for the ring to drain. No afplay, no shell-out: the same path the
+/// live session uses, minus the capture side. Exits 1 with a clear message
+/// when the build has live audio off or the host has no output device.
+fn cmdPlay(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: []const []const u8) !void {
+    if (comptime !audio.enabled) {
+        fail(io, "play: this build has live audio disabled — rebuild with -Dlive", .{});
+    }
+    var phrase: []const u8 = "kujamba karibu";
+    var pattern: kujamba_out.Pattern = .{ .play = 1, .rest = 0 };
+    var pattern_label: []const u8 = "1";
+    var play_mode = kujamba_out.Mode.repeat;
+    var bars: u32 = 1;
+    var bar_ms: u64 = 0;
+    var knobs: synth.VoiceKnobs = .{};
+    var device: ?[]const u8 = null;
+
+    const cfg = loadConfigFile(io, arena, argv);
+    if (cfg) |*c| {
+        if (c.phrase) |v| phrase = v;
+        if (c.pattern) |pat| {
+            pattern = pat;
+            pattern_label = try formatPattern(arena, pat);
+        }
+        knobs = c.knobs;
+    }
+
+    var i: usize = 0;
+    while (i < argv.len) : (i += 1) {
+        const a = argv[i];
+        const next = if (i + 1 < argv.len) argv[i + 1] else null;
+        if (std.mem.eql(u8, a, "--phrase")) {
+            phrase = next orelse fail(io, "--phrase needs a value", .{});
+            i += 1;
+        } else if (std.mem.eql(u8, a, "--config")) {
+            i += 1; // consumed by loadConfigFile
+        } else if (std.mem.eql(u8, a, "--play")) {
+            play_mode = kujamba_out.parseMode(next orelse fail(io, "--play needs a value", .{})) catch
+                fail(io, "bad --play '{s}' (want repeat, loop or once)", .{next.?});
+            i += 1;
+        } else if (std.mem.eql(u8, a, "--voice")) {
+            knobs = synth.parseKnobs(next orelse fail(io, "--voice needs a value", .{})) catch |e|
+                fail(io, "bad --voice '{s}': {s} (want attack=N,noise=N,wobble=N)", .{ next.?, @errorName(e) });
+            i += 1;
+        } else if (std.mem.eql(u8, a, "--pattern")) {
+            const v = next orelse fail(io, "--pattern needs a value", .{});
+            pattern = kujamba_out.parsePattern(v) catch fail(io, "bad --pattern '{s}' (want N or N+M)", .{v});
+            pattern_label = v;
+            i += 1;
+        } else if (std.mem.eql(u8, a, "--bars")) {
+            bars = std.fmt.parseInt(u32, next orelse fail(io, "--bars needs a value", .{}), 10) catch fail(io, "bad --bars", .{});
+            if (bars == 0) fail(io, "--bars must be at least 1", .{});
+            i += 1;
+        } else if (std.mem.eql(u8, a, "--bar-ms")) {
+            bar_ms = std.fmt.parseInt(u64, next orelse fail(io, "--bar-ms needs a value", .{}), 10) catch fail(io, "bad --bar-ms", .{});
+            i += 1;
+        } else if (std.mem.eql(u8, a, "--seed")) {
+            // accepted for render parity; the local render is deterministic
+            // regardless, and the OGG serial has no meaning here
+            _ = std.fmt.parseInt(u64, next orelse fail(io, "--seed needs a value", .{}), 10) catch fail(io, "bad --seed", .{});
+            i += 1;
+        } else if (std.mem.eql(u8, a, "--device")) {
+            device = next orelse fail(io, "--device needs a name or index", .{});
+            i += 1;
+        } else {
+            fail(io, "play: unexpected argument '{s}'", .{a});
+        }
+    }
+
+    const opts = kujamba_out.OfflineOpts{
+        .mode = play_mode,
+        .pattern = pattern,
+        .bars = bars,
+        .bar_samples = if (bar_ms == 0)
+            0
+        else
+            @as(u64, kujamba_out.sample_rate) * bar_ms / 1000,
+        .knobs = knobs,
+    };
+    const pcm = kujamba_out.renderOfflineF32(gpa, phrase, opts) catch |e|
+        fail(io, "phrase render failed: {s}", .{@errorName(e)});
+    defer gpa.free(pcm);
+
+    var probe_buf: [256]u8 = undefined;
+    const probe = audio.Device.probePlayback(&probe_buf);
+    const dev_id: ?[*:0]const u8 = if (device) |d|
+        (arena.dupeZ(u8, d) catch fail(io, "out of memory", .{})).ptr
+    else
+        null;
+    const dev = audio.Device.openPlayback(gpa, kujamba_out.sample_rate, play_period_frames, dev_id) catch |e| {
+        var why_buf: [320]u8 = undefined;
+        const why = if (device) |d|
+            std.fmt.bufPrint(&why_buf, "cannot open output device '{s}' ({s}: {s})", .{
+                d, @errorName(e), audio.Device.lastError(audio.last_open_error),
+            }) catch "cannot open output device"
+        else
+            std.fmt.bufPrint(&why_buf, "no output device available ({s}: {s})", .{
+                @errorName(e), audio.Device.lastError(audio.last_open_error),
+            }) catch "no output device available";
+        fail(io, "play: {s}", .{why});
+    };
+    defer dev.deinit(gpa);
+
+    var buf: [512]u8 = undefined;
+    const line = std.fmt.bufPrint(&buf, "playing {d:.3}s on \"{s}\" ({s}, {d} Hz)\n", .{
+        @as(f64, @floatFromInt(pcm.len)) / @as(f64, @floatFromInt(kujamba_out.sample_rate)),
+        dev.nameSlice(),
+        dev.backend(),
+        dev.dev_srate,
+    }) catch return;
+    std.Io.File.stdout().writeStreamingAll(io, line) catch {};
+    _ = probe;
+
+    // queuedPlayback() reaching 0 means every sample (audio + the silent tail
+    // that keeps the last period audible) was handed to the hardware callback.
+    dev.writePlayback(pcm);
+    const tail: usize = @intFromFloat(play_tail_seconds * @as(f64, @floatFromInt(kujamba_out.sample_rate)));
+    const tail_zeros = try gpa.alloc(f32, @min(tail, 1 << 16));
+    defer gpa.free(tail_zeros);
+    @memset(tail_zeros, 0);
+    var tail_left = tail;
+    var grace: u64 = 0;
+    while (grace < play_grace_ms) : (grace += 10) {
+        if (kujamba_out.stopRequested()) break;
+        while (tail_left > 0) {
+            const chunk = @min(tail_zeros.len, tail_left);
+            dev.writePlayback(tail_zeros[0..chunk]);
+            tail_left -= chunk;
+        }
+        if (dev.queuedPlayback() == 0) break;
+        _ = libc.usleep(10 * 1000);
+    }
+    // let the hardware pull the last queued period before the device closes
+    _ = libc.usleep(@intCast((play_period_frames * 1000 * 1000) / kujamba_out.sample_rate + 10 * 1000));
+    const done = "done\n";
+    std.Io.File.stdout().writeStreamingAll(io, done) catch {};
+}
+
+fn sinkWritePlayback(ctx: *anyopaque, samples: []const f32) void {
+    const dev: *audio.Device = @ptrCast(@alignCast(ctx));
+    dev.writePlayback(samples);
+}
+
+/// #21: the sampler. stdin lines (or --script FILE) drive it: `on <N>` renders
+/// the sound [map] binds to note N and queues it on the local playback device,
+/// `off <N>` is accepted and ignored (one-shot sounds), `q`/EOF exits cleanly.
+/// Unknown lines/notes are warned about and ignored — a live player hits wrong
+/// keys. Rendering happens on the note-on itself (these renders are <50 ms),
+/// so the sound starts after one device period, well inside a bar.
+fn cmdTrigger(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: []const []const u8) !void {
+    if (comptime !audio.enabled) {
+        fail(io, "trigger: this build has live audio disabled — rebuild with -Dlive", .{});
+    }
+    var device: ?[]const u8 = null;
+    var script: ?[]const u8 = null;
+
+    var i: usize = 0;
+    while (i < argv.len) : (i += 1) {
+        const a = argv[i];
+        const next = if (i + 1 < argv.len) argv[i + 1] else null;
+        if (std.mem.eql(u8, a, "--config")) {
+            i += 1; // consumed by loadConfigFile below
+        } else if (std.mem.eql(u8, a, "--device")) {
+            device = next orelse fail(io, "--device needs a name or index", .{});
+            i += 1;
+        } else if (std.mem.eql(u8, a, "--script")) {
+            script = next orelse fail(io, "--script needs a file path", .{});
+            i += 1;
+        } else {
+            fail(io, "trigger: unexpected argument '{s}'", .{a});
+        }
+    }
+    const cfg = loadConfigFile(io, arena, argv);
+    const map = if (cfg) |*c| c.map else [_]kujamba_config.NoteSound{.none} ** 128;
+
+    const dev_id: ?[*:0]const u8 = if (device) |d|
+        (arena.dupeZ(u8, d) catch fail(io, "out of memory", .{})).ptr
+    else
+        null;
+    const dev = audio.Device.openPlayback(gpa, kujamba_out.sample_rate, play_period_frames, dev_id) catch |e| {
+        var why_buf: [320]u8 = undefined;
+        const why = if (device) |d|
+            std.fmt.bufPrint(&why_buf, "cannot open output device '{s}' ({s}: {s})", .{
+                d, @errorName(e), audio.Device.lastError(audio.last_open_error),
+            }) catch "cannot open output device"
+        else
+            std.fmt.bufPrint(&why_buf, "no output device available ({s}: {s})", .{
+                @errorName(e), audio.Device.lastError(audio.last_open_error),
+            }) catch "no output device available";
+        fail(io, "trigger: {s}", .{why});
+    };
+    defer dev.deinit(gpa);
+
+    var engine = TriggerEngine.init(gpa, .{
+        .map = &map,
+        .sink = &sinkWritePlayback,
+        .sink_ctx = dev,
+    });
+
+    var buf: [256]u8 = undefined;
+    const ready = std.fmt.bufPrint(&buf, "trigger ready: {d} mapped notes; send `on <N>`, `off <N>`, `q`\n", .{engine.mappedCount()}) catch return;
+    std.Io.File.stdout().writeStreamingAll(io, ready) catch {};
+
+    if (script) |path| {
+        const text = readTextFile(io, arena, path) catch
+            fail(io, "trigger: cannot read script '{s}'", .{path});
+        var it = std.mem.splitScalar(u8, text, '\n');
+        while (it.next()) |raw| {
+            const line = std.mem.trim(u8, raw, " \t\r");
+            if (line.len == 0 or line[0] == '#') continue;
+            if (!engine.handleLine(line)) break; // q / stop
+        }
+    } else {
+        const stdin = std.Io.File.stdin();
+        var rbuf: [1024]u8 = undefined;
+        var rd = stdin.reader(io, &rbuf);
+        const all = rd.interface.allocRemaining(gpa, .unlimited) catch
+            fail(io, "trigger: cannot read stdin", .{});
+        defer gpa.free(all);
+        var it = std.mem.splitScalar(u8, all, '\n');
+        while (it.next()) |raw| {
+            const line = std.mem.trim(u8, raw, " \t\r");
+            if (line.len == 0 or line[0] == '#') continue;
+            if (!engine.handleLine(line)) break; // q / stop
+        }
+    }
+    // let the last note-on finish sounding, then leave
+    var grace: u64 = 0;
+    while (grace < 2000 and dev.queuedPlayback() > 0 and !kujamba_out.stopRequested()) : (grace += 10) {
+        _ = libc.usleep(10 * 1000);
+    }
+}
+
+/// The note-on engine behind `kujamba trigger` (#21), device-free by
+/// construction: notes map to renders, renders go to any f32 sink. This is
+/// what the unit tests exercise with a recording sink.
+const TriggerEngine = struct {
+    const Sink = *const fn (ctx: *anyopaque, samples: []const f32) void;
+
+    gpa: std.mem.Allocator,
+    map: []const kujamba_config.NoteSound,
+    sink: Sink,
+    sink_ctx: *anyopaque,
+    /// notes played since start (stats / tests)
+    triggered: usize = 0,
+    ignored: usize = 0,
+
+    fn init(gpa: std.mem.Allocator, opts: struct {
+        map: []const kujamba_config.NoteSound,
+        sink: Sink,
+        sink_ctx: *anyopaque,
+    }) TriggerEngine {
+        return .{ .gpa = gpa, .map = opts.map, .sink = opts.sink, .sink_ctx = opts.sink_ctx };
+    }
+
+    fn mappedCount(self: *const TriggerEngine) usize {
+        var n: usize = 0;
+        for (self.map) |binding| {
+            if (binding != .none) n += 1;
+        }
+        return n;
+    }
+
+    /// One protocol line. Returns false when the engine should stop (`q`, or
+    /// the session stop flag — the same Ctrl+C path `join` uses).
+    fn handleLine(self: *TriggerEngine, line: []const u8) bool {
+        if (kujamba_out.stopRequested()) return false;
+        if (std.mem.eql(u8, line, "q") or std.mem.eql(u8, line, "quit")) return false;
+        var it = std.mem.tokenizeAny(u8, line, " \t");
+        const cmd = it.next() orelse return true;
+        if (std.mem.eql(u8, cmd, "off")) return true; // one-shot sounds: note-off is a no-op
+        if (!std.mem.eql(u8, cmd, "on")) {
+            warnLine("trigger: unknown line '{s}' (want `on <N>`, `off <N>`, `q`)", .{line});
+            return true;
+        }
+        const note_text = it.next() orelse {
+            warnLine("trigger: `on` needs a note number", .{});
+            return true;
+        };
+        const note = std.fmt.parseInt(u8, note_text, 10) catch {
+            warnLine("trigger: bad note '{s}' (want 0..127)", .{note_text});
+            return true;
+        };
+        if (note > 127) {
+            warnLine("trigger: bad note '{s}' (want 0..127)", .{note_text});
+            return true;
+        }
+        self.noteOn(note);
+        return true;
+    }
+
+    /// Render the note's sound and queue it. Unmapped notes are ignored and
+    /// counted; rendering happens right here, so latency is one device period.
+    fn noteOn(self: *TriggerEngine, note: u8) void {
+        switch (self.map[note]) {
+            .none => {
+                self.ignored += 1;
+                warnLine("trigger: note {d} has no mapping", .{note});
+            },
+            .shuzi => |seed| {
+                const wav = synth.renderShuziWavWith(self.gpa, seed, .{}) catch return;
+                defer self.gpa.free(wav);
+                self.queueWav(wav);
+                self.triggered += 1;
+            },
+            .phrase => |phrase| {
+                const pcm = kujamba_out.renderOfflineF32(self.gpa, phrase, .{
+                    .mode = .once,
+                    .pattern = .{ .play = 1, .rest = 0 },
+                    .bars = 1,
+                }) catch {
+                    warnLine("trigger: phrase render failed for note {d}", .{note});
+                    return;
+                };
+                defer self.gpa.free(pcm);
+                self.sink(self.sink_ctx, pcm);
+                self.triggered += 1;
+            },
+        }
+    }
+
+    /// Decode a rendered shuzi WAV's data chunk back to f32 and queue it.
+    fn queueWav(self: *TriggerEngine, wav: []const u8) void {
+        const data = wavDataChunk(wav) orelse {
+            warnLine("trigger: rendered wav has no data chunk", .{});
+            return;
+        };
+        const n = data.len / 2;
+        const f32s = self.gpa.alloc(f32, n) catch return;
+        defer self.gpa.free(f32s);
+        for (f32s, 0..n) |*out, k| {
+            const s16 = std.mem.readInt(i16, data[k * 2 ..][0..2], .little);
+            out.* = @as(f32, @floatFromInt(s16)) / 32768.0;
+        }
+        self.sink(self.sink_ctx, f32s);
+    }
+};
+
+/// A rendered shuzi WAV is canonical 44-byte-header PCM (synth.writeWavBytes),
+/// so the data chunk starts at a fixed offset; the RIFF tags are verified anyway.
+fn wavDataChunk(wav: []const u8) ?[]const u8 {
+    if (wav.len < 46) return null;
+    if (!std.mem.eql(u8, wav[0..4], "RIFF") or !std.mem.eql(u8, wav[8..12], "WAVE")) return null;
+    const data_len = std.mem.readInt(u32, wav[40..44], .little);
+    if (44 + @as(usize, data_len) > wav.len) return null;
+    return wav[44 .. 44 + data_len];
+}
+
+// ---- trigger engine tests (#21) ---------------------------------------------
+
+const testing = std.testing;
+
+const RecordingSink = struct {
+    total_samples: usize = 0,
+    pushes: usize = 0,
+    last_peak: f32 = 0,
+
+    fn push(ctx: *anyopaque, samples: []const f32) void {
+        const self: *RecordingSink = @ptrCast(@alignCast(ctx));
+        self.pushes += 1;
+        self.total_samples += samples.len;
+        for (samples) |v| self.last_peak = @max(self.last_peak, @abs(v));
+    }
+
+    fn sink() TriggerEngine.Sink {
+        return &push;
+    }
+};
+
+test "trigger engine: note-on renders the mapped phrase into the sink" {
+    var map = [_]kujamba_config.NoteSound{.none} ** 128;
+    map[60] = .{ .phrase = "po" };
+    var sink_state = RecordingSink{};
+    var engine = TriggerEngine.init(testing.allocator, .{
+        .map = &map,
+        .sink = RecordingSink.sink(),
+        .sink_ctx = &sink_state,
+    });
+    try testing.expectEqual(@as(usize, 1), engine.mappedCount());
+    _ = engine.handleLine("on 60");
+    try testing.expectEqual(@as(usize, 1), engine.triggered);
+    try testing.expectEqual(@as(usize, 1), sink_state.pushes);
+    try testing.expect(sink_state.total_samples > 0);
+    try testing.expect(sink_state.last_peak > 0.05); // real audio, not silence
+    try testing.expect(engine.handleLine("q") == false);
+}
+
+test "trigger engine: shuzi seeds render real audio via the wav decode" {
+    var map = [_]kujamba_config.NoteSound{.none} ** 128;
+    map[61] = .{ .shuzi = 3 };
+    var sink_state = RecordingSink{};
+    var engine = TriggerEngine.init(testing.allocator, .{
+        .map = &map,
+        .sink = RecordingSink.sink(),
+        .sink_ctx = &sink_state,
+    });
+    _ = engine.handleLine("on 61");
+    try testing.expectEqual(@as(usize, 1), engine.triggered);
+    // a shuzi is 1-3 rumble syllables: at least ~160 ms of 44.1 kHz audio
+    try testing.expect(sink_state.total_samples > kujamba_out.sample_rate / 6);
+    try testing.expect(sink_state.last_peak > 0.05);
+}
+
+test "trigger engine: unmapped notes and bad lines are tolerated" {
+    var map = [_]kujamba_config.NoteSound{.none} ** 128;
+    var sink_state = RecordingSink{};
+    var engine = TriggerEngine.init(testing.allocator, .{
+        .map = &map,
+        .sink = RecordingSink.sink(),
+        .sink_ctx = &sink_state,
+    });
+    _ = engine.handleLine("on 42"); // unmapped: counted, no push
+    try testing.expectEqual(@as(usize, 1), engine.ignored);
+    try testing.expectEqual(@as(usize, 0), engine.triggered);
+    try testing.expectEqual(@as(usize, 0), sink_state.pushes);
+    _ = engine.handleLine("off 42"); // note-off is a no-op
+    _ = engine.handleLine("jump 42"); // unknown verb: warned, keep going
+    _ = engine.handleLine("on"); // missing note
+    _ = engine.handleLine("on abc"); // bad note
+    _ = engine.handleLine("on 200"); // out of range
+    try testing.expectEqual(@as(usize, 1), engine.ignored);
+    try testing.expectEqual(@as(usize, 0), engine.triggered);
+    // the engine is still alive
+    try testing.expect(engine.handleLine("q") == false);
+}
+
+test "trigger engine: same seed renders the same bytes (deterministic)" {
+    var map = [_]kujamba_config.NoteSound{.none} ** 128;
+    map[61] = .{ .shuzi = 3 };
+    var s1 = RecordingSink{};
+    var s2 = RecordingSink{};
+    var e1 = TriggerEngine.init(testing.allocator, .{ .map = &map, .sink = RecordingSink.sink(), .sink_ctx = &s1 });
+    var e2 = TriggerEngine.init(testing.allocator, .{ .map = &map, .sink = RecordingSink.sink(), .sink_ctx = &s2 });
+    _ = e1.handleLine("on 61");
+    _ = e2.handleLine("on 61");
+    try testing.expectEqual(s1.total_samples, s2.total_samples);
+}
+
+test "wavDataChunk: rejects garbage, accepts a rendered shuzi" {
+    try testing.expect(wavDataChunk("nope") == null);
+    try testing.expect(wavDataChunk("RIFFxxxxWAVEjunkjunk") == null);
+    const wav = try synth.renderShuziWav(testing.allocator, 3);
+    defer testing.allocator.free(wav);
+    const data = wavDataChunk(wav) orelse return error.TestUnexpectedResult;
+    try testing.expect(data.len >= kujamba_out.sample_rate / 8 * 2); // >= ~125ms of i16
+}
+
+fn warnLine(comptime fmt: []const u8, args: anytype) void {
+    var buf: [512]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, fmt ++ "\n", args) catch return;
+    std.debug.print("{s}", .{msg});
 }
 
 /// Write one interval of pure silence as a decodable Ogg Vorbis stream — the

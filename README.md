@@ -219,6 +219,33 @@ zig build
 * `kujamba check-ogg FILE --min-rms R` decodes a raw interval and fails if it
   is silent; `kujamba encode-silence FILE` is the negative-control generator.
 
+### Local playback + the sampler (#20, #21)
+
+`kujamba play` renders like `render` and plays it on the local output device
+through the vendored miniaudio path (`-Dlive`; on by default on macOS) — no
+`afplay`, no shell-out:
+
+```bash
+./zig-out/bin/kujamba play --phrase "kujamba karibu" --play once
+./zig-out/bin/kujamba play --phrase "po" --device 1   # by index or name substring
+```
+
+No output device (or a bad `--device`) exits 1 with a clear message; a build
+without `-Dlive` says so and refuses the command instead of pretending.
+
+`kujamba trigger` is the sampler: stdin lines `on <N>` / `off <N>` / `q` (or
+`--script FILE` with the same protocol) drive note-ons against the `[map]`
+table from the config file (`note60 = "kujamba karibu"`,
+`note61 = shuzi:3`). Rendering happens on the note-on itself, so the sound
+starts within one device period — well inside a bar:
+
+```bash
+printf 'on 60\non 61\nq\n' | ./zig-out/bin/kujamba trigger --config kujamba.toml
+```
+
+Unmapped notes and malformed lines are warned about and ignored; a live
+player hits wrong keys.
+
 ### Fuzzing the protocol path (#26)
 
 `proto.zig`/`buf.zig` are length-checked with `catch`, so the likelier crash is

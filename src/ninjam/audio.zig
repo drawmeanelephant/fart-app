@@ -24,6 +24,16 @@ extern fn zc_device_open(
     user: ?*anyopaque,
     device_id: ?[*:0]const u8,
 ) c_int;
+/// Playback-only open (no capture side) for the local audition path (#20):
+/// kujamba play/trigger use this so no mic permission is ever asked for.
+extern fn zc_playback_device_open(
+    out: *?*anyopaque,
+    srate: c_uint,
+    period_frames: c_uint,
+    fill: *const fn (?*anyopaque, ?[*]f32, ?[*]const f32, c_uint) callconv(.c) void,
+    user: ?*anyopaque,
+    device_id: ?[*:0]const u8,
+) c_int;
 extern fn zc_device_close(handle: ?*anyopaque) void;
 extern fn zc_device_sample_rate(handle: ?*anyopaque) c_uint;
 extern fn zc_device_name(handle: ?*anyopaque) [*:0]const u8;
@@ -235,6 +245,41 @@ pub const Device = struct {
         self.name_len = n;
         if (self.dev_srate != 0 and self.dev_srate != srate) {
             self.tx_rs = Resampler.init(self.dev_srate, srate);
+            self.rx_rs = Resampler.init(srate, self.dev_srate);
+        }
+        return self;
+    }
+
+    /// Open the default playback-only device at `srate` (#20). Same handle
+    /// type as `open`, but the capture side is unused: never push to `tx` on
+    /// it. `device_id` resolves by index (all digits) or name substring.
+    pub fn openPlayback(alloc: std.mem.Allocator, srate: u32, period_frames: u32, device_id: ?[*:0]const u8) !*Device {
+        const self = try alloc.create(Device);
+        var tx = Ring.init(alloc, 0) catch |e| {
+            alloc.destroy(self);
+            return e;
+        };
+        const rx = Ring.init(alloc, @intFromFloat(@as(f32, @floatFromInt(srate)) * playback_ring_seconds)) catch |e| {
+            tx.deinit(alloc);
+            return e;
+        };
+        self.* = .{ .tx = tx, .rx = rx, .srate = srate, .jitter_frames = 0 };
+
+        var handle: ?*anyopaque = null;
+        const rc = zc_playback_device_open(&handle, srate, period_frames, &onData, self, device_id);
+        if (rc != 0 or handle == null) {
+            last_open_error = rc;
+            self.deinit(alloc);
+            return error.DeviceOpenFailed;
+        }
+        last_open_error = 0;
+        self.handle = handle;
+        self.dev_srate = zc_device_sample_rate(handle);
+        const cname = zc_device_name(handle);
+        var n: usize = 0;
+        while (n < self.name_buf.len and cname[n] != 0) : (n += 1) self.name_buf[n] = cname[n];
+        self.name_len = n;
+        if (self.dev_srate != 0 and self.dev_srate != srate) {
             self.rx_rs = Resampler.init(srate, self.dev_srate);
         }
         return self;

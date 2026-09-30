@@ -8,6 +8,7 @@ ecosystem. Each dependency is a single file or a source-only tree.
 | `stb_vorbis.c` | https://github.com/nothings/stb | public domain (Unlicense) / MIT | see file header | Vorbis decoding (tests + peer decode) |
 | `libogg/` | https://xiph.org/ogg/ | 1.3.6 | BSD-3-Clause (`libogg/COPYING`) | Ogg container (encode path) |
 | `libvorbis/` | https://xiph.org/vorbis/ | 1.3.7 (2020-07-04) | BSD-3-Clause (`libvorbis/COPYING`) | Vorbis encoding of the kujamba channel |
+| `miniaudio.h` + `miniaudio_impl.c` | https://github.com/mackron/miniaudio | 0.11.25 (2026-03-04) | public domain / MIT-0 (statement at the end of `miniaudio.h`) | live audio device behind the `zc_*` shim (#20: `kujamba play`/`trigger` local playback) |
 
 Provenance: these trees were taken from zclient
 (`drawmeanelephant/ninjam`, branch `agent/zclient`, commit `f428caf`) and are
@@ -17,12 +18,15 @@ work (trimming the Xiph tarballs to the files the build needs) is preserved;
 `libvorbis` is 1.3.7 because that is what the reference client's CMake
 FetchContent also uses, so both encoders link the same version.
 
-## Not vendored
-
-`miniaudio.h` / `miniaudio_impl.c` (live audio device) are deliberately absent:
-`kujamba` is a headless instrument — no mic, no speaker — and the session
-engine is compiled with `live = false`, so the Phase-B live path is never
-analyzed or linked.
+Provenance: miniaudio was taken unchanged from zclient
+(`drawmeanelephant/ninjam`, branch `agent/zclient`, commit `4d40aa1c`) except
+for the shim fixes this PR needed: the custom-device-id path now resolves ids
+through backend enumeration (the old code passed a `ma_device_id*` as
+`ma_device_init`'s context argument), `zc_playback_device_open` was added for
+the playback-only audition path, and `zc_error_string` no longer negates the
+result code twice. The miniaudio TU compiles only when `-Dlive` is on
+(default for macOS targets): `zig build` on Linux stays ALSA-free unless the
+flag asks for audio.
 
 ## What was trimmed (per zclient)
 
