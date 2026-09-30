@@ -36,18 +36,21 @@
 //!    lights up the moment a zig upgrade fixes those; until then the seeded
 //!    random execs are the random-input signal in CI.
 //!
-//! The corpus and the random generator deliberately avoid the two *known*
-//! wire-triggered panics in the vendored dispatcher (`onUserinfo` shifting by
-//! `channel_id >= 32`, and `onConfig` dividing by a hostile `bpm = 0`) so
-//! `zig build test` stays green; they are filed and their minimal repro bytes
-//! live in those issues. Once fixed, add their repros here and delete the
-//! scrubber.
+//! The corpus used to deliberately avoid the two wire-triggered panics the
+//! harness had found in the vendored dispatcher (`onUserinfo` shifting by
+//! `channel_id >= 32`, and `onConfig` dividing by a hostile `bpm = 0`), with a
+//! scrubber that masked both shapes out of every generated stream so
+//! `zig build test` stayed green while they were filed.
+//!
+//! Both are fixed (#40, #41): the scrubber is gone and their minimal repros
+//! are corpus entries 13 and 14. That is the point of the arrangement — the
+//! random generator can rediscover those shapes on its own now, and the corpus
+//! pins them whether or not it does.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const session = @import("ninjam/session.zig");
 const proto = @import("ninjam/proto.zig");
-const netmod = @import("ninjam/net.zig");
 
 // ---- fuzz target ------------------------------------------------------------
 
@@ -273,33 +276,7 @@ test "random server bytes through the dispatch (seeded, bounded)" {
     for (0..random_execs) |_| {
         const len = rand.uintAtMost(usize, buf.len);
         rand.bytes(buf[0..len]);
-        scrubKnownCrashes(buf[0..len]);
         try runDispatchStep(buf[0..len]);
-    }
-}
-
-/// Neutralizes the two known unfixed vendored panics in a generated stream, in
-/// place, frame by frame: #40 (userinfo `channel_id >= 32`) and #41 (config
-/// `bpm = 0`). DELETE ME when both are fixed — and move their shapes into
-/// fillCorpus so the regressions stay pinned.
-fn scrubKnownCrashes(stream: []u8) void {
-    var pos: usize = 0;
-    while (pos + 5 <= stream.len) {
-        const size = std.mem.readInt(u32, stream[pos + 1 ..][0..4], .little);
-        if (size > netmod.max_payload or pos + 5 + size > stream.len) return; // not a complete frame: no downstream code runs past it
-        const payload = stream[pos + 5 ..][0..size];
-        switch (stream[pos]) {
-            proto.MSG_USERINFO_CHANGE_NOTIFY => if (size >= 2) {
-                payload[1] &= 0x1F; // #40: the mask shift needs channel_id < 32
-            },
-            proto.MSG_CONFIG_CHANGE_NOTIFY => if (size >= 2 and
-                payload[0] == 0 and payload[1] == 0)
-            {
-                payload[0] = 1; // #41: bpm must not be 0
-            },
-            else => {},
-        }
-        pos += 5 + size;
     }
 }
 
@@ -333,19 +310,30 @@ fn fillCorpus(c: *CorpusBuf) void {
 
     // 2. a well-formed 0x00 challenge (keepalive caps = 3s, current version):
     //    the only message that moves the session forward; the client replies
+    //
+    //    KNOWN GAP (found while pinning #40/#41): the session reads the
+    //    challenge, sends 0x80 AUTH_USER, and then never reaches 0x01 AUTH_OK
+    //    — the handshake stalls, so entries 2, 3 and 4 below are silently
+    //    no-ops and nothing in this corpus exercises the live-session paths
+    //    (interval clock, config re-anchor, finalize). Their comments describe
+    //    what they *intend* to cover. Entries that need no auth (5-14) do run,
+    //    which is why the #40/#41 repros are written without one. Worth its
+    //    own issue: until it is fixed, treat "goes live" as untested here.
     var ch = StreamBuf{};
     ch.msg(proto.MSG_AUTH_CHALLENGE, &challengePayload(0x00000300, proto.PROTO_VER_CUR)) catch unreachable;
     c.entry(ch.stream());
 
-    // 3. challenge + success 0x01 reply: the session goes live and runs to the
-    //    duration cap (no config yet, so the interval clock never starts)
+    // 3. challenge + success 0x01 reply: INTENDED to go live and run to the
+    //    duration cap (no config yet, so the interval clock never starts) —
+    //    but see the known gap above; this stops at the challenge today.
     var live = StreamBuf{};
     live.msg(proto.MSG_AUTH_CHALLENGE, &challengePayload(0x00000300, proto.PROTO_VER_CUR)) catch unreachable;
     live.msg(proto.MSG_AUTH_REPLY, &authReplyPayload(true, "fuzzer", 8)) catch unreachable;
     c.entry(live.stream());
 
-    // 4. live + a 0x02 config change: re-anchor, interval clock starts, silence
-    //    encodes for the remainder of the cap
+    // 4. INTENDED to be live + a 0x02 config change: re-anchor, interval clock
+    //    starts, silence encodes for the remainder of the cap. Blocked on the
+    //    same handshake gap as entry 3.
     var clocked = StreamBuf{};
     clocked.msg(proto.MSG_AUTH_CHALLENGE, &challengePayload(0x00000300, proto.PROTO_VER_CUR)) catch unreachable;
     clocked.msg(proto.MSG_AUTH_REPLY, &authReplyPayload(true, "fuzzer", 8)) catch unreachable;
@@ -406,6 +394,25 @@ fn fillCorpus(c: *CorpusBuf) void {
     @memcpy(truncated.bytes[truncated.len..][0..4], "half");
     truncated.len += 4;
     c.entry(truncated.stream());
+
+    // 13. #40's repro, now pinned: a userinfo record with channel_id = 200.
+    //     Used to panic on `@as(u32, 1) << @intCast(rec.channel_id)`. It is a
+    //     corpus entry rather than only an issue body so the regression stays
+    //     fixed even though the bug lived in vendored code. Like entry 14 this
+    //     needs no auth in front of it.
+    var badchan = StreamBuf{};
+    badchan.msg(proto.MSG_USERINFO_CHANGE_NOTIFY, userinfoRecord(&rec, true, 200, 0, 0, 0, "x", "y")) catch unreachable;
+    c.entry(badchan.stream());
+
+    // 14. #41's repro, now pinned: a 0x02 with bpm = 0 as the *first* message
+    //     on the wire. Used to panic on @divTrunc(srate * bpi * 60, bpm).
+    //     No auth handshake in front of it, which is both the real threat
+    //     model (dispatch does not gate on session state, so the first thing a
+    //     hostile server sends can be this) and the only shape that works
+    //     today: see the note on entry 15.
+    var zerobpm = StreamBuf{};
+    zerobpm.msg(proto.MSG_CONFIG_CHANGE_NOTIFY, &configPayload(0, 8)) catch unreachable;
+    c.entry(zerobpm.stream());
 }
 
 const CorpusBuf = struct {
@@ -467,8 +474,8 @@ fn configPayload(bpm: u16, bpi: u16) [4]u8 {
 /// parser LOOPS over its payload: trailing zeros would parse as more records
 /// and eventually truncate the parse, which changes which handler paths run.
 ///
-/// NOTE: `channel_id` here must stay < 32 — the vendored `onUserinfo` shifts a
-/// u32 mask by this byte unchecked (#26 finding, see the filed issue).
+/// `channel_id` may be any byte: `onUserinfo` rejects >= 32 itself (#40), and
+/// entry 13 above pins that.
 fn userinfoRecord(
     buf: []u8,
     active: bool,
@@ -562,17 +569,21 @@ test "corpus entries are well-formed framed streams" {
 
 // ---- findings ---------------------------------------------------------------------
 // What fuzzing this dispatch path has found so far. Both live in VENDORED code
-// (src/ninjam/ — the file ledger in ISSUES.md gives #26 no edits there), so
-// #26 files them rather than fixing them in place; the fixes ride #29's
-// upstream batch:
+// (src/ninjam/), which the file ledger in ISSUES.md says #26 must not edit, so
+// #26 filed them rather than fixing them in place:
 //
-// 1. onUserinfo (session.zig:991): `@as(u32, 1) << @intCast(rec.channel_id)` —
-//    the channel id is a raw wire byte; >= 32 truncates the cast to the u5
-//    shift amount and panics. FILED: #40.
-// 2. onConfig (session.zig:963): a 0x02 with bpm = 0 (and anything else
-//    changed) reaches `@divTrunc(srate * bpi * 60, bpm)` -> division by zero
-//    panic. FILED: #41.
+// 1. onUserinfo: `@as(u32, 1) << @intCast(rec.channel_id)` — the channel id is a
+//    raw wire byte; >= 32 truncates the cast to the u5 shift amount and panics.
+//    FILED: #40. FIXED: the record is now skipped with a log line, because a
+//    channel outside 0..31 cannot name a bit in a u32 mask. Pinned as entry 13.
+// 2. onConfig: a 0x02 with bpm = 0 (and anything else changed) reaches
+//    `@divTrunc(srate * bpi * 60, bpm)` -> division by zero panic. FILED: #41.
+//    FIXED: bpm and bpi are both validated as non-zero *before* the session's
+//    own copy is written, so a refused config leaves no poisoned state. bpi = 0
+//    never panicked but made every interval zero-length, which turns the run
+//    loop's `produced >= interval_len` into a per-pass finalize — a flood of
+//    empty uploads — so it is refused too. Pinned as entry 14.
 //
-// The corpus above avoids both shapes so `zig build test` stays green. When a
-// fix lands, move the minimal repros from the issues into fillCorpus so the
-// regressions are pinned here forever.
+// The scrubber that used to mask both shapes out of the random stream is gone.
+// New findings here should be filed the same way, and their repros moved into
+// fillCorpus once fixed so the regression is pinned rather than remembered.

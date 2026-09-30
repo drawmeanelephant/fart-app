@@ -985,6 +985,22 @@ pub const Session = struct {
         const cfg = proto.parseConfig(payload) catch {
             return self.failSession("bad config change", .{});
         };
+        // #41: both fields are raw wire values, and a config change is the one
+        // place a client is asked to divide by one of them. bpm = 0 reached
+        // @divTrunc(srate * bpi * 60, bpm) and panicked; bpi = 0 does not panic
+        // but makes every interval zero-length, which turns the run loop's
+        // `produced >= interval_len` into a per-pass finalize — a flood of
+        // empty uploads rather than a crash. Neither is a tempo the client can
+        // honour, so this is the same class as a malformed payload: fail the
+        // session, the same way a parse failure does above.
+        //
+        // Checked BEFORE the assignments below. Bailing out after writing
+        // self.bpm would leave a session that believes it is running at 0 bpm,
+        // which is exactly the state that made the original panic reachable.
+        if (cfg.bpm == 0 or cfg.bpi == 0) {
+            self.log.line("S>C 0x02 CONFIG bpm={d} bpi={d}", .{ cfg.bpm, cfg.bpi });
+            return self.failSession("bad config change: bpm and bpi must both be non-zero", .{});
+        }
         const changed = cfg.bpm != self.bpm or cfg.bpi != self.bpi;
         self.bpm = cfg.bpm;
         self.bpi = cfg.bpi;
@@ -1022,6 +1038,17 @@ pub const Session = struct {
                 rec.username, rec.channel_id, @intFromBool(rec.active), rec.channel_name, rec.flags,
             });
             if (!rec.active) continue;
+            // #40: `channel_id` is a raw wire byte and the shift below needs a
+            // u5, so >= 32 panicked on @intCast. A channel outside 0..31
+            // cannot name a bit in a u32 mask — the reference client's mask is
+            // u32 too, so it has no legitimate meaning and there is nothing to
+            // salvage. Skipping the record (not failing the session) is right:
+            // one nonsense record from a quirky server should not tear down a
+            // live performance, and the rest of the message is still good.
+            if (rec.channel_id >= 32) {
+                self.log.line("  ignoring userinfo record: channel {d} is out of range 0..31", .{rec.channel_id});
+                continue;
+            }
             const u = self.findOrAddUser(rec.username) orelse continue;
             const bit = @as(u32, 1) << @intCast(rec.channel_id);
             if (u.mask & bit == 0) {
@@ -1338,6 +1365,155 @@ test "kujamba: a re-anchored interval keeps the id of the slot it re-uses" {
     const name_after = try kujamba_out.payloadDumpName(alloc, "dump", s.index.seq);
     defer alloc.free(name_after);
     try std.testing.expectEqualStrings(name, name_after);
+}
+
+// ---- #40 / #41: hostile server values must not panic the client -------------
+// Both found by the #26 fuzz harness. The tests drive the real wire bytes
+// through `dispatch`, not the handler directly, so they keep guarding the
+// path an actual server message takes.
+
+test "a userinfo record with channel_id >= 32 is skipped, not shifted (#40)" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var phrase = [_]f32{ 0.1, 0.2, 0.3, 0.4 };
+    var bank = try onePhraseBank(std.testing.allocator, &phrase);
+    defer bank.deinit();
+    var fill = kujamba_out.Fill{ .mode = .repeat };
+    fill.bind(.repeat, bank.active());
+    const pattern = try kujamba_out.parsePattern("1");
+    var adapter = kujamba_out.PlanAdapter{ .pattern = &pattern, .bank = &bank };
+
+    var s = try Session.init(alloc, io, .{
+        .srate = @intCast(kujamba_out.sample_rate),
+        .channel_names = &.{"kujamba"},
+        .source = .{ .kujamba = &fill },
+        .id_seed = 42,
+        .plan = .{ .ctx = @ptrCast(&adapter), .selectFor = kujamba_out.PlanAdapter.selectForFn },
+    });
+    defer s.deinit();
+    s.log.quiet = true;
+
+    // channel 200 is the repro byte from #40. It cannot name a bit in a u32
+    // mask, and the shift used to panic on the @intCast to u5.
+    var f = Fixed{};
+    try proto.buildUserinfoRecord(.{
+        .active = true,
+        .channel_id = 200,
+        .volume = 0,
+        .pan = 0,
+        .flags = 0,
+        .username = "x",
+        .channel_name = "y",
+    }, &f);
+    // The record itself: the session survives, and does NOT tear down. One
+    // nonsense channel from a quirky server should not end a live performance.
+    try s.dispatch(.{ .mtype = proto.MSG_USERINFO_CHANGE_NOTIFY, .payload = f.slice() });
+    try std.testing.expect(s.state != .done);
+
+    // Nothing was subscribed, no user was conjured into existence for a record
+    // we declined to act on, and -- the part a crash-only test would miss --
+    // no auto-subscribe went out on the wire. `msgs_sent` is the honest witness
+    // that we skipped the record rather than half-handling it.
+    for (s.users) |u| try std.testing.expectEqual(@as(usize, 0), u.name_len);
+    for (s.users) |u| try std.testing.expectEqual(@as(u32, 0), u.mask);
+    try std.testing.expectEqual(@as(u64, 0), s.stats.msgs_sent);
+
+    // Seam, not covered here: that a *well-formed* record arriving after this
+    // one is still honoured. The auto-subscribe path calls send(), which
+    // unwraps a socket this test does not have, so it is unreachable without
+    // one -- the same seam #12 documented for the --intervals cap. #24, which
+    // needs a socket anyway, should cover it end to end.
+}
+
+test "a config change with bpm=0 or bpi=0 is refused, not divided by (#41)" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var phrase = [_]f32{ 0.1, 0.2, 0.3, 0.4 };
+    var bank = try onePhraseBank(std.testing.allocator, &phrase);
+    defer bank.deinit();
+    var fill = kujamba_out.Fill{ .mode = .repeat };
+    fill.bind(.repeat, bank.active());
+    const pattern = try kujamba_out.parsePattern("1");
+    var adapter = kujamba_out.PlanAdapter{ .pattern = &pattern, .bank = &bank };
+
+    var s = try Session.init(alloc, io, .{
+        .srate = @intCast(kujamba_out.sample_rate),
+        .channel_names = &.{"kujamba"},
+        .source = .{ .kujamba = &fill },
+        .id_seed = 42,
+        .plan = .{ .ctx = @ptrCast(&adapter), .selectFor = kujamba_out.PlanAdapter.selectForFn },
+    });
+    defer s.deinit();
+    s.log.quiet = true;
+
+    // A real geometry first, so "refused" is observable as "unchanged" rather
+    // than as "never happened".
+    var good = Fixed{};
+    try proto.buildConfig(.{ .bpm = 120, .bpi = 4 }, &good);
+    try s.dispatch(.{ .mtype = proto.MSG_CONFIG_CHANGE_NOTIFY, .payload = good.slice() });
+    const good_len = s.interval_len_samples;
+    try std.testing.expect(good_len > 0);
+
+    // bpm = 0 reached @divTrunc(srate * bpi * 60, bpm) and panicked. bpi is
+    // changed from the current value because `changed` gates the re-anchor.
+    var zero_bpm = Fixed{};
+    try proto.buildConfig(.{ .bpm = 0, .bpi = 8 }, &zero_bpm);
+    try std.testing.expectError(
+        error.SessionFailed,
+        s.dispatch(.{ .mtype = proto.MSG_CONFIG_CHANGE_NOTIFY, .payload = zero_bpm.slice() }),
+    );
+    // The tempo the client was actually running is intact: the check has to
+    // happen BEFORE self.bpm is assigned, or a bailed-out session is left
+    // believing it is running at 0 bpm -- the state that made the panic
+    // reachable in the first place.
+    try std.testing.expectEqual(@as(u16, 120), s.bpm);
+    try std.testing.expectEqual(@as(u16, 4), s.bpi);
+    try std.testing.expectEqual(good_len, s.interval_len_samples);
+    try std.testing.expectEqual(s.state, .done);
+}
+
+test "a config change with bpi=0 is refused: a zero-length interval is nonsense (#41)" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var phrase = [_]f32{ 0.1, 0.2, 0.3, 0.4 };
+    var bank = try onePhraseBank(std.testing.allocator, &phrase);
+    defer bank.deinit();
+    var fill = kujamba_out.Fill{ .mode = .repeat };
+    fill.bind(.repeat, bank.active());
+    const pattern = try kujamba_out.parsePattern("1");
+    var adapter = kujamba_out.PlanAdapter{ .pattern = &pattern, .bank = &bank };
+
+    var s = try Session.init(alloc, io, .{
+        .srate = @intCast(kujamba_out.sample_rate),
+        .channel_names = &.{"kujamba"},
+        .source = .{ .kujamba = &fill },
+        .id_seed = 42,
+        .plan = .{ .ctx = @ptrCast(&adapter), .selectFor = kujamba_out.PlanAdapter.selectForFn },
+    });
+    defer s.deinit();
+    s.log.quiet = true;
+
+    // bpi = 0 does not panic -- advanceAudio early-returns on a zero interval
+    // -- but it makes every interval zero-length, which turns the run loop's
+    // `produced >= interval_len` into a per-pass finalize: a flood of empty
+    // uploads instead of a crash. Just as unhonourable as bpm = 0.
+    var zero_bpi = Fixed{};
+    try proto.buildConfig(.{ .bpm = 100, .bpi = 0 }, &zero_bpi);
+    try std.testing.expectError(
+        error.SessionFailed,
+        s.dispatch(.{ .mtype = proto.MSG_CONFIG_CHANGE_NOTIFY, .payload = zero_bpi.slice() }),
+    );
+    try std.testing.expect(s.interval_len_samples == 0 or s.bpi == 0);
+    try std.testing.expectEqual(s.state, .done);
 }
 
 test "synthetic sources keep an independent phase per channel" {
