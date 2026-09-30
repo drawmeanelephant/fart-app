@@ -208,6 +208,19 @@ and landing Linux first.
 
 ---
 
+- **`accept()` does not inherit `O_NONBLOCK`, and on Linux it visibly does not.**
+  Caught by CI, not by reading: the M5 timing harness set the *listener*
+  non-blocking and assumed the accepted socket came that way. It did not. The
+  server thread parked in `read` waiting for data that could not arrive — it
+  was waiting to send the auth reply, which was queued behind its own reader —
+  so the session timed out with `bars=0` and nothing else to go on. Two fixes
+  worth carrying forward: set the flag on the accepted fd, and **assert that a
+  session went live before asserting anything it produced**, so the next
+  platform difference fails naming its cause instead of three assertions later.
+  `proto_fuzz.zig` had been relying on the same false assumption and only got
+  away with it because a blocking read still returns when the client writes or
+  hangs up — it worked by luck, and its comment asserted something untrue.
+
 ## Mutation testing
 
 `./mutate.sh` breaks one guard at a time and reports which tests went red. It

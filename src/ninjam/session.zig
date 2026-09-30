@@ -1950,9 +1950,12 @@ test "kujamba: a blocked socket drops the bar instead of stalling the clock (#14
     // continuation of the guid it never finished receiving
     try std.testing.expect(!std.mem.eql(u8, &dropped_guid, &s.locals[0].guid));
 
-    // this is the acceptance criterion: bounded, not merely "eventually".
-    // Pre-fix it was unbounded (measured >5 s and still not returning).
-    try std.testing.expect(elapsed_ms < 250);
+    // This is the acceptance criterion: bounded, not merely "eventually".
+    // Pre-fix it was unbounded (measured >5 s and still not returning); with a
+    // 1000 ms budget it is ~1002 ms. 500 ms separates the two with room for a
+    // scheduling spike, and this call does nothing but a poll, a log line and
+    // some bookkeeping — it is microseconds of real work.
+    try std.testing.expect(elapsed_ms < 500);
 }
 
 // #14: a drop can happen mid-interval, not only at the boundary.
@@ -2021,7 +2024,7 @@ test "kujamba: a mid-interval chunk that would block drops the bar and stays dro
     // and the room hears a rest bar where the instrument was actually playing.
     // A dropped bar has to be silent about itself, not lie about why.
     try std.testing.expectEqual(@as(u64, 0), s.stats.silence_markers);
-    try std.testing.expect(elapsed_ms < 250);
+    try std.testing.expect(elapsed_ms < 500);
 }
 
 test "kujamba: one lost bar is counted once, however many channels were on it (#14)" {

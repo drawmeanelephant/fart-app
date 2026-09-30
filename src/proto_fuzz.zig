@@ -229,6 +229,21 @@ fn fakeServer(listener: *Listener, stream: []const u8) void {
     };
     defer _ = std.posix.errno(std.posix.system.close(cfd));
 
+    // Set O_NONBLOCK on the ACCEPTED socket explicitly, rather than relying on
+    // it coming from the listener. POSIX does not make `accept` inherit the
+    // listener's status flags and on Linux it demonstrably does not — a harness
+    // that assumed otherwise (src/kujamba_timing.zig, first cut) had a blocking
+    // accepted socket, parked its reader forever, and deadlocked its own
+    // handshake. That harness *had* to notice, because it stops reading and
+    // starts again; this one has not, because a blocking read still returns as
+    // soon as the client writes or hangs up. So it works by luck and the
+    // comment below used to assert something false.
+    {
+        var o: std.c.O = @bitCast(@as(u32, @intCast(std.c.fcntl(cfd, std.c.F.GETFL, @as(c_int, 0)))));
+        o.NONBLOCK = true;
+        _ = std.c.fcntl(cfd, std.c.F.SETFL, @as(c_int, @bitCast(o)));
+    }
+
     // Abort the connection on close (RST instead of FIN): the server sends the
     // first FIN, so a clean close would park this port in TIME_WAIT for ~15-30s
     // — a long fuzz run exhausts the ephemeral range and every later connect
@@ -257,14 +272,14 @@ fn fakeServer(listener: *Listener, stream: []const u8) void {
     var idle_polls: u32 = 0;
     while (true) {
         const n = std.posix.read(cfd, &scratch) catch |e| switch (e) {
-            // The accepted socket is non-blocking, so a read before the client
-            // has said anything returns WouldBlock. That is "not yet", not
-            // "gone": returning here closed the connection the instant the
-            // stream was written, which -- combined with the abort-on-close
-            // above -- reset the client before it could send its 0x80 reply.
-            // Every live-path corpus entry was therefore a silent no-op: the
-            // session died inside the challenge handler, and runDispatchStep's
-            // `catch {}` reported that as a pass.
+            // The accepted socket is non-blocking (set explicitly above), so a
+            // read before the client has said anything returns WouldBlock. That
+            // is "not yet", not "gone": returning here closed the connection the
+            // instant the stream was written, which -- combined with the
+            // abort-on-close above -- reset the client before it could send its
+            // 0x80 reply. Every live-path corpus entry was therefore a silent
+            // no-op: the session died inside the challenge handler, and
+            // runDispatchStep's `catch {}` reported that as a pass.
             error.WouldBlock => {
                 var fds = [_]std.posix.pollfd{.{ .fd = cfd, .events = std.posix.POLL.IN, .revents = 0 }};
                 _ = std.posix.poll(&fds, 1) catch return;
