@@ -530,27 +530,35 @@ test "#14: a half-full socket declines the frame with zero bytes on the wire" {
     }
     var conn = net.Conn{ .io = io, .fd = fds[0] };
 
-    // Fill it to exactly half. This is the state the bug needs and the one no
-    // other test here reaches: the buffer has room in it, so POLLOUT is set, so
-    // the cheap gate says yes — and yet a 16 KiB frame cannot fit.
+    // Saturate, then hand back a fixed slice. This is the state the bug needs
+    // and the one no other test here reaches: the buffer has room in it, so
+    // POLLOUT is set, so the cheap gate says yes — and yet a 16 KiB frame cannot
+    // fit.
+    //
+    // The sizes are chosen to work on both platforms without knowing either
+    // one's accounting, which took three attempts. A socketpair's SO_SNDBUF is
+    // reported exactly on Darwin (8192) and **doubled** on Linux (16384), so a
+    // half-full buffer is 4096 free there and 8192 here — both comfortably under
+    // a 16372-byte frame, which is the only thing the test needs. Filling to
+    // *exactly half the requested size* instead was the version that failed on
+    // Linux, because a socket with 4096 free out of 16384 does not report
+    // itself writable the way one with 4096 free out of 8192 does.
     var junk: [4096]u8 = undefined;
     @memset(&junk, 0xA5);
-    const queued: usize = blk: {
-        const n = std.posix.system.write(fds[0], &junk, junk.len);
-        if (std.posix.errno(n) != .SUCCESS) return error.WriteFailed;
-        break :blk @intCast(n);
-    };
-    try std.testing.expectEqual(junk.len, queued);
+    const absorbed = fillUntilBlocked(fds[0], &junk);
+    var sink: [65536]u8 = undefined;
+    const drained = drainSocket(fds[1], sink[0..4096]);
+    try std.testing.expect(drained > 0);
     try std.testing.expect(conn.writable()); // the liar: there IS room, just not enough
 
     var payload: [16367]u8 = undefined;
     @memset(&payload, 0x5A);
     const room = conn.sendRoom().?;
     std.debug.print(
-        \\  #14 half-full  {d} of an 8 KiB buffer queued, {d} free, {d}-byte frame
+        \\  #14 half-full  {d} of {d} bytes queued, {d} reported free, {d}-byte frame
         \\
-    , .{ queued, room, payload.len + 5 });
-    try std.testing.expect(room >= 4096); // genuinely half empty
+    , .{ absorbed - drained, absorbed, room, payload.len + 5 });
+    try std.testing.expect(room > 0);
     try std.testing.expect(room < 5 + payload.len);
 
     const outcome = try conn.sendMessageBounded(proto.MSG_UPLOAD_INTERVAL_WRITE, &payload, session.upload_write_budget_ms);
@@ -560,15 +568,26 @@ test "#14: a half-full socket declines the frame with zero bytes on the wire" {
     // The assertion that was missing: not one byte of that frame crossed the
     // wire. A lone header is already enough to do the damage, because the peer
     // will believe the 16 KiB that follows it.
-    var sink: [65536]u8 = undefined;
-    var seen: usize = 0;
-    while (true) {
-        const n = std.posix.read(fds[1], &sink) catch break;
+    //
+    // Counted against the junk rather than a fixed number: everything the
+    // harness wrote, and nothing else, may be read back.
+    var seen: usize = drained;
+    var stalls: u32 = 0;
+    while (seen < absorbed and stalls < 2000) {
+        const n = std.posix.read(fds[1], sink[0..]) catch |e| switch (e) {
+            error.WouldBlock => {
+                stalls += 1;
+                _ = sleepMs(1);
+                continue;
+            },
+            else => break,
+        };
         if (n == 0) break;
         seen += n;
+        stalls = 0;
     }
-    std.debug.print("  peer received {d} bytes; the harness wrote {d}, so the frame contributed {d}\n", .{ seen, queued, seen -| queued });
-    try std.testing.expectEqual(queued, seen);
+    std.debug.print("  peer received {d} bytes; the harness wrote {d}, so the frame contributed {d}\n", .{ seen, absorbed, seen -| absorbed });
+    try std.testing.expectEqual(absorbed, seen);
 }
 
 // #14: the same claim end to end, on the socket the session actually uses, and
@@ -632,12 +651,16 @@ test "#14: a refused frame leaves the peer's byte stream still frame-aligned" {
     defer std.testing.allocator.free(sink);
     var seen: usize = 0;
     var stalls: u32 = 0;
-    while (seen < sink.len - head_len and stalls < 500) {
+    // Read until the peer has everything the sender wrote — exactly `queued`
+    // bytes, because the frame contributed none. A fixed stall budget is the
+    // wrong stopping rule: on a loaded runner the backlog can sit unsent for
+    // longer than any budget you pick, and stopping early truncates the stream
+    // mid-frame and reports a torn frame that never happened. Knowing the
+    // expected total removes the question.
+    while (head_len + seen < queued and head_len + seen < sink.len and stalls < 2000) {
         const n = std.posix.read(fds[1], sink[head_len + seen ..]) catch |e| switch (e) {
             // Not "no more data", just "not right now": the sender still has
-            // bytes in flight and will hand them over as ACKs come back. Stopping
-            // here would truncate the stream mid-frame and manufacture exactly
-            // the desynchronisation this test is looking for.
+            // bytes in flight and will hand them over as ACKs come back.
             error.WouldBlock => {
                 stalls += 1;
                 _ = sleepMs(1);
@@ -652,6 +675,7 @@ test "#14: a refused frame leaves the peer's byte stream still frame-aligned" {
     std.mem.copyForwards(u8, sink[head_len .. head_len + seen], sink[0..seen]);
     @memcpy(sink[0..head_len], head[0..head_len]);
     const total = head_len + seen;
+    try std.testing.expectEqual(queued, total); // the frame contributed nothing
 
     var off: usize = 0;
     var frames: usize = 0;
