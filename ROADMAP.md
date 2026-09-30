@@ -15,8 +15,8 @@ own.
 
 > **Build order lives in [ISSUES.md](ISSUES.md)** — which issues block
 > which, the recommended sequencing, and the vendored-file ledger. Short version:
-> **#12, #17, #18, #19, #22 are landed**; next start with **#10, #27**. #11 (the one-time
-> plan-hook reshape that unblocks #8 and #9) has landed too. Everything else is downstream.
+> **#8, #9, #10, #11, #12, #17, #18, #19, #22, #25, #26 are landed**; next start with **#27**.
+> Everything else is downstream.
 > The `blocked-by` edges are encoded on the issues themselves. Tracked as
 > [#31](https://github.com/drawmeanelephant/fart-app/issues/31).
 
@@ -41,11 +41,19 @@ real instrument is **control while it runs**.
       gives us a per-bar decision point). **Do this first** — widen the hook to
       carry *which phrase* and *which mode*, not just broadcast-or-not, or the
       next two both reshape it.
-- [ ] **Per-phrase render caching.** (#10) Rendering a phrase is cheap but do it once
-      per phrase up front so live switching is instant and deterministic.
-- [ ] **Phrase bank + live selection.** (#8) `--phrases FILE` loads many phrases;
-      `!kujamba <n>` in room chat selects the next one (the client already
-      receives `0xC0` chat — parse it and act on it). Blocked by #10 and #11.
+- [x] **Per-phrase render caching.** (#10) ✅ **Landed**, folded into #8's bank:
+      every phrase is synthesized once at load and never again, and each entry
+      owns its own `loop`/`once` cursor, so switching back resumes rather than
+      restarts. The whole bank stays resident, so it is budgeted by rendered
+      audio (64 MiB, ~6 min) rather than by file size — see ISSUES.md.
+- [x] **Phrase bank + live selection.** (#8) ✅ **Landed** as `--phrases FILE`
+      plus `!kujamba <n|name>` in room chat. The selector resolves when it is
+      typed and is applied at the next bar boundary, reusing #11's
+      once-per-interval hook, so a switch can never splice a phrase mid-bar. A
+      selector that names nothing is counted (`phrase_rejected` in `RESULT`) and
+      leaves the audio alone rather than dropping a bar. `name == phrase text`,
+      so `<n>` and `<name>` are the same vocabulary. Mutually exclusive with
+      `--phrase`, which is the same code path with a bank of one.
 - [x] **Chat-driven transport.** (#9) ✅ **Landed.** `!kujamba play|rest|loop|repeat|once|stop`
       lets a bandleader shape the performance from the room without restarting
       the process. Blocked by #11.
@@ -140,7 +148,7 @@ real instrument is **control while it runs**.
 
 ## Testing status (this pass)
 
-- Unit suites: **102/102 pass** (`zig build test`) — audit + synth + **golden
+- Unit suites: **148/148 pass** (`zig build test`) — audit + synth + **golden
   fingerprints** + kujamba glue + the vendored NINJAM modules, in five targets.
   Synth tests are fail-against-silence enforced. Also green under
   `-Doptimize=ReleaseSafe`, which is the mode the demo builds in.
