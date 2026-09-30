@@ -21,8 +21,13 @@
 //!     attack = 1.0                  # 1 on every axis is the stock sound
 //!     noise  = 0.5
 //!     wobble = 2
+//!     [map]                         # the #21 sampler: note -> sound
+//!     note60 = "kujamba karibu"     # a phrase (quotes required for spaces)
+//!     note64 = shuzi:3              # a single wordless fart by seed
 //!
 //! `[voice] attack = x` and a dotted `voice.attack = x` are the same thing.
+//! In `[map]`, `noteN = sound` (N in 0..127) binds MIDI note N to a phrase or
+//! a `shuzi:<seed>`; `kujamba trigger` reads this table.
 //! Values are double-quoted literals (no escape sequences) or bare scalars up
 //! to a `#` comment. Every value is validated HERE with the same parsers the
 //! flags use, so a bad file fails at load time with a `file:line: message`
@@ -105,6 +110,17 @@ pub const Config = struct {
     /// the [voice] table: axes the file leaves alone stay at 1 (the identity),
     /// so applying it keeps the stock sound everywhere the file is silent
     knobs: synth.VoiceKnobs = .{},
+    /// the [map] table (#21): note -> sound for `kujamba trigger`. Slots the
+    /// file leaves alone stay `.none`. Phrase slices point into the file text.
+    map: [128]NoteSound = [_]NoteSound{.none} ** 128,
+};
+
+/// One [map] binding: MIDI note N plays a wordless shuzi by seed, or a whole
+/// phrase (owned by the config text's allocator).
+pub const NoteSound = union(enum) {
+    none,
+    shuzi: u64,
+    phrase: []const u8,
 };
 
 pub const ParseError = error{
@@ -128,6 +144,8 @@ pub const ParseError = error{
     BadHost,
     /// `pattern` does not parse as N or N+M
     BadPattern,
+    /// a [map] value is neither a phrase nor shuzi:<u64>
+    BadMapValue,
     /// a [voice] value is not a finite non-negative number
     BadVoiceValue,
 };
@@ -170,7 +188,10 @@ pub fn parse(text_in: []const u8, diag: *Diag) ParseError!Config {
     var cfg = Config{};
 
     var in_voice = false;
+    var in_map = false;
     var seen_voice = false;
+    var seen_map = false;
+    var seen_notes: [128]bool = [_]bool{false} ** 128;
     var seen_host = false;
     var seen_user = false;
     var seen_pass = false;
@@ -194,13 +215,23 @@ pub fn parse(text_in: []const u8, diag: *Diag) ParseError!Config {
             if (tail.len > 0 and tail[0] != '#')
                 return diag.fail(line_no, error.BadSectionHeader, "unexpected text after ']' (want a comment)", .{});
             const name = std.mem.trim(u8, t[1..close], " \t");
-            if (!std.mem.eql(u8, name, "voice"))
-                return diag.fail(line_no, error.UnknownKey, "unknown section '[{s}]' (want [voice])", .{name});
-            if (seen_voice)
-                return diag.fail(line_no, error.DuplicateSection, "'[voice]' appears twice", .{});
-            seen_voice = true;
-            in_voice = true;
-            continue;
+            if (std.mem.eql(u8, name, "voice")) {
+                if (seen_voice)
+                    return diag.fail(line_no, error.DuplicateSection, "'[voice]' appears twice", .{});
+                seen_voice = true;
+                in_voice = true;
+                in_map = false;
+                continue;
+            }
+            if (std.mem.eql(u8, name, "map")) {
+                if (seen_map)
+                    return diag.fail(line_no, error.DuplicateSection, "'[map]' appears twice", .{});
+                seen_map = true;
+                in_map = true;
+                in_voice = false;
+                continue;
+            }
+            return diag.fail(line_no, error.UnknownKey, "unknown section '[{s}]' (want [voice] or [map])", .{name});
         }
 
         const eq = std.mem.indexOfScalar(u8, t, '=') orelse
@@ -216,6 +247,25 @@ pub fn parse(text_in: []const u8, diag: *Diag) ParseError!Config {
 
         if (in_voice) {
             try setKnob(&cfg, key, value, line_no, &seen_knobs, diag);
+            continue;
+        }
+        if (in_map) {
+            if (!std.mem.startsWith(u8, key, "note") or key.len == 4)
+                return diag.fail(line_no, error.UnknownKey, "unknown key '{s}' (want noteN, N in 0..127)", .{key});
+            const note = std.fmt.parseInt(u8, key[4..], 10) catch
+                return diag.fail(line_no, error.UnknownKey, "unknown key '{s}' (note number must be 0..127)", .{key});
+            if (note > 127)
+                return diag.fail(line_no, error.UnknownKey, "unknown key '{s}' (note number must be 0..127)", .{key});
+            if (seen_notes[note])
+                return diag.fail(line_no, error.DuplicateKey, "note{d} appears twice", .{note});
+            seen_notes[note] = true;
+            if (std.mem.startsWith(u8, value, "shuzi:")) {
+                const seed_text = value["shuzi:".len..];
+                cfg.map[note] = .{ .shuzi = std.fmt.parseInt(u64, seed_text, 10) catch
+                    return diag.fail(line_no, error.BadMapValue, "bad shuzi seed '{s}' (want shuzi:<u64>)", .{seed_text}) };
+            } else {
+                cfg.map[note] = .{ .phrase = value };
+            }
             continue;
         }
         if (std.mem.eql(u8, key, "host")) {
@@ -477,4 +527,51 @@ test "splitHostPort matches the --host flag semantics" {
     try testing.expectError(error.BadPort, splitHostPort("example.com:notaport", &host));
     try testing.expectError(error.BadPort, splitHostPort("example.com:99999", &host));
     try testing.expectError(error.Ipv6NeedsBrackets, splitHostPort("::1:20531", &host));
+}
+
+test "[map] binds notes to phrases and shuzi seeds" {
+    const cfg = parseOk(
+        \\phrase = "kujamba karibu"
+        \\[map]
+        \\note60 = "kujamba karibu"
+        \\note61 = shuzi:3
+        \\note0 = bare-phrase
+    );
+    try testing.expectEqualStrings("kujamba karibu", cfg.map[60].phrase);
+    try testing.expectEqual(@as(u64, 3), cfg.map[61].shuzi);
+    try testing.expectEqualStrings("bare-phrase", cfg.map[0].phrase);
+    try testing.expect(cfg.map[62] == .none);
+}
+
+test "[map] rejects unknown keys, bad notes, duplicates and bad seeds" {
+    try expectParseError(error.UnknownKey,
+        \\[map]
+        \\note = "x"
+    , 2, "want noteN");
+    try expectParseError(error.UnknownKey,
+        \\[map]
+        \\note999 = "x"
+    , 2, "0..127");
+    try expectParseError(error.DuplicateKey,
+        \\[map]
+        \\note60 = "x"
+        \\note60 = "y"
+    , 3, "note60 appears twice");
+    try expectParseError(error.BadMapValue,
+        \\[map]
+        \\note60 = shuzi:abc
+    , 2, "bad shuzi seed");
+}
+
+test "[map] coexists with [voice] and keeps sections separate" {
+    const cfg = parseOk(
+        \\[voice]
+        \\attack = 0.5
+        \\[map]
+        \\note60 = shuzi:1
+        \\note61 = "habari yako"
+    );
+    try testing.expect(cfg.map[60] == .shuzi);
+    try testing.expectEqual(@as(f64, 0.5) * 0 + cfg.knobs.attack, cfg.knobs.attack);
+    try testing.expect(cfg.map[61] == .phrase);
 }

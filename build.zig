@@ -4,6 +4,14 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // #20: the Phase-B live audio path (vendored miniaudio + the zc_* shim).
+    // Defaults on for macOS (CoreAudio) and off everywhere else, so the Linux
+    // build stays ALSA-free unless the flag asks for it.
+    const live = b.option(bool, "live", "Phase B live audio via miniaudio (default: on when targeting macOS)") orelse
+        (target.result.os.tag == .macos);
+    const live_option = b.addOptions();
+    live_option.addOption(bool, "live", live);
+
     // -------------------------------------------------------------------------
     // fart: the app itself
     // -------------------------------------------------------------------------
@@ -54,7 +62,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    kujambaDeps(b, kujamba_exe.root_module);
+    kujambaDeps(b, kujamba_exe.root_module, live, live_option);
     b.installArtifact(kujamba_exe);
 
     const run_kujamba = b.addRunArtifact(kujamba_exe);
@@ -110,7 +118,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    kujambaDeps(b, kujamba_tests.root_module);
+    kujambaDeps(b, kujamba_tests.root_module, live, live_option);
     const run_kujamba_tests = b.addRunArtifact(kujamba_tests);
     test_step.dependOn(&run_kujamba_tests.step);
 
@@ -126,6 +134,10 @@ pub fn build(b: *std.Build) void {
     fart_tests.root_module.link_libc = true;
     const run_fart_tests = b.addRunArtifact(fart_tests);
     test_step.dependOn(&run_fart_tests.step);
+
+    // #20: report the live-audio build state (same idea as zclient's step).
+    const live_step = b.step("live", "Report live-audio build state");
+    live_step.dependOn(&live_option.step);
 }
 
 // ---------------------------------------------------------------------------
@@ -133,18 +145,36 @@ pub fn build(b: *std.Build) void {
 // ---------------------------------------------------------------------------
 
 /// libogg + libvorbis (encode) + stb_vorbis (decode), compiled exactly like
-/// zclient's build does. No miniaudio: the instrument is headless (no mic, no
-/// speaker), so the Phase-B live path stays compiled out (`live = false`).
-fn kujambaDeps(b: *std.Build, mod: *std.Build.Module) void {
+/// zclient's build does. miniaudio (the Phase-B live device, #20) compiles in
+/// only when `live` is on: the default for macOS builds, `-Dlive` elsewhere.
+fn kujambaDeps(b: *std.Build, mod: *std.Build.Module, live: bool, live_option: *std.Build.Step.Options) void {
     mod.link_libc = true;
     mod.addIncludePath(b.path("vendor"));
     mod.addIncludePath(b.path("vendor/libogg/include"));
     mod.addIncludePath(b.path("vendor/libvorbis/include"));
     mod.addIncludePath(b.path("vendor/libvorbis/lib"));
     mod.addCSourceFiles(.{ .root = b.path("vendor"), .files = &kujamba_c_sources, .flags = &kujamba_c_flags });
-    const opts = b.addOptions();
-    opts.addOption(bool, "live", false);
-    mod.addOptions("build_options", opts);
+    if (live) {
+        // miniaudio.h is 4 MB of macro soup and does not survive translate-c,
+        // so it compiles in exactly one C TU behind the zc_* shim.
+        const miniaudio_sources = [_][]const u8{"miniaudio_impl.c"};
+        mod.addCSourceFiles(.{ .root = b.path("vendor"), .files = &miniaudio_sources, .flags = &kujamba_c_flags });
+        switch (mod.resolved_target.?.result.os.tag) {
+            .macos => {
+                // Apple frameworks miniaudio's CoreAudio backend needs.
+                const frameworks = [_][]const u8{ "CoreAudio", "AudioToolbox", "AudioUnit", "CoreFoundation", "CoreServices" };
+                for (frameworks) |fw| mod.linkFramework(fw, .{});
+            },
+            .linux => {
+                mod.linkSystemLibrary("asound", .{});
+                mod.linkSystemLibrary("pthread", .{});
+                mod.linkSystemLibrary("dl", .{});
+                mod.linkSystemLibrary("m", .{});
+            },
+            else => {},
+        }
+    }
+    mod.addOptions("build_options", live_option);
 }
 
 const kujamba_c_flags = [_][]const u8{
