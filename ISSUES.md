@@ -227,7 +227,7 @@ and landing Linux first.
 `./mutate.sh` breaks one guard at a time and reports which tests went red. It
 exists because **a test that passes whether or not the guard is present is worse
 than no test** — it reads as coverage and is not — and because "I wrote a test
-for it" is not evidence that the test *bites*. All nineteen mutations are
+for it" is not evidence that the test *bites*. All twenty mutations are
 caught. It reports four outcomes
 (`CAUGHT` / `SURVIVED` / `NO-OP` / `BUILD ERROR`), restores every file
 afterwards, and ends with a clean `zig build test` so the evidence ends where it
@@ -479,6 +479,30 @@ to remove the thing it claims to break.
   from a Mac, catches it in about a minute, and is now part of how this was
   checked. Worth more than it sounds: the alternative is another round trip
   through a 10-minute CI job.
+- **A test can be correct on the machine that wrote it and wrong everywhere
+  else, and the fix is to make the divergence impossible rather than to patch
+  each platform.** The frame-alignment test takes three attempts to get right on
+  two platforms, and every failure was a platform assumption rather than a code
+  bug:
+  - `fillUntilBlocked` stops on a *short* write, so the junk stream was whole
+    frames followed by a remainder, and the parser reported a tail — of the
+    test's own making. It now accounts for the remainder exactly.
+  - `writable()` was asserted to prove "the cheap gate lies here". POLLOUT is a
+    coarse signal and how coarse is the kernel's business: Linux will not
+    report a socket with 4096 bytes free out of 16384 as writable, macOS will.
+    Printed, not asserted; the property is stated in bytes.
+  - The helper drained the peer a byte at a time and checked the room *first*,
+    so it consumed nothing on a platform where one byte of room appears at once
+    and a few bytes on one where it does not. A leftover `copyForwards` was then
+    a harmless self-copy on macOS and a clobber on Linux, and the test read a
+    length of `0x01010000` out of the middle of the stream on one platform while
+    passing on the other. Draining first makes the count non-zero everywhere.
+  - `SO_SNDBUF` is exact on a Darwin socketpair and **doubled** on a Linux one,
+    so "half the requested size" is a different buffer on each.
+  The general lesson: a test whose correctness depends on a *kernel's* opinion
+  is a test with a per-platform failure mode, and the fix is to assert the
+  property you care about in units you control. `mutate.sh` entry 20 exists so
+  the last of these cannot come back silently.
 - **A test can manufacture the desynchronisation it is looking for.** The first
   version of the frame-alignment test failed intermittently with a 1–4 byte tail,
   for a reason that had nothing to do with the code: the helper that drives the

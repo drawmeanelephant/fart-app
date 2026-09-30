@@ -192,7 +192,7 @@ real instrument is **control while it runs**.
   harness, in five targets. Synth tests are fail-against-silence enforced. Also
   green under `-Doptimize=ReleaseSafe`, which is the mode the demo builds in,
   and under `-Dlive=false`.
-- **Mutation testing** (`./mutate.sh`): **19 mutations, 19 caught, zero
+- **Mutation testing** (`./mutate.sh`): **20 mutations, 20 caught, zero
   survivors**, ending reverted-and-green. A guard with no test that bites it is
   worse than no guard, because it reads as coverage. The two guards added for
   the frame-atomicity fix are both covered: deleting the frame-fit check is

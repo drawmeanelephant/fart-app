@@ -631,9 +631,9 @@ test "#14: a refused frame leaves the peer's byte stream still frame-aligned" {
     const room = waitForPartialRoom(&conn, fds[1], 5 + payload.len, &frame, &queued, head, &head_len);
     const outcome = try conn.sendMessageBounded(proto.MSG_UPLOAD_INTERVAL_WRITE, &payload, session.upload_write_budget_ms);
     std.debug.print(
-        \\  #14 aligned  {d} junk frames queued, {d} free, {d}-byte frame -> {any}
+        \\  #14 aligned  {d} junk frames queued, {d} free, {d} helper bytes, {d}-byte frame -> {any}
         \\
-    , .{ queued / frame.len, room, payload.len + 5, outcome });
+    , .{ queued / frame.len, room, head_len, payload.len + 5, outcome });
     // The one outcome that is not allowed. `.declined` and `.sent` are both
     // safe; only a torn frame desynchronises the peer.
     try std.testing.expect(outcome != .partial);
@@ -671,7 +671,16 @@ test "#14: a refused frame leaves the peer's byte stream still frame-aligned" {
         seen += n;
         stalls = 0;
     }
-    std.mem.copyForwards(u8, sink[head_len .. head_len + seen], sink[0..seen]);
+    // The two buffers are one stream, and they are already in place: the read
+    // above landed at `head_len + seen` precisely so that the helper's bytes go
+    // back in front without moving anything. There used to be a `copyForwards`
+    // here to do that, left over from when the read started at `seen` — and it
+    // was not a no-op, it overwrote the freshly-read bytes with the first `seen`
+    // bytes of the same buffer. macOS hid it because `head_len` is 0 there, so
+    // the copy became a self-copy; on Linux the helper drains a byte or two
+    // before the room appears, and the parser then read a length of 0x01010000
+    // out of the middle of the stream. Two platforms, one copy-paste, and only
+    // the one with a non-zero `head_len` could see it.
     @memcpy(sink[0..head_len], head[0..head_len]);
     const total = head_len + seen;
     try std.testing.expectEqual(queued, total); // the frame contributed nothing
@@ -799,19 +808,20 @@ fn tcpPairBuffered(snd_buf_bytes: i32, rcv_buf_bytes: i32) ![2]std.posix.socket_
 fn waitForPartialRoom(conn: *net.Conn, peer: std.posix.socket_t, frame_bytes: usize, fill: []const u8, junk_out: *usize, head: []u8, head_len: *usize) usize {
     junk_out.* = fillUntilBlocked(conn.fd, fill);
     var spins: u32 = 0;
+    // Drain first, then look. The order matters more than it looks: a
+    // check-first loop returns having consumed nothing on any platform where
+    // one byte of room appears immediately, and consumes a few on the ones
+    // where it does not — which makes the caller's bookkeeping correct on one
+    // platform and silently untested on the other. A copy-paste bug lived
+    // exactly in that gap for two CI runs. Draining first means `head_len` is
+    // non-zero everywhere, so there is one code path and it is the hard one.
     while (spins < 400_000) : (spins += 1) {
-        const room = conn.sendRoom() orelse return 0;
-        if (room > 0 and room < frame_bytes) return room;
-        // one byte out of the peer's receive buffer, which is the only thing the
-        // sender is actually waiting for. These bytes are the *front* of the
-        // stream the caller is about to parse, so they are kept: dropping them
-        // would hand the parser a stream that starts mid-frame, which is exactly
-        // the desynchronisation this test is looking for and would manufacture
-        // one that is not there.
         if (head_len.* < head.len) {
             const n = std.posix.read(peer, head[head_len.*..][0..1]) catch 0;
             head_len.* += n;
         }
+        const room = conn.sendRoom() orelse return 0;
+        if (room > 0 and room < frame_bytes) return room;
     }
     return 0;
 }

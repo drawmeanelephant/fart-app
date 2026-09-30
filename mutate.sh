@@ -262,6 +262,23 @@ run src/ninjam/net.zig \
 # never be silently reported as a dropped bar, because the type has nowhere to
 # put that.
 
+run src/kujamba_timing.zig \
+'    @memcpy(sink[0..head_len], head[0..head_len]);' \
+'    std.mem.copyForwards(u8, sink[head_len .. head_len + seen], sink[0..seen]);
+    @memcpy(sink[0..head_len], head[0..head_len]);' \
+"#14: re-splice the peer's stream and clobber the bytes just read" 20
+
+# The helper above is `waitForPartialRoom`, which drains the peer a byte at a
+# time to reach a half-full send buffer and hands those bytes back so the caller
+# can parse the stream whole. It used to check the room *before* draining, so it
+# returned having consumed nothing on a platform where one byte of room appears
+# straight away — which is macOS — and a few on one where it does not. A
+# leftover `copyForwards` in the caller was then a self-copy on macOS and a
+# clobber on Linux, and the test read a length of 0x01010000 out of the middle
+# of the stream on one platform and passed on the other. Draining first makes
+# `head_len` non-zero everywhere, so entry 20 bites on both and the divergence
+# has nowhere left to hide.
+
 echo "=== reverted: the suite must be green again ==="
 restore
 zig build test --summary all 2>&1 | grep -E "^Build Summary:" | tail -1
