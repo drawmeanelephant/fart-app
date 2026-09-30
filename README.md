@@ -1,6 +1,6 @@
 # 💨 fart-app — Flatlophone v2
 
-A standalone, over-the-top fart application written in [Zig](https://ziglang.org/) (v0.16.0), now with a real fart synthesizer, bundled with an adversarial RAG audit pipeline for LLM ingestion. It also ships `kujamba`: the same synth as a headless NINJAM instrument that streams fart intervals to a real server (milestone 3 of the NINJAM revival).
+A standalone, over-the-top fart application written in [Zig](https://ziglang.org/) (v0.16.0), now with a real fart synthesizer, bundled with an adversarial RAG audit pipeline for LLM ingestion. It also ships `kujamba`: the same synth as a headless NINJAM instrument that streams fart intervals to a real server (milestone 3 of the NINJAM revival). Runs on **macOS and Linux** (#25); see Requirements.
 
 ---
 
@@ -31,8 +31,12 @@ fart-app/
 ## Requirements
 
 - **Zig 0.16.0** — https://ziglang.org/download/
-- **macOS** — uses `afplay`, `say`, and ANSI terminal escape codes
-  - `afplay` and `say` are built-in macOS CLI tools (no install needed)
+- **macOS or Linux** — the visuals need any ANSI terminal (#25)
+  - **macOS**: sound via the built-in `afplay`, voice lines via `say`
+  - **Linux**: sound via `paplay`, `aplay` or `ffplay` (first found on PATH)
+    and voice lines via `espeak` — all optional; with none of them the app
+    says so once and runs silent
+  - `kujamba` is headless POSIX and has no audio or speech dependencies at all
 
 ---
 
@@ -45,8 +49,8 @@ An animated terminal chaos engine. Features:
 - 📳 Screen-shake effect on every frame
 - 💥 Emoji cascade: 💨 💩 🤮 🤢 🍑 💥 ✨ ☢️ ~ ~ ~
 - ☢️ **Nuclear Fart Event** — rare (1-in-300 chance per frame), full ASCII mushroom cloud + `say -v 'Bad News' 'TACTICAL NUKE INCOMING'`
-- 🔊 **Flatlophone v2 synth farts** — the old `Basso.aiff` library is retired; random farts are now rendered by `src/synth.zig` (six deterministic *shuzi* pre-rendered at startup into `/tmp/fart_shuzi_*.wav`) and played with `afplay`
-- 🗣️ `say` voice lines stay — the voice is not a fart, it stays
+- 🔊 **Flatlophone v2 synth farts** — the old `Basso.aiff` library is retired; random farts are now rendered by `src/synth.zig` (six deterministic *shuzi* pre-rendered at startup into `/tmp/fart_shuzi_*.wav`) and played through the host audio player (`afplay` on macOS, `paplay`/`aplay`/`ffplay` on Linux)
+- 🗣️ `say`/`espeak` voice lines stay — the voice is not a fart, it stays
 - 🛑 Graceful `Ctrl+C` handling — restores terminal cursor and colors cleanly
 
 ### Run it
@@ -59,7 +63,7 @@ zig build run
 
 *kujamba* = to fart. Type a Swahili phrase and the butt speaks it **in fart**:
 each syllable gets its own animated frame (butt + syllable cloud + emoji rain
-+ screen shake) while the synthesized WAV plays through `afplay`.
++ screen shake) while the synthesized WAV plays through the host audio player.
 
 ```bash
 zig build run -- kujamba habari yako     # or:
@@ -409,7 +413,7 @@ zig build test
 
 - The fart app runs **indefinitely** until you press `Ctrl+C`; `kujamba` mode performs its phrase and exits
 - The audit tool **excludes** `zig-out/`, `.zig-cache/`, `.git/`, and `audit.zig` itself from scanning
-- macOS only (uses `afplay` and `say`). The visual app works on any ANSI terminal
+- macOS and Linux (#25). The fart app shells out to whatever audio player the host offers (`afplay` / `paplay` / `aplay` / `ffplay`) and speaks with `say` / `espeak` — missing tools mean silent mode, not a crash; the visual app works on any ANSI terminal. Windows is not supported yet: the blocking gaps (Winsock shim for `src/ninjam/net.zig`, a console handler, audio/speech) are listed in #25
 - Synth output is deterministic: same phrase in → byte-identical WAV out, always
 
 ---
