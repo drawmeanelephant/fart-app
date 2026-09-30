@@ -18,6 +18,14 @@ const session = @import("ninjam/session.zig");
 const vorbis = @import("ninjam/vorbis.zig");
 const synth = @import("synth.zig");
 const kujamba_out = @import("ninjam_out.zig");
+const libc = @cImport({
+    @cInclude("signal.h");
+});
+
+fn handleStop(sig: c_int) callconv(.c) void {
+    _ = sig;
+    kujamba_out.requestStop();
+}
 
 fn printUsage(io: std.Io) void {
     const usage =
@@ -28,14 +36,25 @@ fn printUsage(io: std.Io) void {
         \\    --seed N           determinism seed: ids + payloads derive from it
         \\    --pattern P        bar pattern, e.g. 3+1 = 3 fart bars + 1 rest bar
         \\                       (default 3+1)
-        \\    --intervals N      stop after N completed intervals (default 8)
+        \\    --play MODE        how the phrase maps onto bars:
+        \\                       repeat  restart at every fart bar (default)
+        \\                       loop    play continuously, wrapping at the end
+        \\                       once    play one pass, then silence
+        \\                       (rest bars freeze the phrase position)
+        \\    --intervals N      stop after N completed intervals (default 8); a
+        \\                       mid-session BPI/BPM change does not restart this
+        \\    --dump-dir DIR     write each interval's uploaded payload bytes to
+        \\                       DIR/interval_NNNN.ogg (determinism evidence),
+        \\                       numbered by a monotonic per-session sequence
+        \\                       that survives a BPI/BPM change
         \\    --duration S       hard safety cap in seconds (default 120)
         \\    --out-dir DIR      directory for decoded peer WAVs (default dump)
-        \\    --dump-dir DIR     write each interval's uploaded payload bytes to
-        \\                       DIR/interval_NNNN.ogg (determinism evidence)
         \\    --transcript FILE  transcript log (default <out-dir>/transcript.log)
         \\  kujamba check-ogg FILE [--min-rms R]   analyze an interval; exit 1 if rms < R
         \\  kujamba encode-silence FILE [--seconds S]   write a silent interval
+        \\
+        \\join exits 0 only if at least one interval was uploaded; Ctrl+C finishes
+        \\the current interval cleanly and reports the same way.
         \\
     ;
     std.Io.File.stderr().writeStreamingAll(io, usage) catch {};
@@ -52,6 +71,10 @@ pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const arena = init.arena.allocator();
     const io = init.io;
+
+    // Ctrl+C finishes the current interval cleanly (see session run loop).
+    _ = libc.signal(libc.SIGINT, handleStop);
+    _ = libc.signal(libc.SIGTERM, handleStop);
     const args = try std.process.Args.toSlice(init.minimal.args, arena);
 
     if (args.len < 2) {
@@ -59,6 +82,10 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(2);
     }
     if (std.mem.eql(u8, args[1], "join")) {
+        if (args.len > 2 and (std.mem.eql(u8, args[2], "--help") or std.mem.eql(u8, args[2], "help"))) {
+            printUsage(io);
+            return;
+        }
         return cmdJoin(io, gpa, arena, args[2..]);
     } else if (std.mem.eql(u8, args[1], "check-ogg")) {
         return cmdCheckOgg(io, args[2..]);
@@ -80,6 +107,7 @@ fn cmdJoin(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: [
     var phrase: []const u8 = "kujamba karibu";
     var seed: u64 = 1;
     var pattern_str: []const u8 = "3+1";
+    var play_mode: kujamba_out.Mode = .repeat;
     var intervals: u64 = 8;
     var duration_ms: i64 = 120_000;
     var out_dir: []const u8 = "dump";
@@ -92,12 +120,27 @@ fn cmdJoin(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: [
         const next: ?[]const u8 = if (i + 1 < argv.len) argv[i + 1] else null;
         if (std.mem.eql(u8, a, "--host")) {
             const v = next orelse fail(io, "--host needs a value", .{});
-            if (std.mem.indexOfScalar(u8, v, ':')) |colon| {
+            if (v.len > 0 and v[0] == '[') {
+                // bracketed IPv6: [::1]:20531 or [::1]
+                const close = std.mem.indexOfScalar(u8, v, ']') orelse
+                    fail(io, "bad --host: missing ']'", .{});
+                host = v[1..close];
+                if (close + 1 < v.len) {
+                    if (v[close + 1] != ':') fail(io, "bad --host after ']'", .{});
+                    port = std.fmt.parseInt(u16, v[close + 2 ..], 10) catch fail(io, "bad port in --host", .{});
+                }
+            } else if (std.mem.indexOfScalar(u8, v, ':')) |colon| {
+                if (std.mem.indexOfScalarPos(u8, v, colon + 1, ':') != null)
+                    fail(io, "IPv6 host needs brackets: --host [::1]:port", .{});
                 host = v[0..colon];
                 port = std.fmt.parseInt(u16, v[colon + 1 ..], 10) catch fail(io, "bad port in --host", .{});
             } else {
                 host = v;
             }
+            i += 1;
+        } else if (std.mem.eql(u8, a, "--play")) {
+            play_mode = kujamba_out.parseMode(next orelse fail(io, "--play needs a value", .{})) catch
+                fail(io, "bad --play '{s}' (want repeat, loop or once)", .{next.?});
             i += 1;
         } else if (std.mem.eql(u8, a, "--user")) {
             user = next orelse fail(io, "--user needs a value", .{});
@@ -119,6 +162,9 @@ fn cmdJoin(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: [
             i += 1;
         } else if (std.mem.eql(u8, a, "--duration")) {
             const secs = std.fmt.parseFloat(f64, next orelse fail(io, "--duration needs a value", .{})) catch fail(io, "bad --duration", .{});
+            // NaN/negative would panic in @intFromFloat
+            if (!(secs > 0.0) or secs > 86400.0)
+                fail(io, "--duration must be in (0, 86400] seconds", .{});
             duration_ms = @intFromFloat(secs * 1000.0);
             i += 1;
         } else if (std.mem.eql(u8, a, "--out-dir")) {
@@ -142,7 +188,7 @@ fn cmdJoin(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: [
     // then read it out interval by interval.
     const phrase_samples = kujamba_out.renderPhraseF32(gpa, phrase) catch |e| fail(io, "phrase render failed: {s}", .{@errorName(e)});
     defer gpa.free(phrase_samples);
-    var fill = kujamba_out.Fill{ .samples = phrase_samples };
+    var fill = kujamba_out.Fill{ .samples = phrase_samples, .mode = play_mode };
 
     var opts = session.Options{
         .host = host,
@@ -171,14 +217,24 @@ fn cmdJoin(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: [
 
     const stats = s.run() catch s.stats;
 
+    // exit-code honesty: a run that uploaded nothing is a failure even if the
+    // duration cap was reached without an error
+    var err_text: []const u8 = stats.failText();
+    var ok = stats.ok;
+    if (ok and stats.intervals_uploaded == 0) {
+        ok = false;
+        err_text = "no intervals uploaded";
+    }
+
     var out_buf: [2048]u8 = undefined;
     const line = std.fmt.bufPrint(
         &out_buf,
-        "RESULT ok={} err=\"{s}\" seed={d} intervals_uploaded={d} intervals_broadcast={d} silence_markers={d} payload_dumps={d} upload_chunks={d} upload_bytes={d} intervals_downloaded={d} msgs_sent={d} msgs_recv={d}\n",
+        "RESULT ok={} err=\"{s}\" seed={d} play={s} intervals_uploaded={d} intervals_broadcast={d} silence_markers={d} payload_dumps={d} upload_chunks={d} upload_bytes={d} intervals_downloaded={d} msgs_sent={d} msgs_recv={d}\n",
         .{
-            stats.ok,
-            stats.failText(),
+            ok,
+            err_text,
             seed,
+            @tagName(play_mode),
             stats.intervals_uploaded,
             stats.intervals_broadcast,
             stats.silence_markers,
@@ -192,7 +248,7 @@ fn cmdJoin(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: [
     ) catch return;
     std.Io.File.stdout().writeStreamingAll(io, line) catch {};
 
-    if (!stats.ok) std.process.exit(1);
+    if (!ok) std.process.exit(1);
 }
 
 fn peakOf(pcm: []const f32) f64 {
