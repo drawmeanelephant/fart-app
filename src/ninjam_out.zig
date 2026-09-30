@@ -203,6 +203,124 @@ pub fn renderPhraseF32(alloc: std.mem.Allocator, phrase: []const u8) ![]f32 {
     return out;
 }
 
+// ---- offline render ----------------------------------------------------------
+
+/// How `renderOfflineF32` lays one phrase over the bar grid. Mirrors the flags
+/// `join` already takes, so an offline file is shaped like the session.
+pub const OfflineOpts = struct {
+    mode: Mode = .repeat,
+    pattern: Pattern = .{ .play = 1, .rest = 0 },
+    /// how many bars to render, each `bar_samples` long
+    bars: u32 = 1,
+    /// samples per bar. 0 means "one bar exactly as long as the phrase", so the
+    /// defaults render the phrase untouched rather than truncating it at 1s.
+    bar_samples: u64 = 0,
+};
+
+/// Render a phrase to the bar-shaped audio `join` would upload, with no server.
+///
+/// This is the same three pieces the session uses — `renderPhraseF32`, the bar
+/// `Pattern`, and `Fill` — driven bar by bar instead of block by block, so the
+/// offline file is what a listener would have heard.
+///
+/// **Rest bars are exact silence, not skipped bars.** In a session a rest bar
+/// uploads a NINJAM silence marker rather than audio, so the room hears nothing
+/// for that bar and the phrase cursor does not advance. Emitting silence
+/// preserves both: the output timeline matches the live one sample for sample,
+/// and `--pattern 3+1` means "3 bars of fart, 1 bar of nothing" rather than
+/// "3 bars of fart with the gap removed". Skipping the bars would make the file
+/// disagree with the room it is meant to preview.
+pub fn renderOfflineF32(
+    alloc: std.mem.Allocator,
+    phrase: []const u8,
+    opts: OfflineOpts,
+) ![]f32 {
+    const samples = try renderPhraseF32(alloc, phrase);
+    defer alloc.free(samples);
+
+    const bar: u64 = if (opts.bar_samples != 0) opts.bar_samples else @max(1, samples.len);
+    const bars: u64 = @max(1, opts.bars);
+    const bar_usize: usize = @intCast(bar);
+    const out = try alloc.alloc(f32, @intCast(bar * bars));
+    errdefer alloc.free(out);
+    @memset(out, 0); // rest bars stay exactly zero
+
+    var fill = Fill{ .samples = samples, .mode = opts.mode };
+    var b: u64 = 0;
+    while (b < bars) : (b += 1) {
+        // A rest bar is skipped entirely: no copyInto call, so in loop/once the
+        // cursor freezes just as it does in the session.
+        if (!opts.pattern.broadcastFor(b)) continue;
+        const start: usize = @intCast(b * bar);
+        fill.copyInto(0, out[start..][0..bar_usize]);
+    }
+    return out;
+}
+
+/// f32 -> i16 using the same scaling synth itself uses, clamped so a shaped
+/// buffer cannot wrap around on an out-of-range sample.
+pub fn f32ToI16(x: f32) i16 {
+    const scaled: f64 = @round(@as(f64, @floatCast(x)) * 32767.0);
+    return @intFromFloat(std.math.clamp(scaled, -32768.0, 32767.0));
+}
+
+/// Offline render straight to WAV bytes (44-byte header + data).
+pub fn renderOfflineWav(
+    alloc: std.mem.Allocator,
+    phrase: []const u8,
+    opts: OfflineOpts,
+) ![]u8 {
+    const pcm = try renderOfflineF32(alloc, phrase, opts);
+    defer alloc.free(pcm);
+    const pcm16 = try alloc.alloc(i16, pcm.len);
+    defer alloc.free(pcm16);
+    for (pcm, pcm16) |x, *o| o.* = f32ToI16(x);
+    return synth.writeWavBytes(alloc, pcm16, sample_rate);
+}
+
+/// Offline render straight to Ogg Vorbis bytes, through the same 960-sample
+/// block size the session uploads intervals with, so the file is a real
+/// interval payload rather than something only a decoder would accept.
+pub fn renderOfflineOgg(
+    alloc: std.mem.Allocator,
+    phrase: []const u8,
+    opts: OfflineOpts,
+    serial: u32,
+) ![]u8 {
+    const pcm = try renderOfflineF32(alloc, phrase, opts);
+    defer alloc.free(pcm);
+    const vorbis = @import("ninjam/vorbis.zig");
+    const enc = try vorbis.Encoder.create(alloc, @intCast(sample_rate), 0.0, serial);
+    defer enc.destroy();
+    var ogg: std.ArrayList(u8) = .empty;
+    errdefer ogg.deinit(alloc);
+    try enc.writeHeaders(&ogg);
+    const block: usize = 960;
+    var off: usize = 0;
+    while (off < pcm.len) {
+        const n = @min(block, pcm.len - off);
+        try enc.encode(pcm[off..][0..n], &ogg);
+        off += n;
+    }
+    try enc.flush(&ogg);
+    return ogg.toOwnedSlice(alloc);
+}
+
+/// RMS of a finished buffer, for CLI reporting and tests.
+pub fn rmsOf(samples: []const f32) f64 {
+    if (samples.len == 0) return 0;
+    var acc: f64 = 0;
+    for (samples) |s| acc += @as(f64, s) * @as(f64, s);
+    return @sqrt(acc / @as(f64, @floatFromInt(samples.len)));
+}
+
+/// Peak absolute sample value of a finished buffer.
+pub fn peakOf(samples: []const f32) f64 {
+    var peak: f64 = 0;
+    for (samples) |s| peak = @max(peak, @abs(@as(f64, @floatCast(s))));
+    return peak;
+}
+
 // ---- cooperative stop (Ctrl+C) ----------------------------------------------
 
 var stop_flag = std.atomic.Value(bool).init(false);
@@ -538,4 +656,183 @@ test "a rest interval encodes to exact zero energy" {
     var dec = try vorbis.decodeMemory(alloc, ogg);
     defer dec.deinit();
     try testing.expect(dec.rms() < 1e-6);
+}
+
+// ---- offline render tests ----------------------------------------------------
+
+test "offline render with defaults is the phrase itself: nothing truncated, nothing padded" {
+    const alloc = testing.allocator;
+    const phrase = try renderPhraseF32(alloc, "kujamba karibu");
+    defer alloc.free(phrase);
+    const out = try renderOfflineF32(alloc, "kujamba karibu", .{});
+    defer alloc.free(out);
+    // the default bar is exactly the phrase, so the file is the phrase
+    try testing.expectEqualSlices(f32, phrase, out);
+}
+
+test "a rest bar is exact silence and freezes the phrase cursor (loop mode)" {
+    const alloc = testing.allocator;
+    const phrase = try renderPhraseF32(alloc, "kujamba karibu");
+    defer alloc.free(phrase);
+    const bar = @divExact(phrase.len, 2);
+    const out = try renderOfflineF32(alloc, "kujamba karibu", .{
+        .mode = .loop,
+        .pattern = .{ .play = 1, .rest = 1 },
+        .bars = 4,
+        .bar_samples = bar,
+    });
+    defer alloc.free(out);
+    try testing.expectEqual(@as(usize, bar * 4), out.len);
+
+    const b0 = out[0..bar];
+    const b1 = out[bar..][0..bar];
+    const b2 = out[bar * 2 ..][0..bar];
+    const b3 = out[bar * 3 ..][0..bar];
+
+    // bars 1 and 3 rest: exact zeros, and the bar is not skipped, so the
+    // offline timeline still matches the live one
+    for (b1) |s| try testing.expectEqual(0.0, s);
+    for (b3) |s| try testing.expectEqual(0.0, s);
+
+    // bar 0 reads the first half...
+    try testing.expectEqualSlices(f32, phrase[0..bar], b0);
+    // ...and bar 2 continues into the second half, which is only true if the
+    // rest bar froze the cursor instead of restarting the phrase
+    try testing.expectEqualSlices(f32, phrase[bar..], b2);
+}
+
+test "offline shaping is deterministic and rest bars carry no energy" {
+    const alloc = testing.allocator;
+    const opts = OfflineOpts{
+        .mode = .once,
+        .pattern = .{ .play = 3, .rest = 1 },
+        .bars = 4,
+        .bar_samples = 44100 / 2,
+    };
+    const a = try renderOfflineF32(alloc, "kujamba tena", opts);
+    defer alloc.free(a);
+    const b = try renderOfflineF32(alloc, "kujamba tena", opts);
+    defer alloc.free(b);
+    try testing.expectEqualSlices(f32, a, b);
+
+    try testing.expect(rmsOf(a) > 0.01);
+    const last_bar = a[44100 * 3 / 2 ..][0 .. 44100 / 2];
+    for (last_bar) |s| try testing.expectEqual(0.0, s);
+}
+
+test "offline WAV is a valid non-silent PCM file with a correct data length" {
+    const alloc = testing.allocator;
+    const wav = try renderOfflineWav(alloc, "kujamba karibu", .{});
+    defer alloc.free(wav);
+
+    try testing.expectEqualSlices(u8, "RIFF", wav[0..4]);
+    try testing.expectEqualSlices(u8, "WAVE", wav[8..12]);
+    try testing.expectEqualSlices(u8, "data", wav[36..40]);
+    try testing.expectEqual(
+        @as(u32, synth.SAMPLE_RATE),
+        std.mem.readInt(u32, wav[24..28], .little),
+    );
+    try testing.expectEqual(
+        @as(usize, wav.len - 44),
+        @as(usize, synth.wavDataByteLen(wav)),
+    );
+
+    // non-silent: the phrase survived the f32 -> i16 roundtrip
+    const nsamples = (wav.len - 44) / 2;
+    var acc: f64 = 0;
+    for (0..nsamples) |k| {
+        const s: f64 = @floatFromInt(std.mem.readInt(i16, wav[44 + 2 * k ..][0..2], .little));
+        acc += s * s;
+    }
+    const rms = @sqrt(acc / @as(f64, @floatFromInt(nsamples)));
+    try testing.expect(rms > 100.0);
+}
+
+test "offline OGG decodes non-silent and preserves the rest bar as silence" {
+    const alloc = testing.allocator;
+    const vorbis = @import("ninjam/vorbis.zig");
+    const ogg = try renderOfflineOgg(alloc, "kujamba karibu", .{
+        .pattern = .{ .play = 1, .rest = 1 },
+        .bars = 2,
+        .bar_samples = 44100,
+    }, deriveSerial(7, 0, 0));
+    defer alloc.free(ogg);
+    try testing.expectEqualSlices(u8, "OggS", ogg[0..4]);
+
+    var dec = try vorbis.decodeMemory(alloc, ogg);
+    defer dec.deinit();
+    try testing.expectEqual(@as(u32, 44100), dec.srate);
+    try testing.expect(dec.rms() > 0.001);
+
+    // Exactly two bars of frames, so the bar boundary lands where it should.
+    try testing.expectEqual(@as(usize, 44100 * 2), dec.frames());
+
+    // The second bar was a rest bar. Vorbis is lossy and rings a little into
+    // the silence, so this asserts the bar is at least 20 dB below the play
+    // bar rather than exactly zero (measured ~39 dB down, so there is margin).
+    // The bit-exact zero is asserted on the shaped f32 buffer above, before
+    // any codec sees it.
+    const half = dec.pcm.len / 2;
+    var play_acc: f64 = 0;
+    var rest_acc: f64 = 0;
+    for (dec.pcm, 0..) |s, k| {
+        const sq = @as(f64, @floatCast(s)) * @as(f64, @floatCast(s));
+        if (k < half) play_acc += sq else rest_acc += sq;
+    }
+    const play_rms = @sqrt(play_acc / @as(f64, @floatFromInt(half)));
+    const rest_rms = @sqrt(rest_acc / @as(f64, @floatFromInt(half)));
+    try testing.expect(play_rms > 0.01);
+    try testing.expect(rest_rms * 10.0 < play_rms); // >20 dB down
+}
+
+test "f32ToI16 clamps instead of wrapping around" {
+    // in-range: the same symmetric x*32767 scaling synth itself uses
+    try testing.expectEqual(@as(i16, 32767), f32ToI16(1.0));
+    try testing.expectEqual(@as(i16, -32767), f32ToI16(-1.0));
+    try testing.expectEqual(@as(i16, 0), f32ToI16(0.0));
+    // out of range: clamped, not wrapped (a wrap would turn a loud bar into
+    // a loud click of the opposite sign)
+    try testing.expectEqual(@as(i16, 32767), f32ToI16(4.0));
+    try testing.expectEqual(@as(i16, -32768), f32ToI16(-4.0));
+}
+
+test "offline WAV is the synth WAV plus the session's fade-out, and nothing else" {
+    const alloc = testing.allocator;
+    const offline = try renderOfflineWav(alloc, "kujamba karibu", .{});
+    defer alloc.free(offline);
+    const direct = try synth.renderPhraseWav(alloc, "kujamba karibu");
+    defer alloc.free(direct);
+    try testing.expectEqual(direct.len, offline.len);
+
+    const n = (offline.len - 44) / 2;
+    const fade: usize = synth.SAMPLE_RATE * 8 / 1000; // the tail renderPhraseF32 fades
+    const at = comptime std.mem.readInt;
+
+    // Outside the fade tail the two are the same signal to within the f32
+    // round-trip's 1 LSB. Anything larger would mean the offline path is
+    // re-shaping audio rather than carrying it.
+    for (0..n - fade) |k| {
+        const x: i32 = at(i16, offline[44 + 2 * k ..][0..2], .little);
+        const y: i32 = at(i16, direct[44 + 2 * k ..][0..2], .little);
+        try testing.expect(@abs(x - y) <= 1);
+    }
+
+    // The tail is where they are meant to differ: renderPhraseF32 fades the
+    // last 8 ms so loop wraps and interval tails do not click, and the synth's
+    // own WAV has no fade.
+    const last: i32 = at(i16, offline[offline.len - 2 ..][0..2], .little);
+    try testing.expectEqual(0, last); // the fade reaches silence
+
+    // How much quieter depends on where the phrase's energy sits inside the
+    // fade window — mean magnitude is dominated by its loudest part, which for
+    // this phrase lands where the ramp has barely started (measured 0.80). So
+    // this asserts the fade is unambiguously there rather than pinning a number
+    // that would move with any change to the voice tables.
+    var offline_tail: i64 = 0;
+    var direct_tail: i64 = 0;
+    for (n - fade..n) |k| {
+        offline_tail += @abs(at(i16, offline[44 + 2 * k ..][0..2], .little));
+        direct_tail += @abs(at(i16, direct[44 + 2 * k ..][0..2], .little));
+    }
+    try testing.expect(offline_tail * 10 < direct_tail * 9);
 }

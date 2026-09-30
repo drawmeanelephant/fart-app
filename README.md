@@ -175,6 +175,33 @@ zig build
 * `kujamba check-ogg FILE --min-rms R` decodes a raw interval and fails if it
   is silent; `kujamba encode-silence FILE` is the negative-control generator.
 
+### Offline render
+
+The synth is useful without a room. `kujamba render` writes a phrase to a WAV or
+Ogg file, shaped by the same `Fill`/`Pattern` code the session plays, so the
+file is what a listener would have heard:
+
+```bash
+./zig-out/bin/kujamba render --phrase "kujamba karibu" --out karibu.wav
+./zig-out/bin/kujamba render --phrase "kujamba karibu" --out bars.wav \
+  --play loop --pattern 3+1 --bars 4 --bar-ms 500
+./zig-out/bin/kujamba render --phrase "kujamba karibu" --out bars.ogg \
+  --pattern 3+1 --bars 4 --bar-ms 500 --seed 42
+```
+
+* `--play`, `--pattern` and `--bars` shape the output exactly as they shape a
+  live session; the container is picked from the `--out` extension.
+* **A rest bar is exact silence, not a skipped bar.** In a session a rest bar
+  uploads a silence marker rather than audio, so the room hears nothing for
+  that bar and the phrase cursor does not advance. Writing silence instead of
+  concatenating the play bars keeps the file's timeline identical to the live
+  one and keeps `loop`/`once` phrasing in step with the room.
+* With no `--bar-ms`, one bar is exactly as long as the phrase, so the default
+  is "the phrase, untouched" rather than "the phrase, truncated at one second".
+* Deterministic: same phrase + flags give byte-identical output. `--seed` keys
+  the Ogg stream serial, not the waveform — the same split `join` has, where the
+  seed keys interval ids and the synth seeds from the phrase text.
+
 ### Where the code comes from
 
 * VENDORED (do not edit): `src/ninjam/` — zclient's protocol/encode subset
