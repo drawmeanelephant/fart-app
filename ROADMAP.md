@@ -15,7 +15,8 @@ own.
 
 > **Build order lives in [ISSUES.md](ISSUES.md)** — which issues block
 > which, the recommended sequencing, and the vendored-file ledger. Short version:
-> start with **#11, #10, #27**; **#12, #18 and #19** are landed. Everything else is downstream.
+> **#12, #17, #18, #19, #22 are landed**; next start with **#10, #27**. #11 (the one-time
+> plan-hook reshape that unblocks #8 and #9) has landed too. Everything else is downstream.
 > The `blocked-by` edges are encoded on the issues themselves. Tracked as
 > [#31](https://github.com/drawmeanelephant/fart-app/issues/31).
 
@@ -35,7 +36,7 @@ own.
 Right now one phrase maps onto bars with `repeat`/`loop`/`once`. The gap to a
 real instrument is **control while it runs**.
 
-- [ ] **Bar-accurate phrase switching.** (#11) A chat command takes effect at the
+- [x] **Bar-accurate phrase switching.** (#11) ✅ **Landed.** A chat command takes effect at the
       next interval boundary, not mid-bar (the `IntervalPlan` hook already
       gives us a per-bar decision point). **Do this first** — widen the hook to
       carry *which phrase* and *which mode*, not just broadcast-or-not, or the

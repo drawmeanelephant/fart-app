@@ -41,6 +41,23 @@ pub const Mode = enum {
 
 pub const ModeError = error{UnknownMode};
 
+/// What the plan selects for one interval.
+///
+/// The session consults the plan once per interval, *before* it generates any
+/// audio, and applies this selection at that bar boundary. That ordering is
+/// what makes "a switch requested during bar N takes effect at the start of
+/// bar N+1" true by construction rather than by a latch: by the time a block is
+/// encoded, the whole bar's mode and phrase are already decided. #11.
+pub const Selection = struct {
+    /// false makes the interval a silence-marker bar — no audio is uploaded
+    broadcast: bool,
+    /// play mode for the interval
+    mode: Mode,
+    /// phrase buffer to read this interval; null keeps whatever the source
+    /// already holds. Carried ahead of #8's bank so the hook is reshaped once.
+    samples: ?[]const f32 = null,
+};
+
 /// Parse a play mode name ("repeat", "loop", "once").
 pub fn parseMode(s: []const u8) ModeError!Mode {
     if (std.mem.eql(u8, s, "repeat")) return .repeat;
@@ -177,11 +194,21 @@ pub const IntervalIndex = struct {
 /// Adapter so a `Pattern` can be handed to `session.Options.plan`.
 pub const PlanAdapter = struct {
     pattern: *const Pattern,
+    /// play mode the plan selects for each interval. A live switch updates this
+    /// and it is picked up at the next bar boundary.
+    mode: Mode = .repeat,
+    /// the phrase buffer this plan currently selects. One buffer today; #8
+    /// resolves an index into a bank here.
+    samples: []const f32 = &.{},
 
-    /// Matches `session.IntervalPlan.broadcastFor`.
-    pub fn broadcastForFn(ctx: *anyopaque, interval_idx: u64) bool {
+    /// Matches `session.IntervalPlan.selectFor`.
+    pub fn selectForFn(ctx: *anyopaque, interval_idx: u64) Selection {
         const self: *PlanAdapter = @ptrCast(@alignCast(ctx));
-        return self.pattern.broadcastFor(interval_idx);
+        return .{
+            .broadcast = self.pattern.broadcastFor(interval_idx),
+            .mode = self.mode,
+            .samples = self.samples,
+        };
     }
 };
 

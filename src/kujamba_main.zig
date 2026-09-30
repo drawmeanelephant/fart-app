@@ -295,13 +295,15 @@ fn cmdJoin(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: [
         }
     }
 
-    var adapter = kujamba_out.PlanAdapter{ .pattern = &s.pattern };
-
     // The synth is the capture device: render the phrase once (deterministic),
     // then read it out interval by interval.
     const phrase_samples = kujamba_out.renderPhraseF32With(gpa, s.phrase, s.knobs) catch |e| fail(io, "phrase render failed: {s}", .{@errorName(e)});
     defer gpa.free(phrase_samples);
     var fill = kujamba_out.Fill{ .samples = phrase_samples, .mode = s.play_mode };
+    // kujamba (#11): the plan owns the selection — the pattern (rest bars) plus
+    // the mode and phrase the session should bind each bar. A live switch just
+    // updates the adapter; the session picks it up at the next bar boundary.
+    var adapter = kujamba_out.PlanAdapter{ .pattern = &s.pattern, .mode = s.play_mode, .samples = phrase_samples };
 
     var opts = session.Options{
         .host = s.host,
@@ -312,7 +314,7 @@ fn cmdJoin(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: [
         .channel_names = &.{"kujamba"},
         .source = .{ .kujamba = &fill },
         .id_seed = s.seed,
-        .plan = .{ .ctx = @ptrCast(&adapter), .broadcastFor = kujamba_out.PlanAdapter.broadcastForFn },
+        .plan = .{ .ctx = @ptrCast(&adapter), .selectFor = kujamba_out.PlanAdapter.selectForFn },
         .out_dir = s.out_dir,
         .payload_dump_dir = s.dump_dir,
         .stop_after_intervals = s.intervals,
