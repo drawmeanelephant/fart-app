@@ -25,7 +25,7 @@ unblocks them (#11) is the smallest item in M4.
 
 | Start here | Why it's unblocked | What it unblocks |
 |---|---|---|
-| **#11** Bar-accurate switching | The per-bar decision point already exists in `startIntervalEncoders`; widening its return type is the whole change | #8, #9 |
+| **#11** Bar-accurate switching | ✅ **done** — one-time hook reshape, `Selection{broadcast,mode,samples}` | #8, #9 |
 | **#10** Render caching | Depends only on `renderPhraseF32` | #8 |
 | **#18** voiceSpec knobs | ✅ **done** — `--voice` multipliers, see below | #15, #16 |
 | **#12** Re-anchor on config change | ✅ **done** — split the counters, see below | #24, #29 |
@@ -51,7 +51,9 @@ Everything else is Wave 2+ and can proceed in parallel once the above land.
 
 ### The four edges that matter most
 
-1. **#11 before #8 and #9.** `IntervalPlan.broadcastFor` returns `bool`. All three
+1. **#11 before #8 and #9.** ✅ Done — the hook is now `selectFor(...) -> Selection{broadcast, mode, samples}`,
+   consulted once per interval and applied at the bar boundary. **#8 and #9 no longer need to
+   reshape the vendored hook.** The original note: `IntervalPlan.broadcastFor` returned `bool`. All three
    issues need it to carry *which phrase* and *which mode*. Doing #8 or #9 first
    means reshaping this vendored hook twice. The hook is consulted exactly once
    per interval, *before* any audio is generated — which is what makes
@@ -148,7 +150,7 @@ recommended answer.
 ## Sequencing
 
 ### Wave 0 — the unblocked six
-`#11` · `#10` · `#18`✅ · `#12`✅ · `#19`✅ · `#27`
+`#11`✅ · `#10` · `#18`✅ · `#12`✅ · `#19`✅ · `#27`
 
 Six independent items; in practice three or four people can work in parallel
 with zero collisions. `#12` and `#19` are the two that paid off fastest and both

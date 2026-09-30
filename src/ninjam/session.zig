@@ -26,11 +26,16 @@ pub const Source = union(enum) {
 };
 
 /// Per-interval broadcast plan for instrument sources (kujamba rest bars).
-/// Consulted at every interval start; returning false makes the interval a
-/// silence-marker bar — no audio is ever uploaded for it.
+/// Consulted at every interval start; returning a selection whose `broadcast`
+/// is false makes the interval a silence-marker bar — no audio is ever uploaded
+/// for it. The whole selection (broadcast, play mode, and the phrase buffer) is
+/// applied at that bar boundary, so a switch requested during bar N takes
+/// effect at the start of bar N+1 with no mid-interval splice. kujamba
+/// adaptation (#11): the hook used to return a bare bool and carried nothing
+/// else, so a mid-session mode/phrase change had no way to express itself.
 pub const IntervalPlan = struct {
     ctx: *anyopaque,
-    broadcastFor: *const fn (ctx: *anyopaque, interval_idx: u64) bool,
+    selectFor: *const fn (ctx: *anyopaque, interval_idx: u64) kujamba_out.Selection,
 };
 
 pub const Options = struct {
@@ -560,9 +565,26 @@ pub const Session = struct {
 
     fn startIntervalEncoders(self: *Session) !void {
         if (self.opts.plan) |pl| {
-            // kujamba (#12): grid position decides play vs. rest, nothing else
-            const bcast = pl.broadcastFor(pl.ctx, self.index.grid);
-            for (self.locals) |*lc| lc.broadcast = bcast;
+            // kujamba (#11, #12): the plan returns a full selection for this
+            // bar and it is applied HERE — once, at the bar boundary, before any
+            // audio is generated. That ordering is what makes a switch requested
+            // during bar N land at the start of bar N+1 by construction: by the
+            // time any block is encoded, the bar's mode and phrase are already
+            // decided. grid position drives the pattern (rest) decision; the
+            // selection carries the mode and phrase.
+            const sel = pl.selectFor(pl.ctx, self.index.grid);
+            for (self.locals) |*lc| lc.broadcast = sel.broadcast;
+            // Rebind the instrument source to the selected mode/phrase. Applied
+            // even on a rest bar, so a switch made while resting takes effect on
+            // the next play bar too. A rest bar freezes the fill's cursor (no
+            // copyInto), so this cannot splice audio mid-bar.
+            switch (self.opts.source) {
+                .kujamba => |fill| {
+                    fill.mode = sel.mode;
+                    if (sel.samples) |s| fill.samples = s;
+                },
+                else => {},
+            }
         }
         for (self.locals) |*lc| {
             if (lc.enc) |e| {
@@ -1185,7 +1207,7 @@ test "kujamba: a config change moves the grid without renumbering intervals or c
         .channel_names = &.{"kujamba"},
         .source = .{ .kujamba = &fill },
         .id_seed = 42,
-        .plan = .{ .ctx = @ptrCast(&adapter), .broadcastFor = kujamba_out.PlanAdapter.broadcastForFn },
+        .plan = .{ .ctx = @ptrCast(&adapter), .selectFor = kujamba_out.PlanAdapter.selectForFn },
     });
     defer s.deinit();
     s.log.quiet = true; // these tests assert on state, not on the transcript
@@ -1259,7 +1281,7 @@ test "kujamba: a re-anchored interval keeps the id of the slot it re-uses" {
         .channel_names = &.{"kujamba"},
         .source = .{ .kujamba = &fill },
         .id_seed = 42,
-        .plan = .{ .ctx = @ptrCast(&adapter), .broadcastFor = kujamba_out.PlanAdapter.broadcastForFn },
+        .plan = .{ .ctx = @ptrCast(&adapter), .selectFor = kujamba_out.PlanAdapter.selectForFn },
     });
     defer s.deinit();
     s.log.quiet = true; // these tests assert on state, not on the transcript
@@ -1299,4 +1321,80 @@ test "synthetic sources keep an independent phase per channel" {
     try std.testing.expect(ba[0] != bb[0]);
     // each channel still advances its own oscillator
     try std.testing.expect(a.phase != b.phase);
+}
+
+// ---- #11 bar-accurate selection ---------------------------------------------
+
+test "kujamba: a mode switch requested during bar N applies at the start of bar N+1" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // A phrase long enough that a bar change is visible in the audio below.
+    var phrase: [4096]f32 = undefined;
+    for (&phrase, 0..) |*o, i| o.* = @as(f32, @floatFromInt(i % 97)) / 97.0;
+    var fill = kujamba_out.Fill{ .samples = &phrase, .mode = .repeat };
+    const pattern = try kujamba_out.parsePattern("1"); // always broadcast
+    var adapter = kujamba_out.PlanAdapter{ .pattern = &pattern, .mode = .repeat, .samples = &phrase };
+
+    var s = try Session.init(alloc, io, .{
+        .srate = @intCast(kujamba_out.sample_rate),
+        .channel_names = &.{"kujamba"},
+        .source = .{ .kujamba = &fill },
+        .id_seed = 42,
+        .plan = .{ .ctx = @ptrCast(&adapter), .selectFor = kujamba_out.PlanAdapter.selectForFn },
+    });
+    defer s.deinit();
+    s.log.quiet = true;
+
+    // Bar 0 starts in repeat: the plan's mode is bound to the source.
+    s.index.grid = 0;
+    try s.startIntervalEncoders();
+    try std.testing.expectEqual(kujamba_out.Mode.repeat, fill.mode);
+
+    // A switch is "requested" during bar 0 by updating the plan. The fill is
+    // untouched until the next bar boundary — this is the "no mid-interval
+    // splice" property: the in-flight bar keeps the mode it started with.
+    adapter.mode = .loop;
+    try std.testing.expectEqual(kujamba_out.Mode.repeat, fill.mode); // not yet applied
+
+    // Bar 1 starts: the selection is applied, now including the new mode.
+    s.index.grid = 1;
+    try s.startIntervalEncoders();
+    try std.testing.expectEqual(kujamba_out.Mode.loop, fill.mode);
+}
+
+test "kujamba: a rest bar still rebinds the mode, so a switch while resting lands on the next play bar" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var phrase: [2048]f32 = undefined;
+    for (&phrase, 0..) |*o, i| o.* = @as(f32, @floatFromInt(i % 31)) / 31.0;
+    var fill = kujamba_out.Fill{ .samples = &phrase, .mode = .repeat };
+    const pattern = try kujamba_out.parsePattern("1+1"); // play, rest, play, rest
+    var adapter = kujamba_out.PlanAdapter{ .pattern = &pattern, .mode = .repeat, .samples = &phrase };
+
+    var s = try Session.init(alloc, io, .{
+        .srate = @intCast(kujamba_out.sample_rate),
+        .channel_names = &.{"kujamba"},
+        .source = .{ .kujamba = &fill },
+        .id_seed = 7,
+        .plan = .{ .ctx = @ptrCast(&adapter), .selectFor = kujamba_out.PlanAdapter.selectForFn },
+    });
+    defer s.deinit();
+    s.log.quiet = true;
+
+    // bar 0 plays, bar 1 rests. Switch requested "during" the rest bar.
+    s.index.grid = 0;
+    try s.startIntervalEncoders();
+    try std.testing.expectEqual(kujamba_out.Mode.repeat, fill.mode);
+
+    adapter.mode = .once;
+    s.index.grid = 1; // rest bar
+    try s.startIntervalEncoders();
+    // the rest bar applied the new mode even though it uploads no audio
+    try std.testing.expectEqual(kujamba_out.Mode.once, fill.mode);
 }
