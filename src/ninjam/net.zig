@@ -58,10 +58,25 @@ pub const Conn = struct {
         // fast path: dotted-quad IPv4 literal
         if (std.Io.net.Ip4Address.parse(host, port)) |ip4| {
             const sa = sockaddrIn(ip4);
-            return connectSockaddr(io, &sa);
+            return connectSockaddr(io, std.posix.AF.INET, @ptrCast(&sa), @intCast(@sizeOf(std.posix.sockaddr.in)));
         } else |_| {}
 
-        // hostname: getaddrinfo (libc)
+        // fast path: IPv6 literal. The CLI strips the brackets of
+        // `--host [::1]:port`, so the text arrives bare (`::1`). A `%zone`
+        // scope is refused here (error.UnresolvedScope) on purpose: getaddrinfo
+        // below resolves scoped forms, and duplicating if_nametoindex would be
+        // a second copy of one job.
+        if (std.Io.net.Ip6Address.parse(host, port)) |ip6| {
+            const sa = sockaddrIn6(ip6);
+            return connectSockaddr(io, std.posix.AF.INET6, @ptrCast(&sa), @intCast(@sizeOf(std.posix.sockaddr.in6)));
+        } else |_| {}
+
+        // hostname: getaddrinfo (libc). AF.UNSPEC, not AF.INET: the resolver
+        // returns both families in its own preference order (RFC 6724), and
+        // the loop below connects to the first entry that answers — so a
+        // v6-first resolver still reaches a v4-only server by falling through
+        // the refused v6 attempt, and vice versa. Taking only the first entry
+        // would be happy-eyeballs by luck rather than by construction.
         const host_z = std.heap.page_allocator.dupeZ(u8, host) catch return error.SystemResources;
         defer std.heap.page_allocator.free(host_z);
         var port_buf: [16]u8 = undefined;
@@ -69,7 +84,7 @@ pub const Conn = struct {
 
         const hints: std.posix.addrinfo = .{
             .flags = .{},
-            .family = std.posix.AF.INET,
+            .family = std.posix.AF.UNSPEC,
             .socktype = std.posix.SOCK.STREAM,
             .protocol = std.posix.IPPROTO.TCP,
             .addrlen = 0,
@@ -82,26 +97,51 @@ pub const Conn = struct {
         if (rc != @as(std.posix.system.EAI, @enumFromInt(0)) or res == null) return error.UnknownHost;
         defer if (res) |some| std.posix.system.freeaddrinfo(some);
 
+        // getaddrinfo can return many entries; a host has at most two families
+        // that matter here, and the fixed array is a deliberate bound rather
+        // than an allocation. The addrs are borrowed from the list, which
+        // outlives the connect loop below.
+        var cands: [16]Candidate = undefined;
+        var ncands: usize = 0;
         var it: ?*std.posix.addrinfo = res;
         while (it) |ai| : (it = ai.next) {
             if (ai.addrlen == 0 or ai.addr == null) continue;
-            const fd = openStreamSocket() catch continue;
-            std.posix.setsockopt(fd, std.posix.IPPROTO.TCP, 1, &std.mem.toBytes(@as(c_int, 1))) catch {};
-            switch (std.posix.errno(std.posix.system.connect(fd, @ptrCast(@alignCast(ai.addr.?)), @intCast(ai.addrlen)))) {
-                .SUCCESS, .INTR, .INPROGRESS, .ISCONN => {},
-                else => {
-                    closeFd(fd);
-                    continue;
-                },
-            }
-            setNonblocking(fd);
-            return connected(io, fd);
+            if (ncands == cands.len) break;
+            cands[ncands] = .{ .family = ai.family, .addr = ai.addr.?, .len = @intCast(ai.addrlen) };
+            ncands += 1;
+        }
+        return connectCandidates(io, cands[0..ncands]);
+    }
+
+    /// One place a host may be reached: an address of a specific family, in
+    /// the form `connect` accepts. `addr` is borrowed and must outlive the
+    /// connect attempt.
+    pub const Candidate = struct {
+        family: c_int,
+        addr: *const std.posix.sockaddr,
+        len: std.posix.socklen_t,
+    };
+
+    /// The connect loop proper, separated from where candidates come from
+    /// (literals, getaddrinfo) so the fallthrough is testable without betting
+    /// on the resolver's ordering of `localhost`.
+    ///
+    /// The property it exists to keep: **one failed candidate is not a failed
+    /// host.** A v6-first resolver must still reach a v4-only server — the
+    /// refused v6 connect falls through to the next entry — and a v4-only
+    /// resolver reaches a v6-only one the same way. Taking the first entry and
+    /// dying on it would be happy-eyeballs by luck rather than by construction.
+    fn connectCandidates(io: std.Io, candidates: []const Candidate) !Conn {
+        for (candidates) |c| {
+            if (connectSockaddr(io, c.family, c.addr, c.len)) |conn| {
+                return conn;
+            } else |_| continue;
         }
         return error.UnknownHost;
     }
 
-    fn openStreamSocket() !std.posix.socket_t {
-        const rc = std.posix.system.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, std.posix.IPPROTO.TCP);
+    fn openStreamSocket(family: c_int) !std.posix.socket_t {
+        const rc = std.posix.system.socket(@intCast(family), std.posix.SOCK.STREAM, std.posix.IPPROTO.TCP);
         if (std.posix.errno(rc) != .SUCCESS) return error.SocketOpen;
         return @intCast(rc);
     }
@@ -127,19 +167,34 @@ pub const Conn = struct {
         return sa;
     }
 
-    fn connectSockaddr(io: std.Io, sa: *const std.posix.sockaddr.in) !Conn {
-        const fd = try openStreamSocket();
+    /// The IPv6 twin of `sockaddrIn`, for the literal fast path. The scoped
+    /// `%zone` forms never reach here (see `connect`), so `scope_id` is the
+    /// address's own interface index — 0 for every unscoped literal.
+    fn sockaddrIn6(ip6: std.Io.net.Ip6Address) std.posix.sockaddr.in6 {
+        const In6 = std.posix.sockaddr.in6;
+        var sa: In6 = std.mem.zeroes(In6);
+        if (@hasField(In6, "len")) sa.len = @sizeOf(In6);
+        sa.family = std.posix.AF.INET6;
+        sa.port = std.mem.nativeToBig(u16, ip6.port);
+        sa.flowinfo = ip6.flow;
+        sa.addr = ip6.bytes;
+        sa.scope_id = ip6.interface.index;
+        return sa;
+    }
+
+    /// Open a stream socket of `family`, connect it to `sa` (a `sockaddr.in`,
+    /// a `sockaddr.in6`, or an addrinfo's own sockaddr — all the same bytes to
+    /// `connect`), and return the non-blocking `Conn`.
+    fn connectSockaddr(io: std.Io, family: c_int, sa: *const std.posix.sockaddr, len: std.posix.socklen_t) !Conn {
+        const fd = try openStreamSocket(family);
         errdefer closeFd(fd);
         // latency-sensitive protocol: TCP_NODELAY
         std.posix.setsockopt(fd, std.posix.IPPROTO.TCP, 1, &std.mem.toBytes(@as(c_int, 1))) catch {};
         // blocking connect (like the reference client's jnetlib), then go async
-        switch (std.posix.errno(std.posix.system.connect(fd, @ptrCast(sa), @sizeOf(std.posix.sockaddr.in)))) {
+        switch (std.posix.errno(std.posix.system.connect(fd, @ptrCast(sa), len))) {
             .SUCCESS, .INTR, .INPROGRESS => {},
             .ISCONN => {},
-            else => |e| {
-                std.debug.print("connect errno: {any}\n", .{e});
-                return error.ConnectionRefused;
-            },
+            else => return error.ConnectionRefused,
         }
         setNonblocking(fd);
         return connected(io, fd);
@@ -469,4 +524,129 @@ fn outqBytes(fd: std.posix.socket_t) ?usize {
 
 test "framing constants" {
     try std.testing.expectEqual(@as(u32, 16384), max_payload);
+}
+
+// ---- connect tests (#23) -----------------------------------------------------
+//
+// These drive `Conn.connect` against a real loopback listener, because the
+// failure they guard against is not expressible without a socket: the bug this
+// issue fixed was an `openStreamSocket` hard-coded to AF.INET — which cannot
+// even be constructed against a v6 listener — and a hints struct pinned to
+// AF.INET, which returns no v6 results to iterate at all. Both are invisible
+// to any test that does not actually cross a socket.
+
+/// Reads exactly `buf.len` bytes off a blocking socket; EOF mid-read fails.
+fn readExact(fd: std.posix.socket_t, buf: []u8) !void {
+    var got: usize = 0;
+    while (got < buf.len) {
+        const n = try std.posix.read(fd, buf[got..]);
+        if (n == 0) return error.EndOfStream;
+        got += n;
+    }
+}
+
+/// One framed round-trip over a freshly connected `Conn`: connect to the
+/// already-listening `server` by `host` text, then check the exchange.
+fn expectRoundTrip(io: std.Io, host: []const u8, server: *std.Io.net.Server) !void {
+    const port = server.socket.address.getPort();
+    var conn = try Conn.connect(io, host, port);
+    defer conn.close();
+    try assertRoundTrip(&conn, server);
+}
+
+/// The exchange itself: send a message from the client side and check the
+/// bytes the server-side socket receives — type byte, little-endian length,
+/// payload — the whole framing contract in one exchange. `server` must already
+/// have `conn` in its backlog.
+fn assertRoundTrip(conn: *Conn, server: *std.Io.net.Server) !void {
+    try conn.sendMessage(0x41, "hello");
+
+    // Accept *after* the client has connected and sent: the connection waits
+    // in the listener's backlog and the bytes in the kernel's buffers, so the
+    // whole exchange needs no second thread. Accept goes through raw posix
+    // (harness style): the listener here is blocking, and the io vtable's
+    // accept asserts its own blocking assumptions we do not need.
+    const rc = std.posix.system.accept(server.socket.handle, null, null);
+    try std.testing.expectEqual(std.posix.errno(rc), .SUCCESS);
+    const cfd: std.posix.socket_t = @intCast(rc);
+    defer Conn.closeFd(cfd);
+
+    var buf: [10]u8 = undefined;
+    try readExact(cfd, &buf);
+    try std.testing.expectEqual(@as(u8, 0x41), buf[0]);
+    try std.testing.expectEqual(@as(u32, 5), std.mem.readInt(u32, buf[1..5], .little));
+    try std.testing.expectEqualStrings("hello", buf[5..10]);
+}
+
+fn loopbackServer(family: std.Io.net.IpAddress) !std.Io.net.Server {
+    return family.listen(std.testing.io, .{});
+}
+
+test "connect: dotted-quad IPv4 literal round-trips a frame" {
+    var server = try loopbackServer(.{ .ip4 = .loopback(0) });
+    defer server.deinit(std.testing.io);
+    try expectRoundTrip(std.testing.io, "127.0.0.1", &server);
+}
+
+test "connect: IPv6 literal round-trips a frame" {
+    // The skip is for containers with IPv6 switched off at the kernel, where
+    // binding ::1 fails and no test in the repo could exercise this path.
+    // Everywhere this suite is expected to run — macOS and Linux CI runners
+    // both answer on ::1 — this is a real assertion: `::1` must reach the
+    // AF.INET6 socket.
+    var server = loopbackServer(.{ .ip6 = .loopback(0) }) catch |e| switch (e) {
+        error.AddressUnavailable => return error.SkipZigTest,
+        else => return e,
+    };
+    defer server.deinit(std.testing.io);
+    try expectRoundTrip(std.testing.io, "::1", &server);
+}
+
+test "connect: hostname resolves through AF.UNSPEC and falls through families" {
+    // "localhost" resolves to ::1 and 127.0.0.1 in some order on both CI
+    // platforms, and the resolver's order decides whether this run exercises
+    // the fallthrough — so this test proves the resolution path only, and the
+    // fallthrough has its own seam test below that does not depend on the
+    // resolver's mood.
+    var server = try loopbackServer(.{ .ip4 = .loopback(0) });
+    defer server.deinit(std.testing.io);
+    try expectRoundTrip(std.testing.io, "localhost", &server);
+}
+
+test "connect: a refused candidate falls through to the next family" {
+    // The seam version of the resolver test, with the ordering problem
+    // removed: the candidate list is v6-first *by construction* — a dead v6
+    // port, then the live v4 listener — so the property "one failed candidate
+    // is not a failed host" is exercised no matter how this machine's
+    // resolver orders localhost. Mutating `connectCandidates` to break on the
+    // first refused candidate fails exactly here.
+    var server = try loopbackServer(.{ .ip4 = .loopback(0) });
+    defer server.deinit(std.testing.io);
+    const port = server.socket.address.getPort();
+
+    var dead: std.posix.sockaddr.in6 = std.mem.zeroes(std.posix.sockaddr.in6);
+    dead.family = std.posix.AF.INET6;
+    dead.port = std.mem.nativeToBig(u16, 1); // loopback port 1: nothing listens
+    dead.addr[15] = 1;
+    var live: std.posix.sockaddr.in = std.mem.zeroes(std.posix.sockaddr.in);
+    live.family = std.posix.AF.INET;
+    live.port = std.mem.nativeToBig(u16, port);
+    live.addr = @bitCast([4]u8{ 127, 0, 0, 1 });
+    const cands = [_]Conn.Candidate{
+        .{ .family = std.posix.AF.INET6, .addr = @ptrCast(&dead), .len = @sizeOf(std.posix.sockaddr.in6) },
+        .{ .family = std.posix.AF.INET, .addr = @ptrCast(&live), .len = @sizeOf(std.posix.sockaddr.in) },
+    };
+    var conn = try Conn.connectCandidates(std.testing.io, &cands);
+    defer conn.close();
+    try assertRoundTrip(&conn, &server);
+}
+
+test "sockaddrIn6: builds the wire struct for a loopback literal" {
+    const ip6 = try std.Io.net.Ip6Address.parse("::1", 20531);
+    const sa = Conn.sockaddrIn6(ip6);
+    try std.testing.expectEqual(@as(std.posix.sa_family_t, std.posix.AF.INET6), sa.family);
+    try std.testing.expectEqual(std.mem.nativeToBig(u16, 20531), sa.port);
+    try std.testing.expectEqual(@as(u8, 1), sa.addr[15]);
+    try std.testing.expectEqualSlices(u8, &[_]u8{0} ** 15, sa.addr[0..15]);
+    try std.testing.expectEqual(@as(u32, 0), sa.scope_id);
 }

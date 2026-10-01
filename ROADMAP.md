@@ -169,8 +169,12 @@ real instrument is **control while it runs**.
 > file — putting it inside `proto.zig`/`buf.zig` re-breaks the byte-identical
 > invariant that #29 restores. See [ISSUES.md](ISSUES.md).
 
-- [ ] **IPv6 transport.** (#23) The CLI parses `[::1]:port`, but `net.zig` resolves
-      via `AF.INET` only — add IPv6 resolution and dual-stack sockets.
+- [x] **IPv6 transport.** (#23) ✅ **Landed.** `net.zig` is family-agnostic: IPv6
+      literals take a `sockaddr_in6` fast path, the getaddrinfo hint is
+      `AF.UNSPEC` and the loop opens each candidate's own socket and falls
+      through a refused connect to the next family, so v6-first resolvers still
+      reach v4-only servers (and vice versa). Verified end-to-end against the
+      reference `ninjamsrv` over `[::1]` and covered by loopback tests.
 - [ ] **Reconnect with backoff.** (#24) On `EndOfStream`/stall, rejoin and resume
       from the next bar instead of exiting (the run loop's stall detector
       already notices). Unblocked by #12: the bar counter is now independent of
