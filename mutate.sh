@@ -292,6 +292,50 @@ run src/kujamba_timing.zig \
 # whole frames in, three frames and a 22-byte tail out — with no sockets in it,
 # so it cannot be lost to a platform's socket accounting.
 
+# ============ #24 reconnect ===================================================
+
+run src/ninjam_out.zig \
+'        if (delay >= max_ms) return max_ms;' \
+'        if (false) return max_ms;' \
+"#24: the backoff no longer clamps at its ceiling" 22
+
+run src/ninjam/session.zig \
+'                    if (dials_used >= self.opts.reconnect_attempts) {' \
+'                    if (dials_used > self.opts.reconnect_attempts) {' \
+"#24: the dial budget allows one attempt more than it should" 23
+
+run src/ninjam/session.zig \
+'        self.bpm = 0;
+        self.bpi = 0;' \
+'        self.bpm = self.bpm;
+        self.bpi = self.bpi;' \
+"#24: the reconnect no longer forces the fresh config to re-anchor" 24
+
+run src/ninjam/session.zig \
+'        self.drop_marked = false;
+        self.index.reanchor(0);' \
+'        self.drop_marked = false;
+        self.index.seq = 0;
+        self.index.reanchor(0);' \
+"#24: a reconnect resets interval identity and re-issues guids" 25
+
+run src/ninjam/session.zig \
+'                        self.markConnectionLost("read failed: {s}", .{@errorName(e)});
+                        continue :outer;' \
+'                    return self.failSession("read failed: {s}", .{@errorName(e)});' \
+"#24: an EndOfStream kills the session instead of reconnecting" 26
+
+run src/ninjam/session.zig \
+'                self.markConnectionLost("connection stalled: no data for {d}ms", .{now_ms - self.conn.?.last_recv_ms});
+                continue :outer;' \
+'                return self.failSession("connection stalled: no data for {d}ms", .{now_ms - self.conn.?.last_recv_ms});' \
+"#24: the stall detector kills the session instead of reconnecting" 27
+
+run src/ninjam/session.zig \
+'                    const outage = clock.nowNs(self.io) - self.conn_lost_ns.?;' \
+'                    const outage: i128 = 0;' \
+"#24: the outage clock stops being credited to the RESULT line" 28
+
 echo "=== reverted: the suite must be green again ==="
 restore
 zig build test --summary all 2>&1 | grep -E "^Build Summary:" | tail -1

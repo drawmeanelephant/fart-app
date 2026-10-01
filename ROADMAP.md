@@ -175,12 +175,18 @@ real instrument is **control while it runs**.
       through a refused connect to the next family, so v6-first resolvers still
       reach v4-only servers (and vice versa). Verified end-to-end against the
       reference `ninjamsrv` over `[::1]` and covered by loopback tests.
-- [ ] **Reconnect with backoff.** (#24) On `EndOfStream`/stall, rejoin and resume
-      from the next bar instead of exiting (the run loop's stall detector
+- [x] **Reconnect with backoff.** (#24) ✅ On `EndOfStream`/stall, rejoin and
+      resume from the next bar instead of exiting (the run loop's stall detector
       already notices). Unblocked by #12: the bar counter is now independent of
       interval identity, and `IntervalIndex.reanchor` is the hook for a resume.
-      Still needs a test of the `--intervals` cap across a reconnect, which
-      #12 could not reach without a socket.
+      The `--intervals` cap counts the monotonic sequence, so it now demonstrably
+      spans reconnects — the seam test #12 could not reach without a socket is
+      in, driven against a scripted server that kills the connection mid-bar.
+      The `--reconnect [N]` flag turns it on; it is deliberately **off by
+      default** so the CI demo keeps reporting connection deaths verbatim while
+      #28 is open — a reconnect that papers over the flake would blind the gate
+      measuring it. The `RESULT` line reports `reconnects=` and the total
+      `outage_ms=` either way.
 - [ ] **Cross-platform builds.** (#25) `kujamba` is mostly portable (posix sockets);
       verify on Linux and Windows (Winsock) and drop the macOS-only assumption
       that lives in `src/main.zig`, not the instrument.

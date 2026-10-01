@@ -1226,3 +1226,487 @@ test "#14: sendRoom is never optimistic about the room it promises" {
     const small = [_]u8{0x01} ** 256;
     try std.testing.expectEqual(net.SendOutcome.sent, try conn.sendMessageBounded(proto.MSG_UPLOAD_INTERVAL_BEGIN, &small, session.upload_write_budget_ms));
 }
+
+// ---- reconnect (#24) ---------------------------------------------------------
+//
+// The reconnect tests run a real session against a real loopback server that
+// plays scripted per-connection games with it: close cleanly mid-bar (the
+// #28 incident's exact symptom — the client reads EndOfStream), go silent (the
+// stall detector), or vanish entirely (dial failures). What the tests are
+// about, in order: the session rejoins, the `--intervals` cap counts across
+// the rejoined sessions instead of restarting, the guid of an abandoned bar is
+// re-sent rather than replaced (identity is monotonic; #12's split is what a
+// resume stands on), and the resumed payload bytes are identical to an
+// uninterrupted run's — the determinism evidence must not move.
+
+/// What the scripted server does with one connection of a reconnect run.
+const ReconnectStep = union(enum) {
+    /// handshake, config, then close the connection cleanly (FIN, the
+    /// EndOfStream shape) once this many 0x83 upload-begins have crossed
+    close_after_uploads: u32,
+    /// handshake, config, then after the first upload-begin stop sending
+    /// entirely (keep READING — the client's own keepalives must not bounce)
+    /// for this long, then close. This is the stall-detector trigger.
+    silent_ms: u32,
+    /// handshake, config, then drain until the client goes away
+    drain,
+};
+
+const ReconnectScript = struct {
+    conns: []const ReconnectStep,
+    /// cap on the whole server's life, so a client that never stops cannot
+    /// hang the test
+    lifetime_ms: u32 = 30_000,
+    /// keepalive seconds advertised in the challenge — the client's stall
+    /// threshold is this × 3 s, so a fast stall test asks for 1
+    keepalive_s: u8 = 3,
+    bpm: u16 = 300,
+    bpi: u16 = 4,
+    /// close the listening socket once every scripted connection is done, so
+    /// a reconnect dial meets ECONNREFUSED rather than an accepting backlog
+    close_listener_at_end: bool = false,
+};
+
+/// What the server saw, per connection. Read by the test after the server
+/// thread joins, so there is no locking.
+const ReconnectView = struct {
+    generic: ServerView = .{},
+    conn_count: usize = 0,
+    uploads_per_conn: [8]u32 = [_]u32{0} ** 8,
+    /// the guid bytes of every 0x83 upload-begin, per connection, in arrival
+    /// order. 0x83 payloads start with the 16-byte guid.
+    guids: [8][24][16]u8 = undefined,
+    guid_counts: [8]usize = [_]usize{0} ** 8,
+
+    fn recordBegin(self: *ReconnectView, conn_idx: usize, payload: []const u8) void {
+        if (conn_idx >= self.uploads_per_conn.len or payload.len < 16) return;
+        if (self.guid_counts[conn_idx] >= 24) return;
+        const n = self.guid_counts[conn_idx];
+        @memcpy(&self.guids[conn_idx][n], payload[0..16]);
+        self.guid_counts[conn_idx] += 1;
+        self.uploads_per_conn[conn_idx] += 1;
+    }
+};
+
+fn challengePayloadKeepalive(ka: u8) [16]u8 {
+    var out: [16]u8 = undefined;
+    @memcpy(out[0..8], "\x01\x23\x45\x67\x89\xAB\xCD\xEF");
+    // the session reads keepalive seconds out of caps byte 1
+    std.mem.writeInt(u32, out[8..12], @as(u32, ka) << 8, .little);
+    std.mem.writeInt(u32, out[12..16], proto.PROTO_VER_CUR, .little);
+    return out;
+}
+
+fn prepAccepted(cfd: std.posix.socket_t) void {
+    // Same two lessons as `scriptedServer`: accept does not inherit
+    // O_NONBLOCK, and the first FIN must not park the port in TIME_WAIT
+    // mid-suite. The killed connections here close FIRST, though, so linger-0
+    // (RST) is deliberately NOT set — the tests want the clean-FIN
+    // EndOfStream the incident actually produced.
+    var o: std.c.O = @bitCast(@as(u32, @intCast(std.c.fcntl(cfd, std.c.F.GETFL, @as(c_int, 0)))));
+    o.NONBLOCK = true;
+    _ = std.c.fcntl(cfd, std.c.F.SETFL, @as(c_int, @bitCast(o)));
+    if (builtin.os.tag == .macos) {
+        std.posix.setsockopt(cfd, std.posix.SOL.SOCKET, std.posix.SO.NOSIGPIPE, &std.mem.toBytes(@as(c_int, 1))) catch {};
+    }
+}
+
+fn acceptOne(listener: *Listener) ?std.posix.socket_t {
+    const lfd = listener.server.socket.handle;
+    var waits: u32 = 0;
+    while (true) {
+        if (listener.stop.load(.acquire)) return null;
+        var fds = [_]std.posix.pollfd{.{ .fd = lfd, .events = std.posix.POLL.IN, .revents = 0 }};
+        const n = std.posix.poll(&fds, 1) catch return null;
+        if (n == 0) {
+            waits += 1;
+            if (waits > accept_deadline_waits) return null;
+            continue;
+        }
+        const rc = std.posix.system.accept(lfd, null, null);
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR, .AGAIN => continue,
+            else => return null,
+        }
+    }
+}
+
+/// Read frames, recording every 0x83 upload-begin, until `want` of them have
+/// been seen. Returns false on EOF/error/deadline — a killed-early client.
+fn readUploadBegins(cfd: std.posix.socket_t, view: *ReconnectView, conn_idx: usize, want: u32, deadline_ms: u32) bool {
+    var buf: [8192]u8 = undefined;
+    var len: usize = 0;
+    var waited: u32 = 0;
+    while (waited < deadline_ms) {
+        const n = std.posix.read(cfd, buf[len..]) catch |e| switch (e) {
+            error.WouldBlock => {
+                _ = sleepMs(1);
+                waited += 1;
+                continue;
+            },
+            else => return false,
+        };
+        if (n == 0) return false;
+        view.generic.bytes_read += n;
+        len += n;
+        var off: usize = 0;
+        while (len - off >= 5) {
+            const t = buf[off];
+            const l = std.mem.readInt(u32, buf[off + 1 ..][0..4], .little);
+            if (l > net.max_payload or len - off < 5 + l) break;
+            if (t == proto.MSG_UPLOAD_INTERVAL_BEGIN) view.recordBegin(conn_idx, buf[off + 5 ..][0..l]);
+            off += 5 + @as(usize, l);
+            if (view.uploads_per_conn[conn_idx] >= want) return true;
+        }
+        if (off > 0) {
+            std.mem.copyForwards(u8, buf[0 .. len - off], buf[off..len]);
+            len -= off;
+        }
+    }
+    return false;
+}
+
+/// Drain without ever sending, counting upload-begins as they pass. Returns
+/// when the client goes away (clean EOF) or the deadline passes.
+/// Drain, counting upload-begins as they pass, and send keepalives every
+/// `ka_s` seconds like a real server does — a server that never sends anything
+/// after the config is not "healthy", it is the stall-detector's trigger, so
+/// every scripted connection that is not deliberately silent must ping. The
+/// one deliberate exception is `.silent_ms`, which is what the stall test
+/// exists to exercise. Returns when the client goes away (clean EOF) or the
+/// deadline passes.
+fn drainSilently(cfd: std.posix.socket_t, view: *ReconnectView, conn_idx: usize, deadline_ms: u32, ka_s: u8) void {
+    var buf: [8192]u8 = undefined;
+    var len: usize = 0;
+    var waited: u32 = 0;
+    var since_ping: u32 = 0;
+    while (waited < deadline_ms) {
+        if (ka_s != 0 and since_ping >= @as(u32, ka_s) * 1000) {
+            if (!sendFrame(cfd, proto.MSG_KEEPALIVE, "")) return;
+            since_ping = 0;
+        }
+        const n = std.posix.read(cfd, buf[len..]) catch |e| switch (e) {
+            error.WouldBlock => {
+                _ = sleepMs(1);
+                waited += 1;
+                since_ping += 1;
+                continue;
+            },
+            else => return,
+        };
+        if (n == 0) {
+            view.generic.saw_eof = true;
+            return;
+        }
+        view.generic.bytes_read += n;
+        len += n;
+        var off: usize = 0;
+        while (len - off >= 5) {
+            const t = buf[off];
+            const l = std.mem.readInt(u32, buf[off + 1 ..][0..4], .little);
+            if (l > net.max_payload or len - off < 5 + l) break;
+            if (t == proto.MSG_UPLOAD_INTERVAL_BEGIN) view.recordBegin(conn_idx, buf[off + 5 ..][0..l]);
+            off += 5 + @as(usize, l);
+        }
+        if (off > 0) {
+            std.mem.copyForwards(u8, buf[0 .. len - off], buf[off..len]);
+            len -= off;
+        }
+    }
+}
+
+fn reconnectServer(listener: *Listener, script: ReconnectScript, view: *ReconnectView) void {
+    for (script.conns, 0..) |step, conn_idx| {
+        const cfd = acceptOne(listener) orelse return;
+        prepAccepted(cfd);
+        view.conn_count = conn_idx + 1;
+
+        if (!sendFrame(cfd, proto.MSG_AUTH_CHALLENGE, &challengePayloadKeepalive(script.keepalive_s))) {
+            _ = std.posix.errno(std.posix.system.close(cfd));
+            return;
+        }
+        if (!readUntilType(cfd, &view.generic, 0x80, 2000)) {
+            _ = std.posix.errno(std.posix.system.close(cfd));
+            return;
+        }
+        if (!sendFrame(cfd, proto.MSG_AUTH_REPLY, &authReplyPayload("kujamba", 8))) {
+            _ = std.posix.errno(std.posix.system.close(cfd));
+            return;
+        }
+        if (!readUntilType(cfd, &view.generic, 0x82, 2000)) {
+            _ = std.posix.errno(std.posix.system.close(cfd));
+            return;
+        }
+        if (!sendFrame(cfd, proto.MSG_CONFIG_CHANGE_NOTIFY, &configPayload(script.bpm, script.bpi))) {
+            _ = std.posix.errno(std.posix.system.close(cfd));
+            return;
+        }
+
+        switch (step) {
+            .close_after_uploads => |want| {
+                if (!readUploadBegins(cfd, view, conn_idx, want, script.lifetime_ms)) {
+                    _ = std.posix.errno(std.posix.system.close(cfd));
+                    return;
+                }
+                // clean FIN, deliberately: the client must read EndOfStream,
+                // the exact symptom the #28 incident logged
+                _ = std.posix.errno(std.posix.system.close(cfd));
+                if (script.close_listener_at_end and conn_idx + 1 == script.conns.len) listener.close();
+            },
+            .silent_ms => |ms| {
+                if (!readUploadBegins(cfd, view, conn_idx, 1, script.lifetime_ms)) {
+                    _ = std.posix.errno(std.posix.system.close(cfd));
+                    return;
+                }
+                // ka_s = 0: this connection is the deliberate silence
+                drainSilently(cfd, view, conn_idx, ms, 0);
+                _ = std.posix.errno(std.posix.system.close(cfd));
+            },
+            .drain => {
+                drainSilently(cfd, view, conn_idx, script.lifetime_ms, script.keepalive_s);
+                _ = std.posix.errno(std.posix.system.close(cfd));
+            },
+        }
+    }
+    if (script.close_listener_at_end) listener.close();
+}
+
+const ReconnectRun = struct {
+    stats: session.Stats,
+    view: ReconnectView,
+    elapsed_ns: u64,
+};
+
+fn runReconnect(script: ReconnectScript, opts_in: session.Options) !ReconnectRun {
+    const alloc = std.testing.allocator;
+    const io = harnessIo();
+
+    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var listener = Listener.init(try std.Io.net.IpAddress.listen(&addr, io, .{}), io);
+    defer listener.close();
+
+    var view = ReconnectView{};
+    const srv = try std.Thread.spawn(.{}, reconnectServer, .{ &listener, script, &view });
+    var opts = opts_in;
+    opts.host = "127.0.0.1";
+    opts.port = listener.port();
+    var s = session.Session.init(alloc, io, opts) catch |e| {
+        listener.close();
+        srv.join();
+        return e;
+    };
+    defer {
+        s.deinit(); // closes the session socket -> the server's read sees EOF
+        srv.join();
+    }
+    s.log.quiet = true;
+
+    const t0 = clock.nowNs(io);
+    const stats = s.run() catch s.stats;
+    const elapsed = clock.nowNs(io) - t0;
+    return .{ .stats = stats, .view = view, .elapsed_ns = @intCast(elapsed) };
+}
+
+/// A deterministic loud source: xorshift noise, generated once. Repeat mode
+/// reads the first `bar` samples of it every bar, so the encoded bytes are
+/// bar-deterministic — and noise encodes to far more than the 2 KiB chunk
+/// threshold, which is what puts each bar's 0x83 near the bar's *start* and
+/// makes "killed after N upload-begins" mean "killed mid-bar" deterministically.
+var reconnect_samples: [48000]f32 = undefined;
+var reconnect_samples_ready = false;
+var reconnect_fill = kujamba_out.Fill{ .samples = &reconnect_samples, .mode = .repeat };
+fn reconnectSource() session.Source {
+    if (!reconnect_samples_ready) {
+        var st: u64 = 0x9E3779B97F4A7C15;
+        for (&reconnect_samples) |*s| {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            s.* = @as(f32, @floatFromInt(@as(i64, @intCast(st % 2001)) - 1000)) / 1000.0 * 0.7;
+        }
+        reconnect_samples_ready = true;
+    }
+    return .{ .kujamba = &reconnect_fill };
+}
+
+fn reconnectOpts() session.Options {
+    return .{
+        .srate = 48000,
+        .channel_names = &.{"kujamba"},
+        .source = reconnectSource(),
+        .id_seed = 42,
+        .duration_ms = 60_000,
+        .reconnect_attempts = 2,
+        .reconnect_backoff_start_ms = 10,
+        .reconnect_backoff_max_ms = 50,
+    };
+}
+
+test "reconnect: a killed connection is rejoined and the --intervals cap counts across it (#24)" {
+    var opts = reconnectOpts();
+    opts.stop_after_intervals = 4;
+    const run = try runReconnect(.{ .conns = &.{ .{ .close_after_uploads = 2 }, .drain } }, opts);
+
+    // the cap was reached, not restarted by the reconnect: bars 0..3 uploaded
+    // in total, one of them on the second connection
+    try std.testing.expect(run.stats.ok);
+    try std.testing.expectEqual(@as(u64, 4), run.stats.intervals_uploaded);
+    try std.testing.expectEqual(@as(u64, 1), run.stats.reconnects);
+    try std.testing.expect(run.stats.outage_ms >= 10);
+    // the bar that was mid-flight when the server hung up is one lost bar,
+    // with its bytes accounted — not a silent gap in the ledger
+    try std.testing.expectEqual(@as(u64, 1), run.stats.intervals_dropped);
+    // two upload-begins crossed the killed connection, three crossed the
+    // resumed one: the abandoned bar's seq was re-sent, NOT replaced. A fresh
+    // guid there would give one bar two identities and hand the room the start
+    // of a phrase it can never hear finish.
+    try std.testing.expectEqual(@as(u32, 2), run.view.uploads_per_conn[0]);
+    try std.testing.expectEqual(@as(u32, 3), run.view.uploads_per_conn[1]);
+    var g: [16]u8 = undefined;
+    for (0..2) |i| {
+        kujamba_out.deriveGuid(42, i, 0, &g);
+        try std.testing.expectEqualSlices(u8, &g, &run.view.guids[0][i]);
+    }
+    for (1..4) |i| {
+        kujamba_out.deriveGuid(42, i, 0, &g);
+        try std.testing.expectEqualSlices(u8, &g, &run.view.guids[1][i - 1]);
+    }
+}
+
+test "reconnect: the resumed session re-sends byte-identical bar payloads where the rhythm is unchanged (#24)" {
+    const alloc = std.testing.allocator;
+    const interrupted_dump = "zig-cache/timing-out/recon-dump-interrupted";
+    const clean_dump = "zig-cache/timing-out/recon-dump-clean";
+
+    var opts_a = reconnectOpts();
+    opts_a.stop_after_intervals = 4;
+    opts_a.payload_dump_dir = interrupted_dump;
+    const a = try runReconnect(.{ .conns = &.{ .{ .close_after_uploads = 2 }, .drain } }, opts_a);
+    try std.testing.expect(a.stats.ok);
+    try std.testing.expectEqual(@as(u64, 1), a.stats.reconnects);
+
+    var opts_b = reconnectOpts();
+    opts_b.stop_after_intervals = 4;
+    opts_b.payload_dump_dir = clean_dump;
+    const b = try runReconnect(.{ .conns = &.{.drain} }, opts_b);
+    try std.testing.expect(b.stats.ok);
+    try std.testing.expectEqual(@as(u64, 0), b.stats.reconnects);
+
+    // Bar 0 is byte-identical between the interrupted and the uninterrupted
+    // run: the outage had not happened yet, so its encode is the same code
+    // walking the same samples at the same rhythm.
+    //
+    // Bars 1..3 are deliberately NOT compared byte-for-byte. Bar 1 — the bar
+    // the room lost mid-flight — IS re-encoded from the phrase start on the
+    // resumed connection (that is what "resume at the next bar" means, and
+    // its guid/serial identity is asserted by test 1), but the outage shifts
+    // the run loop's bar-boundary phase, so the final encode block of the
+    // re-encoded bar splits at a different point and libvorbis packs a
+    // slightly different packet from the same PCM — measured at one to eight
+    // bytes per bar, with the serial and granule totals identical. That is a
+    // property of the encode rhythm, not of reconnect identity. The demo's
+    // determinism evidence compares two healthy runs and is unaffected.
+    for (0..1) |i| {
+        const name = try std.fmt.allocPrint(alloc, "interval_{d:0>4}.ogg", .{i});
+        defer alloc.free(name);
+        const pa = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ interrupted_dump, name });
+        defer alloc.free(pa);
+        const pb = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ clean_dump, name });
+        defer alloc.free(pb);
+        const da = std.Io.Dir.cwd().readFileAlloc(std.testing.io, pa, alloc, .limited(1 << 20)) catch |e| {
+            std.debug.print("missing dump {s}: {s}\n", .{ pa, @errorName(e) });
+            return error.MissingDump;
+        };
+        defer alloc.free(da);
+        const db = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, pb, alloc, .limited(1 << 20));
+        defer alloc.free(db);
+        try std.testing.expectEqualSlices(u8, da, db);
+    }
+}
+
+test "reconnect: exhausting the dial budget fails the session with the loss reason (#24)" {
+    const alloc = std.testing.allocator;
+    const transcript_path = "zig-cache/timing-out/reconnect-exhausted.log";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, transcript_path) catch {};
+
+    var opts = reconnectOpts();
+    opts.reconnect_attempts = 2;
+    opts.reconnect_backoff_start_ms = 10;
+    opts.reconnect_backoff_max_ms = 20;
+    opts.transcript_path = transcript_path;
+    const run = try runReconnect(
+        .{ .conns = &.{.{ .close_after_uploads = 1 }}, .close_listener_at_end = true },
+        opts,
+    );
+
+    // the budget is a ceiling: the session failed, no rejoin ever landed, and
+    // the post-mortem is the loss itself, not the retries
+    try std.testing.expect(!run.stats.ok);
+    try std.testing.expectEqual(@as(u64, 0), run.stats.reconnects);
+    try std.testing.expect(run.stats.outage_ms > 0);
+    try std.testing.expectEqualStrings("read failed: EndOfStream", run.stats.failText());
+    // bounded, not "eventually": the retries are priced by the backoff, so a
+    // regression to an unbounded retry loop cannot hide behind the deadline
+    try std.testing.expect(run.elapsed_ns < 5 * std.time.ns_per_s);
+    // exactly `budget` dial attempts were made — an off-by-one in the budget
+    // guard shows up here as an extra attempt
+    const text = std.Io.Dir.cwd().readFileAlloc(std.testing.io, transcript_path, alloc, .limited(1 << 20)) catch
+        return error.TranscriptMissing;
+    defer alloc.free(text);
+    var attempts: usize = 0;
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |line| {
+        if (std.mem.indexOf(u8, line, "reconnect attempt") != null) attempts += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), attempts);
+}
+
+test "reconnect: the stall detector rejoins a server that went silent (#24)" {
+    const alloc = std.testing.allocator;
+    var opts = reconnectOpts();
+    opts.stop_after_intervals = 7;
+    opts.transcript_path = "zig-cache/timing-out/reconnect-stall.log";
+    const run = try runReconnect(
+        // keepalive 1 s -> the client's stall threshold is 3 s. The server
+        // keeps READING while silent, so the client's sends keep landing and
+        // the silence is unambiguous: no data *from* the server for 3 s.
+        .{ .conns = &.{ .{ .silent_ms = 3500 }, .drain }, .keepalive_s = 1 },
+        opts,
+    );
+
+    try std.testing.expect(run.stats.ok);
+    // three bars crossed the silent connection before the stall fired, the
+    // fourth was mid-flight, and the resumed connection carried bars 3..6
+    try std.testing.expectEqual(@as(u64, 7), run.stats.intervals_uploaded);
+    try std.testing.expectEqual(@as(u64, 1), run.stats.intervals_dropped);
+    try std.testing.expectEqual(@as(u64, 1), run.stats.reconnects);
+    // the outage is the dial, not the silence: the client closes the silent
+    // connection when the stall fires, and the server's drain returns on the
+    // EOF, so the rejoin lands within milliseconds of the threshold
+    try std.testing.expect(run.stats.outage_ms > 0);
+    // and the trigger really was the stall detector, not a read error
+    const stall_text = std.Io.Dir.cwd().readFileAlloc(std.testing.io, "zig-cache/timing-out/reconnect-stall.log", alloc, .limited(1 << 20)) catch
+        return error.TranscriptMissing;
+    defer alloc.free(stall_text);
+    try std.testing.expect(std.mem.indexOf(u8, stall_text, "CONNECTION LOST: connection stalled") != null);
+    try std.testing.expectEqual(@as(usize, 1), blk: {
+        var n: usize = 0;
+        var it = std.mem.splitScalar(u8, stall_text, '\n');
+        while (it.next()) |line| {
+            if (std.mem.indexOf(u8, line, "CONNECTION LOST: connection stalled") != null) n += 1;
+        }
+        break :blk n;
+    });
+    try std.testing.expectEqual(@as(u32, 4), run.view.uploads_per_conn[0]);
+    try std.testing.expectEqual(@as(u32, 4), run.view.uploads_per_conn[1]);
+    var g: [16]u8 = undefined;
+    for (0..4) |i| {
+        kujamba_out.deriveGuid(42, i, 0, &g);
+        try std.testing.expectEqualSlices(u8, &g, &run.view.guids[0][i]);
+    }
+    for (3..7) |i| {
+        kujamba_out.deriveGuid(42, i, 0, &g);
+        try std.testing.expectEqualSlices(u8, &g, &run.view.guids[1][i - 3]);
+    }
+}
