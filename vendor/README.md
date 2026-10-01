@@ -12,7 +12,7 @@ ecosystem. Each dependency is a single file or a source-only tree.
 
 Provenance: the 15 Zig files in `src/ninjam/`, both Xiph source trees, and
 the miniaudio/stb headers and shims match zclient in `drawmeanelephant/ninjam`
-at **`c2a0d95848c590f8e259cbe105fb68b9a128e791`** byte-for-byte. The null-audio
+at **`ae9a4d4325addd42d844047c080b9e1c0d6080d4`** byte-for-byte. The null-audio
 ABI test also matches upstream (`src/audio_shim_test.c` here,
 `zclient/tests/audio_shim_test.c` there). The C dependencies are
 compiled exactly as zclient's `build.zig` compiles them (same source list,
@@ -21,12 +21,12 @@ work (trimming the Xiph tarballs to the files the build needs) is preserved;
 `libvorbis` is 1.3.7 because that is what the reference client's CMake
 FetchContent also uses, so both encoders link the same version.
 
-**Pending upstream merge:** this pin is the tip of the reviewed feature branch
-`droid/instrument-interfaces-29`, based on `agent/zclient` tip
-`17905c5bdf85ff6d385a9741ebadb2e214071d0c`. It is not yet merged. Land the
-upstream PR first, then repin this document and README to its actual merged
-commit, repeat the checks below and the demo, and only then merge downstream.
-Windows (#25) is deferred separately and is not a prerequisite.
+**Merged upstream pin:** [ninjam#38](https://github.com/drawmeanelephant/ninjam/pull/38)
+landed in `agent/zclient` on 2026-10-01 at the commit above. Its zclient tree
+is unchanged from reviewed feature commit
+`c2a0d95848c590f8e259cbe105fb68b9a128e791`. The exact identity checks and
+reference demo have been repeated after the merge. Windows (#25) remains
+deferred separately and is not a prerequisite for downstream reconciliation.
 
 The shared shim resolves playback and capture IDs separately from one
 enumeration snapshot, retains its context until close, supports playback-only
@@ -43,7 +43,7 @@ Run from this repository, with `NINJAM_CHECKOUT` set to that checkout:
 
 ```sh
 set -e
-pin=c2a0d95848c590f8e259cbe105fb68b9a128e791
+pin=ae9a4d4325addd42d844047c080b9e1c0d6080d4
 test "$(git -C "$NINJAM_CHECKOUT" rev-parse HEAD)" = "$pin"
 git -C "$NINJAM_CHECKOUT" diff --exit-code HEAD -- zclient/src zclient/vendor zclient/tests
 diff -r "$NINJAM_CHECKOUT/zclient/src" src/ninjam

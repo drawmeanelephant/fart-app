@@ -416,11 +416,11 @@ file is what a listener would have heard:
 
 * VENDORED (upstream changes first): all **15 files** in `src/ninjam/` and
   the C dependency subset match **drawmeanelephant/ninjam commit
-  `c2a0d95848c590f8e259cbe105fb68b9a128e791`** byte-for-byte.
-  This is the #29 review branch `droid/instrument-interfaces-29`, based on
-  `agent/zclient`, **not a merged upstream pin**. Downstream merging waits
-  for upstream to land, followed by a final merged-commit repin and identity
-  check. See [`vendor/README.md`](vendor/README.md) for reproducible checks.
+  `ae9a4d4325addd42d844047c080b9e1c0d6080d4`** byte-for-byte,
+  the merge of [ninjam#38](https://github.com/drawmeanelephant/ninjam/pull/38)
+  into `agent/zclient`. The merged source is unchanged from the reviewed
+  feature commit. See [`vendor/README.md`](vendor/README.md) for reproducible
+  identity checks.
 * LOCAL: `src/ninjam_out.zig` owns phrase banks, bar patterns and play modes;
   `src/kujamba_main.zig` owns CLI/chat commands and stop wiring.
   App integration tests live in `src/kujamba_session_tests.zig`. The shared

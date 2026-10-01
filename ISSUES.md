@@ -12,8 +12,9 @@ Windows (#25). `zig build test` → **218/218 pass**, in Debug, ReleaseSafe and
 `-Dlive=false`, plus the hardware-independent C audio test. CI runs native
 Linux/macOS builds and tests, with `build-test` and `demo-e2e` required on main.
 #58 provisioning hardening has landed. The #26 crash bugs (#40, #41) are fixed.
-#29's upstream feature batch and byte-identical downstream subset are ready
-for review, but upstream merging and the final merged-commit pin are pending.
+#29's upstream feature batch landed in ninjam#38. The byte-identical downstream
+subset is pinned to its actual merge commit and ready for downstream review;
+#29 remains open until the downstream PR lands.
 
 Tracking issue for this map: [#31](https://github.com/drawmeanelephant/fart-app/issues/31).
 
@@ -116,12 +117,12 @@ selects the next interval once, and never selects past the interval cap.
 
 ## Vendored-file ledger
 
-All **15 of 15** files in `src/ninjam/` now match the upstream feature commit
-`c2a0d95848c590f8e259cbe105fb68b9a128e791`, based on `agent/zclient` tip
-`17905c5bdf85ff6d385a9741ebadb2e214071d0c`. The C shim and generated Ogg
-config header also match, with no source exceptions. This is a real review
-commit, **not yet a merged upstream pin**. Upstream must land first, then
-downstream must repin and recheck before merging; #29 is not closed yet.
+All **15 of 15** files in `src/ninjam/` now match the upstream merge commit
+`ae9a4d4325addd42d844047c080b9e1c0d6080d4` (ninjam#38 into `agent/zclient`).
+The C shim and generated Ogg config header also match, with no source
+exceptions. The merged zclient tree is identical to the reviewed feature
+commit; identity checks and the reference demo have been repeated.
+Only downstream review/merge remains before #29 can close.
 The old `f428caf` pin and three-file divergence ledger are superseded.
 See `vendor/README.md` for the exact identity check.
 
