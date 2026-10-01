@@ -120,11 +120,17 @@ real instrument is **control while it runs**.
 
 ## M6 — Sounds like an instrument (the synth as a playable voice)
 
-- [ ] **Velocity / dynamics input.** (#15) Map a per-phrase or per-word intensity to
-      `STRESS_LEVEL_BOOST` and the noise mix so phrases can be shouted or
-      whispered.
-- [ ] **Controllable vowel pitch table.** (#16) Let a preset shift the base freqs
-      (`vowelBaseFreq`) up/down in cents for different "instruments."
+- [x] **Velocity / dynamics input.** (#15) ✅ **landed** (PR #50): `--voice
+      intensity=N` / `[voice] intensity` scales level and noise mix together
+      (`applyEffort`) across 0.25–4, carries the stress emphasis (`stressBoost`:
+      whisper flattens dynamics, shout caps at 2× the stock 1.2), and reaches
+      the breath tail and the shuzi rumble. Byte-identical per value.
+- [x] **Controllable vowel pitch table.** (#16) ✅ **landed** (PR #50): `--voice
+      cents=N` / `[voice] cents` shifts every vowel base freq by `2^(N/1200)`
+      (clamped ±1200), applied to `vowelBaseFreq`'s output only so `PITCH_DROP`
+      keeps the character; the breath tail's 88 Hz carrier shifts with it,
+      shuzi does not. `cents == 0` is a bit-exact identity the golden
+      fingerprints assert.
 - [x] **Loop seam crossfade.** (#17) ✅ **Already satisfied — no crossfade
       needed, and adding one regresses.** Measured: the loop wrap is already
       *exactly* click-free (wrap step 0.000000 on every phrase) because the synth
@@ -155,8 +161,13 @@ real instrument is **control while it runs**.
       NAME|INDEX` picks the output; a missing device (or a build without
       `-Dlive`) exits 1 with a clear message. The bare positional phrase the
       issue names parses now too (`--phrase` still works, one or the other).
-- [ ] **Real-time trigger input** (#21) — a keyboard/MIDI note maps to a phrase or a
-      single syllable (`shuzi`) so it can be played like a sampler.
+- [x] **Real-time trigger input** (#21) ✅ **landed** (PR #48): `kujamba trigger`
+      is the sampler — `[map]` in the config binds note N to a phrase or
+      `shuzi:<seed>`, stdin lines (`on <N>` / `off <N>` / `q`) or `--script
+      FILE` fire note-ons, and rendering happens on the note-on itself (<50 ms,
+      well inside a bar). Device-free and headless by design; a hardware MIDI
+      backend (CoreMIDI/ALSA) was deliberately left out and would be its own
+      issue.
 - [ ] **Config file** (#22) — `kujamba.toml`-style presets for host/user/pattern/
       phrase bank, so a session is a one-word command.
 
@@ -193,8 +204,11 @@ real instrument is **control while it runs**.
 - [ ] **Fuzz the protocol parsers.** (#26) `proto.zig`/`buf.zig` are length-checked
       but feed a network — add a fuzz target over `parseIntervalBegin/Write`,
       `parseUserinfoRecords`, `parseChat`.
-- [ ] **CI demo.** (#27) Run `demo/run_demo.sh` on a macOS runner so the live
-      reference-server test gates merges, not just the unit tests.
+- [x] **CI demo.** (#27) ✅ **landed** (PRs #45 + #52): `demo-e2e` runs
+      `demo/run_demo.sh` on a macOS runner on every PR, `build-test` and
+      `demo-e2e` are required status checks on main's ruleset, and the
+      reference `ninjamsrv` build is cached with a 30-minute job timeout.
+      Landed report-only first, flipped required after the green streak.
 
 ---
 
