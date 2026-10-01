@@ -125,9 +125,9 @@ maintainable if new divergence is batched, not dripped in per-issue.
 | `src/ninjam/proto.zig` | byte-identical | #26 — *only if* the harness lands in-tree |
 | `src/ninjam/buf.zig` | byte-identical | #26 — *only if* the harness lands in-tree |
 | `src/ninjam/audio.zig` | byte-identical (live path compiled out) | #20 (`-Dlive` toggle + miniaudio) |
-| `src/ninjam_out.zig` | **new** (not vendored) | #10, #11, #12, #13, #17, #22 |
+| `src/ninjam_out.zig` | **new** (not vendored) | #10, #11, #12, #13, #17, #22, #24 |
 | `src/kujamba_main.zig` | **new** (not vendored) | #8, #9, #19, #20, #21, #22, #25 |
-| `src/kujamba_timing.zig` | **new** (not vendored) | #13, #14 — the M5 timing harness |
+| `src/kujamba_timing.zig` | **new** (not vendored) | #13, #14, #24 — the M5 timing harness + the reconnect test rig |
 | `src/synth.zig` | **new** (not vendored) | #15, #16, #18 |
 | `src/golden.zig` | **new** (not vendored) | guards #15, #16, #17, #18 |
 
@@ -194,11 +194,11 @@ fix, the other is the harness that makes M6 verifiable without a room.
 
 ### Wave 2 — standalone instrument + hardening
 - **M7:** #21, #22, #20
-- **M8:** #23, #24, #25 — **#23 landed**: the whole connect path is
-  family-agnostic now (IPv6 literal fast path, `AF.UNSPEC` hints, and a
-  per-entry socket of the entry's own family), so the hostname loop falls
-  through a refused connect to the next family instead of dying on the first
-  answer. See the findings below.
+- **M8:** #23 ✅, #24 ✅, #25 — #23 landed the family-agnostic connect path
+  (IPv6 literal fast path, `AF.UNSPEC` hints, per-entry socket family; see the
+  findings below). #24's `--reconnect` is off by default on purpose (see Wave
+  3): flipping the demo/default to reconnect-on belongs to the same change
+  that closes #28.
 
 `#20` and `#25` share the `-Dlive` build option. `#25`'s Windows half is
 honestly a separate job (Winsock shim + console handler) — consider splitting it
@@ -576,6 +576,37 @@ to remove the thing it claims to break.
   is a test with a per-platform failure mode, and the fix is to assert the
   property you care about in units you control. `mutate.sh` entry 20 exists so
   the last of these cannot come back silently.
+- **#24's reconnect semantics rest on three load-bearing subtleties.** The
+  fresh handshake's `0x02` must re-anchor the grid **even when bpm/bpi are
+  unchanged** — a reconnect to the same server gets the same config, and
+  `onConfig`'s re-anchor branch only fires on a *difference*. The session
+  returns the learned config to zero before dialling, which forces that branch
+  and is semantically honest: a fresh server session knows nothing. The reset
+  deliberately does NOT touch `index.seq` (identity is monotonic — the resumed
+  bar re-sends the abandoned bar's guid, and the `--intervals` cap keeps
+  counting across rejoins; that is the #12 seam, now covered end to end), the
+  phrase cursor (the room lost contact, not the instrument), or the drift
+  ledger. And the budget-exhausted path must close the open outage ledger
+  before failing — the first cut reported a 0 ms outage for a session that had
+  spent 30 ms dialling in vain.
+- **A reconnect changes the encode rhythm, and libvorbis notices.** The
+  resumed session's bars re-encode from the phrase start (repeat mode is
+  bar-aligned), but an outage shifts the run loop's bar-boundary phase, so the
+  final encode block of a bar splits at a different point — and libvorbis then
+  packs a slightly different packet from the same PCM: measured at **one to
+  eight bytes per bar** (same serial, same granule totals, same guid). The
+  resume tests therefore pin identity where it actually lives — guid and
+  serial derive from `(seed, seq)` and are untouched — and assert the serial
+  straight out of each dump's ogg page header plus that every dump decodes.
+  Cross-run byte-for-byte dump comparison is not asserted at all: even the
+  pre-outage bar 0 differed across two runs on a slow ReleaseSafe runner,
+  because the session's first partial encode block is scheduling jitter. Two
+  consequences worth keeping: the demo's determinism evidence is unaffected
+  (it compares two healthy runs and the demo never reconnects), and — more
+  interesting — a direct `vorbis_analysis` experiment showed chunk splits
+  under `encode_block_samples` (960) are byte-safe while one 20 000-sample
+  call is not, so the sensitivity lives at the packet-packing boundary, not in
+  the 960-sample rhythm itself.
 - **A test can manufacture the desynchronisation it is looking for.** The first
   version of the frame-alignment test failed intermittently with a 1–4 byte tail,
   for a reason that had nothing to do with the code: the helper that drives the

@@ -83,6 +83,11 @@ fn printUsage(io: std.Io) void {
         \\                       numbered by a monotonic per-session sequence
         \\                       that survives a BPI/BPM change
         \\    --duration S       hard safety cap in seconds (default 120)
+        \\    --reconnect [N]    on a lost connection, re-dial with bounded
+        \\                       backoff and resume at the next bar (#24);
+        \\                       N is the dial budget (default 5). Off by
+        \\                       default; the RESULT line reports reconnects
+        \\                       and the total outage either way
         \\    --out-dir DIR      directory for decoded peer WAVs (default dump)
         \\    --transcript FILE  transcript log (default <out-dir>/transcript.log)
         \\  kujamba render --phrase "..." --out FILE.wav|.ogg [--config FILE]
@@ -271,6 +276,9 @@ const JoinSettings = struct {
     knobs: synth.VoiceKnobs = .{},
     intervals: u64 = 8,
     duration_ms: i64 = 120_000,
+    /// --reconnect [#24]: reconnect dial budget on a lost connection. 0 = off
+    /// (a connection death ends the session, as it always has).
+    reconnect_attempts: u32 = 0,
     out_dir: []const u8 = "dump",
     dump_dir: ?[]const u8 = null,
     transcript: ?[]const u8 = null,
@@ -374,6 +382,20 @@ fn cmdJoin(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: [
         } else if (std.mem.eql(u8, a, "--intervals")) {
             s.intervals = std.fmt.parseInt(u64, next orelse fail(io, "--intervals needs a value", .{}), 10) catch fail(io, "bad --intervals", .{});
             i += 1;
+        } else if (std.mem.eql(u8, a, "--reconnect")) {
+            // #24: on a lost connection, re-dial with bounded backoff instead of
+            // ending the session. Bare flag = a default budget of 5 attempts;
+            // `--reconnect N` prices the budget explicitly. Off by default: the
+            // live demo must keep reporting connection deaths verbatim, because
+            // a reconnect that papers over the #28 flake would blind the very
+            // gate that is measuring it. Flip the default after #28 closes.
+            s.reconnect_attempts = if (next) |v| blk: {
+                if (v.len > 0 and v[0] != '-') {
+                    i += 1;
+                    break :blk std.fmt.parseInt(u32, v, 10) catch fail(io, "bad --reconnect '{s}' (want a count >= 0)", .{v});
+                }
+                break :blk 5;
+            } else 5;
         } else if (std.mem.eql(u8, a, "--duration")) {
             const secs = std.fmt.parseFloat(f64, next orelse fail(io, "--duration needs a value", .{})) catch fail(io, "bad --duration", .{});
             // NaN/negative would panic in @intFromFloat
@@ -462,6 +484,7 @@ fn cmdJoin(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: [
         .payload_dump_dir = s.dump_dir,
         .stop_after_intervals = s.intervals,
         .duration_ms = s.duration_ms,
+        .reconnect_attempts = s.reconnect_attempts,
         .quality = 0.0,
     };
     if (s.transcript) |t| {
@@ -487,7 +510,7 @@ fn cmdJoin(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: [
     var out_buf: [2048]u8 = undefined;
     const line = std.fmt.bufPrint(
         &out_buf,
-        "RESULT ok={} err=\"{s}\" seed={d} play={s} phrases={d} phrase={d} phrase_switches={d} phrase_rejected={d} intervals_uploaded={d} intervals_broadcast={d} silence_markers={d} payload_dumps={d} upload_chunks={d} upload_bytes={d} intervals_downloaded={d} msgs_sent={d} msgs_recv={d} intervals_dropped={d} upload_bytes_dropped={d} upload_stall_ms={d} drift_ms={d} max_drift_ms={d} clock_corrections={d}\n",
+        "RESULT ok={} err=\"{s}\" seed={d} play={s} phrases={d} phrase={d} phrase_switches={d} phrase_rejected={d} intervals_uploaded={d} intervals_broadcast={d} silence_markers={d} payload_dumps={d} upload_chunks={d} upload_bytes={d} intervals_downloaded={d} msgs_sent={d} msgs_recv={d} intervals_dropped={d} upload_bytes_dropped={d} upload_stall_ms={d} drift_ms={d} max_drift_ms={d} clock_corrections={d} reconnects={d} outage_ms={d}\n",
         .{
             ok,
             err_text,
@@ -515,6 +538,11 @@ fn cmdJoin(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: [
             @divTrunc(stats.drift_ns, std.time.ns_per_ms),
             @divTrunc(stats.max_abs_drift_ns, std.time.ns_per_ms),
             stats.clock_corrections,
+            // #24: the cost of the connection the room never had to think
+            // about. reconnects counts the rejoins that landed; outage_ms is
+            // everything the audience actually missed, backoff included.
+            stats.reconnects,
+            stats.outage_ms,
         },
     ) catch return;
     std.Io.File.stdout().writeStreamingAll(io, line) catch {};

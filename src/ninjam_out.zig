@@ -237,6 +237,48 @@ pub const IntervalIndex = struct {
     }
 };
 
+// ---- reconnect backoff (#24) -------------------------------------------------
+
+/// How long to wait before reconnect dial attempt `attempt` (0-based), in ms.
+///
+/// Exponential from `start_ms`, hard-capped at `max_ms` — the delay is bounded
+/// twice on purpose. Exponential alone would wait whole minutes by attempt 12,
+/// which for an always-on room instrument is indistinguishable from being gone;
+/// the cap keeps the instrument probing at a steady clip once the outage is
+/// clearly not a blip. The budget of attempts itself lives in the session's
+/// options; this function only prices each one.
+///
+/// Pure, so the bound is testable without a socket and mutable without a
+/// network: deleting the clamp shows up as a unit failure, not as a CI runner
+/// that happens to be slow. The early return inside the loop is also what makes
+/// a large attempt count unrepresentable — without it, doubling `start_ms`
+/// `u32`-many times overflows before the final `@min` could save it.
+pub fn reconnectDelayMs(attempt: u32, start_ms: i64, max_ms: i64) i64 {
+    var delay = @max(start_ms, 1);
+    var i: u32 = 0;
+    while (i < attempt) : (i += 1) {
+        if (delay >= max_ms) return max_ms;
+        delay *= 2;
+    }
+    return @min(delay, max_ms);
+}
+
+test "reconnect backoff: doubles from the start, clamps at the max, never overflows" {
+    // attempt 0 is the first delay, not zero — a reconnect that waits 0 ms
+    // would hammer a server that is likely down for a reason
+    try std.testing.expectEqual(@as(i64, 500), reconnectDelayMs(0, 500, 8_000));
+    try std.testing.expectEqual(@as(i64, 1_000), reconnectDelayMs(1, 500, 8_000));
+    try std.testing.expectEqual(@as(i64, 2_000), reconnectDelayMs(2, 500, 8_000));
+    // the clamp: attempt 4 and attempt 40 price the same, and a huge attempt
+    // count cannot overflow the doubling on its way there
+    try std.testing.expectEqual(@as(i64, 8_000), reconnectDelayMs(4, 500, 8_000));
+    try std.testing.expectEqual(@as(i64, 8_000), reconnectDelayMs(40, 500, 8_000));
+    try std.testing.expectEqual(@as(i64, 8_000), reconnectDelayMs(std.math.maxInt(u32), 500, 8_000));
+    // a floor of 1 ms: start_ms = 0 is a test convenience, not a hammer
+    try std.testing.expectEqual(@as(i64, 1), reconnectDelayMs(0, 0, 8_000));
+    try std.testing.expectEqual(@as(i64, 4), reconnectDelayMs(2, 1, 4));
+}
+
 // ---- server-clock discipline (#13) -------------------------------------------
 
 /// One bar's length in nanoseconds, straight from `bpi`/`bpm`.

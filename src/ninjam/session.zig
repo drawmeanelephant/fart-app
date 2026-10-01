@@ -73,6 +73,16 @@ pub const Options = struct {
     /// stop after this many completed intervals (demo determinism aid)
     stop_after_intervals: ?u64 = null,
 
+    // ---- reconnect (#24) ----
+    /// how many times a lost connection may be re-dialled before the session
+    /// gives up. 0 (the default) keeps the old behaviour: a connection-level
+    /// death ends the session. The instrument turns this on via `--reconnect`.
+    reconnect_attempts: u32 = 0,
+    /// first reconnect delay in ms; doubles per attempt up to the max below
+    reconnect_backoff_start_ms: i64 = 500,
+    /// ceiling on one reconnect delay in ms
+    reconnect_backoff_max_ms: i64 = 8_000,
+
     // ---- Phase B: live audio ----
     /// capture the local device instead of generating --source, and play the
     /// decoded peer mix out of it. Falls back to --source + WAV dumps when no
@@ -130,6 +140,14 @@ pub const Stats = struct {
     intervals_dropped: u64 = 0,
     upload_bytes_dropped: u64 = 0,
 
+    /// #24: successful rejoins after a connection-level loss. An attempt that
+    /// never lands does not count — it is priced into `outage_ms` instead.
+    reconnects: u64 = 0,
+    /// #24: total time spent disconnected across every outage in the session,
+    /// in ms — backoff sleeps, refused dials and handshake time included. This
+    /// is the number the `RESULT` line reports as the cost of the incident.
+    outage_ms: u64 = 0,
+
     intervals_downloaded: u64 = 0,
     download_bytes: u64 = 0,
     samples_decoded: u64 = 0,
@@ -173,6 +191,13 @@ pub const Stats = struct {
 
     pub fn failText(self: *const Stats) []const u8 {
         return self.fail_reason[0..self.fail_len];
+    }
+
+    /// #24: the loss reason is provisional — it describes the connection that
+    /// died, and a successful rejoin means the session survived it. Cleared on
+    /// reconnect so a session that ends well does not report a stale error.
+    pub fn clearFail(self: *Stats) void {
+        self.fail_len = 0;
     }
 };
 
@@ -339,6 +364,11 @@ pub const Session = struct {
     // the top of `finalizeInterval`, so N channels failing on one bar is one
     // lost bar, not N.
     drop_marked: bool = false,
+    // kujamba (#24): when the current outage began, if the session is
+    // disconnected. Null means connected (or never connected). This is what
+    // distinguishes the first dial from a reconnect dial in the run loop, and
+    // what `outage_ms` is accumulated from when the connection comes back.
+    conn_lost_ns: ?i128 = null,
 
     start_ns: i128 = 0,
     chat_sent: bool = false,
@@ -397,6 +427,130 @@ pub const Session = struct {
         self.log.line("FAIL: " ++ fmt, args);
         self.state = .done;
         return error.SessionFailed;
+    }
+
+    /// #24: end the session with the reason already sitting in `stats` (the
+    /// provisional loss reason `markConnectionLost` recorded). Re-running
+    /// `stats.fail` on `failText()` would print a slice out of the very buffer
+    /// it is printing into, which `@memcpy` rightly refuses to alias.
+    fn failSessionWithRecordedReason(self: *Session) error{SessionFailed} {
+        // the outage the retries priced in is still open — close it, so the
+        // post-mortem reports the disconnection the session actually suffered
+        if (self.conn_lost_ns) |t0| {
+            self.stats.outage_ms += @intCast(@divTrunc(clock.nowNs(self.io) - t0, 1_000_000));
+            self.conn_lost_ns = null;
+        }
+        self.log.line("FAIL: {s}", .{self.stats.failText()});
+        self.state = .done;
+        return error.SessionFailed;
+    }
+
+    /// #24: the connection just died. Record the loss, close the socket, start
+    /// the outage clock. Everything bound to the dead connection — the
+    /// in-flight bar, peer state, the learned config — is left in place until
+    /// the run loop decides what happens next: a reconnect tears it down in
+    /// `resetForReconnect`, and a session that gives up keeps it as the
+    /// post-mortem.
+    ///
+    /// The failure reason is provisional: if a rejoin lands, `clearFail` wipes
+    /// it, because the session survived what it describes.
+    fn markConnectionLost(self: *Session, comptime fmt: []const u8, args: anytype) void {
+        self.stats.fail(fmt, args);
+        self.log.line("CONNECTION LOST: " ++ fmt, args);
+        if (self.conn) |*c| c.close();
+        self.conn = null;
+        self.conn_lost_ns = clock.nowNs(self.io);
+        self.state = .connecting;
+    }
+
+    /// #24: return the session to its post-auth, pre-config shape so the fresh
+    /// handshake's `0x02` re-anchors everything.
+    ///
+    /// The load-bearing subtlety is `bpm = 0`. The re-anchor path in `onConfig`
+    /// only runs when the new config *differs*, and a reconnect to the same
+    /// server almost always hands back the same bpm/bpi. Zeroing the learned
+    /// config forces that path to fire — it is the one place that re-anchors
+    /// the clock and restarts the interval engine — and it is semantically
+    /// honest: a fresh server session knows nothing about the old one, so the
+    /// session returns to "not yet configured" until told otherwise.
+    ///
+    /// What is deliberately NOT reset:
+    ///  - `index.seq`: identity is monotonic for the whole run, so a resumed
+    ///    session never re-issues a guid (which is also what keeps the
+    ///    `--intervals` cap counting across reconnects instead of restarting).
+    ///  - the phrase cursor: the room lost contact, not the instrument; the
+    ///    next bar picks up where the abandoned one was generated.
+    ///  - `timing`'s drift ledger: `onConfig`'s re-anchor keeps it continuous.
+    ///
+    /// The in-flight bar, if there was one, is abandoned the #14 way — counted
+    /// once as dropped, its bytes counted, nothing of it sent again. The grid
+    /// genuinely restarts (`reanchor(0)` is the escape hatch #12 built for
+    /// this), so the pattern starts from its top at the next bar.
+    fn resetForReconnect(self: *Session) void {
+        var abandoned_bytes: u64 = 0;
+        var abandoned = false;
+        for (self.locals) |*lc| {
+            abandoned_bytes += lc.pending.len + lc.dump.len;
+            if (lc.produced > 0 or lc.pending.len > 0 or lc.dump.len > 0 or lc.begun) abandoned = true;
+            if (lc.enc) |e| {
+                e.destroy();
+                lc.enc = null;
+            }
+            lc.pending.clear();
+            lc.dump.clear();
+            lc.begun = false;
+            lc.produced = 0;
+            lc.dropped = false;
+            lc.broadcast = true;
+        }
+        if (abandoned) {
+            // one lost bar, not N — same accounting rule as a socket-drop
+            self.stats.intervals_dropped += 1;
+            self.stats.upload_bytes_dropped += abandoned_bytes;
+            self.log.line("reconnect: bar {d} abandoned mid-flight ({d} bytes discarded) — resuming at the next bar", .{
+                self.index.seq, abandoned_bytes,
+            });
+        }
+        // peers, downloads and their WAV outputs belonged to the dead connection
+        self.closeWavs();
+        for (&self.downloads) |*d| {
+            d.active = false;
+            d.buf.clear();
+        }
+        for (&self.users) |*u| {
+            u.name_len = 0;
+            u.mask = 0;
+        }
+        self.eff_user = .{};
+        self.maxchan = 1;
+        self.bpm = 0;
+        self.bpi = 0;
+        self.interval_len_samples = 0;
+        self.keepalive_s = default_keepalive_s;
+        self.chat_sent = false;
+        self.drop_marked = false;
+        self.index.reanchor(0);
+    }
+
+    /// #24: sleep for reconnect backoff, interruptibly. The session is
+    /// single-threaded, so the wait is sliced and each slice re-checks the two
+    /// things that outrank a retry: a stop request and the session deadline.
+    /// Returns false when the wait was cut short — the caller ends the session
+    /// gracefully rather than dialling into a performance that is already over.
+    fn sleepInterruptibly(self: *Session, ms: i64, deadline_ns: i128) enum { proceeded, stopped, expired } {
+        const wake_ns = clock.nowNs(self.io) + @as(i128, ms) * std.time.ns_per_ms;
+        while (true) {
+            const now = clock.nowNs(self.io);
+            if (now >= wake_ns) return .proceeded;
+            if (now >= deadline_ns) return .expired;
+            if (kujamba_out.stopRequested()) return .stopped;
+            // slice the wait into ≤25 ms sleeps so a stop request and the
+            // deadline are noticed promptly rather than after a full backoff
+            const slice_ns = @min(wake_ns - now, @as(i128, 25) * std.time.ns_per_ms);
+            const slice_ms: u32 = @intCast(@divTrunc(slice_ns + std.time.ns_per_ms - 1, std.time.ns_per_ms));
+            const d: std.Io.Clock.Duration = .{ .raw = .fromMilliseconds(slice_ms), .clock = .awake };
+            d.sleep(self.io) catch {};
+        }
     }
 
     fn findOrAddUser(self: *Session, name: []const u8) ?*UserEntry {
@@ -757,10 +911,18 @@ pub const Session = struct {
         switch (try conn.sendMessageBounded(mtype, payload, upload_write_budget_ms)) {
             .sent => {},
             .declined => return false,
-            .partial => return self.failSession(
-                "upload frame of {d} bytes could not be written whole; the byte stream can no longer be framed, so this connection is finished",
-                .{payload.len + 5},
-            ),
+            // #24: a torn frame is a connection-level failure, never a bar-level
+            // one (#14) — and a dead connection is what reconnect exists for.
+            // With `reconnect_attempts = 0` the run loop turns this into the
+            // same session failure #14 specified; with a budget, the session
+            // rejoins and the stream re-frames from zero on the new connection.
+            .partial => {
+                self.markConnectionLost(
+                    "upload frame of {d} bytes could not be written whole; the byte stream can no longer be framed, so this connection is finished",
+                    .{payload.len + 5},
+                );
+                return error.ConnectionLost;
+            },
         }
         self.stats.msgs_sent += 1;
         self.stats.bytes_sent += payload.len + 5;
@@ -1335,15 +1497,75 @@ pub const Session = struct {
         var hostbuf: [256]u8 = undefined;
         const hostport = std.fmt.bufPrint(&hostbuf, "{s}:{d}", .{ self.opts.host, self.opts.port }) catch "host";
         self.log.line("connecting to {s} as {s}", .{ hostport, self.opts.user });
-        self.conn = netmod.Conn.connect(self.io, self.opts.host, self.opts.port) catch |e| {
-            return self.failSession("connect failed: {s}", .{@errorName(e)});
-        };
-        self.log.line("connected", .{});
-        self.last_keepalive_ms = clock.nowMs(self.io);
 
         const deadline_ns = self.start_ns + @as(i128, self.opts.duration_ms) * 1_000_000;
+        // kujamba (#24): reconnect dials consumed so far. The first dial is not
+        // an attempt — a server that refuses the join ends the session, exactly
+        // as it always has; only a connection that was LOST is retried.
+        var dials_used: u32 = 0;
 
-        while (self.state != .done) {
+        // `outer` labels the run loop so a connection-loss path can jump
+        // straight to the acquisition step at the top; every one of them has
+        // already torn the connection down before it jumps.
+        outer: while (self.state != .done) {
+            // ---- acquire a connection: the first dial, or a reconnect ----
+            if (self.conn == null) {
+                if (self.conn_lost_ns == null) {
+                    self.conn = netmod.Conn.connect(self.io, self.opts.host, self.opts.port) catch |e| {
+                        return self.failSession("connect failed: {s}", .{@errorName(e)});
+                    };
+                    self.log.line("connected", .{});
+                    self.last_keepalive_ms = clock.nowMs(self.io);
+                } else {
+                    // The connection was lost. Decide the budget first: a
+                    // session with nothing left to try keeps its post-mortem
+                    // exactly as the loss left it.
+                    if (dials_used >= self.opts.reconnect_attempts) {
+                        // With the default budget of 0 this is where every
+                        // connection-level death lands, with the loss reason
+                        // verbatim — the pre-#24 behaviour, unchanged.
+                        return self.failSessionWithRecordedReason();
+                    }
+                    // Reconnecting: tear down everything bound to the dead
+                    // connection before pricing the next attempt.
+                    self.resetForReconnect();
+                    const delay_ms = kujamba_out.reconnectDelayMs(
+                        dials_used,
+                        self.opts.reconnect_backoff_start_ms,
+                        self.opts.reconnect_backoff_max_ms,
+                    );
+                    self.log.line("reconnect attempt {d}/{d} in {d}ms", .{ dials_used + 1, self.opts.reconnect_attempts, delay_ms });
+                    switch (self.sleepInterruptibly(delay_ms, deadline_ns)) {
+                        .proceeded => {},
+                        // the outage outlived the session: end it gracefully —
+                        // what was uploaded before the loss still counts
+                        .stopped, .expired => {
+                            self.stats.outage_ms += @intCast(@divTrunc(clock.nowNs(self.io) - self.conn_lost_ns.?, 1_000_000));
+                            self.conn_lost_ns = null;
+                            self.log.line("giving up reconnecting: session over during outage", .{});
+                            self.stats.ok = self.stats.intervals_uploaded > 0;
+                            self.state = .done;
+                            break;
+                        },
+                    }
+                    dials_used += 1;
+                    self.conn = netmod.Conn.connect(self.io, self.opts.host, self.opts.port) catch |e| {
+                        self.log.line("reconnect dial failed: {s}", .{@errorName(e)});
+                        continue; // the next backoff prices this attempt in
+                    };
+                    const outage = clock.nowNs(self.io) - self.conn_lost_ns.?;
+                    self.stats.outage_ms += @intCast(@divTrunc(outage, 1_000_000));
+                    self.conn_lost_ns = null;
+                    self.stats.reconnects += 1;
+                    self.stats.clearFail();
+                    self.log.line("reconnected after {d}ms outage (attempt {d} of {d})", .{
+                        @divTrunc(outage, 1_000_000), dials_used, self.opts.reconnect_attempts,
+                    });
+                    self.last_keepalive_ms = clock.nowMs(self.io);
+                    self.state = .connecting;
+                }
+            }
+
             const now_ns = clock.nowNs(self.io);
             if (now_ns >= deadline_ns) {
                 // kujamba instrument hook: hitting the cap with zero intervals
@@ -1360,7 +1582,13 @@ pub const Session = struct {
                 if (self.state == .active and self.interval_len_samples != 0 and
                     self.locals.len > 0 and self.locals[0].produced > 0)
                 {
-                    try self.finalizeInterval();
+                    self.finalizeInterval() catch |e| switch (e) {
+                        // #24: the final bar's upload tore the connection — the
+                        // stop is still the stop; do not resurrect the session
+                        // just to report the tear
+                        error.ConnectionLost => self.log.line("final bar lost the connection on the way out", .{}),
+                        else => return e,
+                    };
                 }
                 self.stats.ok = self.stats.intervals_uploaded > 0;
                 self.state = .done;
@@ -1371,14 +1599,25 @@ pub const Session = struct {
             var readable = true;
             while (readable and self.state != .done) {
                 readable = self.conn.?.pollReadable(0) catch |e| {
-                    return self.failSession("poll failed: {s}", .{@errorName(e)});
+                    self.markConnectionLost("poll failed: {s}", .{@errorName(e)});
+                    continue :outer;
                 };
                 if (!readable) break;
                 const msg = self.conn.?.readMessage(&self.payload) catch |e| switch (e) {
                     error.WouldBlock => break,
-                    else => return self.failSession("read failed: {s}", .{@errorName(e)}),
+                    else => {
+                        self.markConnectionLost("read failed: {s}", .{@errorName(e)});
+                        continue :outer;
+                    },
                 };
-                try self.dispatch(msg);
+                self.dispatch(msg) catch |e| switch (e) {
+                    error.SessionFailed => return e,
+                    // #24: a connection-level error surfaced from inside a
+                    // handler (e.g. an upload frame tore mid-finalize). The
+                    // connection is already torn down; go dial a new one.
+                    error.ConnectionLost => continue :outer,
+                    else => return e,
+                };
             }
             if (self.state != .done) {
                 // wait up to 20 ms for the next message
@@ -1389,9 +1628,14 @@ pub const Session = struct {
                 const now2 = clock.nowNs(self.io);
                 self.advanceAudio(now2) catch |e| switch (e) {
                     error.SessionFailed => {},
+                    // #24: the connection died under the audio engine (a torn
+                    // upload frame is the realistic case). Everything is
+                    // already torn down; go dial a new one.
+                    error.ConnectionLost => continue :outer,
                     else => return self.failSession("audio advance failed: {s}", .{@errorName(e)}),
                 };
                 if (self.state == .done) break;
+                if (self.conn == null) continue;
 
                 if (self.opts.chat != null and !self.chat_sent and
                     now2 - self.start_ns >= @as(i128, self.opts.chat_delay_ms) * 1_000_000)
@@ -1407,9 +1651,16 @@ pub const Session = struct {
 
             const now_ms = clock.nowMs(self.io);
             if (now_ms - self.conn.?.last_recv_ms > @as(i64, @intCast(self.keepalive_s)) * 3000) {
-                return self.failSession("connection stalled: no data for {d}ms", .{now_ms - self.conn.?.last_recv_ms});
+                self.markConnectionLost("connection stalled: no data for {d}ms", .{now_ms - self.conn.?.last_recv_ms});
+                continue :outer;
             }
             if (self.state == .active) self.sendKeepaliveIfDue(now_ms);
+        }
+
+        // a session that ends mid-outage still reports the outage it suffered
+        if (self.conn_lost_ns) |t0| {
+            self.stats.outage_ms += @intCast(@divTrunc(clock.nowNs(self.io) - t0, 1_000_000));
+            self.conn_lost_ns = null;
         }
 
         self.closeWavs();
