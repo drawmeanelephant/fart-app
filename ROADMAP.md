@@ -234,6 +234,11 @@ real instrument is **control while it runs**.
 > It now also has a sharper local-side hypothesis to test before the server-side
 > one — see [ISSUES.md](ISSUES.md). Do not close it via #24; reconnect makes the
 > symptom survivable but would mask the real cause.
+>
+> Measured 2026-09-30: 30/30 isolation runs clean, 60 refpeer teardowns across
+> 5 victim sessions clean (`demo/repro_teardown_churn.sh` — the incident
+> geometry, amplified), and 18/18 green in the CI demo job that runs the
+> original scenario on every PR. Still zero reproductions; still open.
 
 On one run the second determinism session was dropped by the server
 (`read failed: EndOfStream`) at interval 2 with no server-side log entry, in the
