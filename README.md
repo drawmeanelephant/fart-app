@@ -412,9 +412,9 @@ fresh checkout of `drawmeanelephant/ninjam` main (or set `NINJAM_REPO` to an
 existing checkout), runs 6 intervals against it with `demo/refpeer.cpp` (the
 reference client core) as the receiving second client, asserts energy, then
 re-runs for the determinism check. Evidence lands in
-`demo/evidence/<timestamp>/`. CI runs the same demo as a merge gate (the
-`demo-e2e` job, #27) — the reference build is cached, and every run's
-evidence is uploaded as a workflow artifact.
+`demo/evidence/<timestamp>/`. CI runs the same demo as a required merge gate
+(the `demo-e2e` job, #27 — a red demo blocks merge on `main`) — the reference
+build is cached, and every run's evidence is uploaded as a workflow artifact.
 
 ---
 
