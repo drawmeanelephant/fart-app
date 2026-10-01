@@ -1677,7 +1677,11 @@ test "reconnect: exhausting the dial budget fails the session with the loss reas
     try std.testing.expect(!run.stats.ok);
     try std.testing.expectEqual(@as(u64, 0), run.stats.reconnects);
     try std.testing.expect(run.stats.outage_ms > 0);
-    try std.testing.expectEqualStrings("read failed: EndOfStream", run.stats.failText());
+    // the post-mortem is the recorded loss, verbatim. Which read error the
+    // killer's close surfaces depends on whether the client was mid-write
+    // when the FIN arrived — EndOfStream or ConnectionResetByPeer, whichever
+    // the kernel had — so the assertion pins the site, not the errno.
+    try std.testing.expect(std.mem.startsWith(u8, run.stats.failText(), "read failed: "));
     // bounded, not "eventually": the retries are priced by the backoff, so a
     // regression to an unbounded retry loop cannot hide behind the deadline
     try std.testing.expect(run.elapsed_ns < 5 * std.time.ns_per_s);
