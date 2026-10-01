@@ -344,7 +344,7 @@ cp examples/kujamba.toml kujamba.toml
 
 | Key | Type | Means |
 |---|---|---|
-| `host` | string | exactly `--host`'s syntax, so the port lives here: `"127.0.0.1:20531"`, `"[::1]:20531"` |
+| `host` | string | exactly `--host`'s syntax, so the port lives here: `"127.0.0.1:20531"`, `"[::1]:20531"`; IPv6 literals and dual-stack hostname resolution both connect |
 | `user`, `pass` | string | NINJAM credentials (join only) |
 | `phrase` | string | the Swahili phrase (join + render) |
 | `pattern` | string | exactly `--pattern`'s syntax (`"3+1"`) |

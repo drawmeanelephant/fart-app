@@ -194,7 +194,11 @@ fix, the other is the harness that makes M6 verifiable without a room.
 
 ### Wave 2 — standalone instrument + hardening
 - **M7:** #21, #22, #20
-- **M8:** #23, #24, #25
+- **M8:** #23, #24, #25 — **#23 landed**: the whole connect path is
+  family-agnostic now (IPv6 literal fast path, `AF.UNSPEC` hints, and a
+  per-entry socket of the entry's own family), so the hostname loop falls
+  through a refused connect to the next family instead of dying on the first
+  answer. See the findings below.
 
 `#20` and `#25` share the `-Dlive` build option. `#25`'s Windows half is
 honestly a separate job (Winsock shim + console handler) — consider splitting it
@@ -343,6 +347,25 @@ to remove the thing it claims to break.
   `openStreamSocket` and types `connectSockaddr` as
   `*const std.posix.sockaddr.in` — the IPv4 struct. The CLI already parses
   `[::1]:port` correctly.
+  ✅ **Landed, and the rewrite was three small things, not one.** (1) An IPv6
+  literal fast path beside the IPv4 one — `std.Io.net.Ip6Address.parse` builds
+  a `sockaddr_in6`, and `%zone` scopes are deliberately *not* handled there:
+  `Ip6Address.parse` refuses them, and getaddrinfo owns scoped forms, so
+  duplicating `if_nametoindex` would be a second copy of one job. (2)
+  `openStreamSocket(family)` — the socket must be created *in the candidate's
+  own family*, because an `AF.INET` socket cannot even be constructed against
+  a v6 peer and an `AF.INET` hints struct returns no v6 results to iterate at
+  all; both bugs are invisible to any test that does not cross a real socket.
+  (3) The load-bearing property of the hostname loop: **one failed entry is
+  not a failed host.** With `AF.UNSPEC` the resolver returns both families in
+  its own preference order (RFC 6724), so a v6-first resolver reaches a
+  v4-only server by falling through the refused v6 connect — happy-eyeballs by
+  construction, not by taking the first entry and hoping. Covered by loopback
+  tests on both families plus a `localhost`-against-a-v4-listener test, and
+  smoke-tested end-to-end: the real binary joined the reference `ninjamsrv`
+  through an `[::1]` listener and uploaded its intervals (`session end:
+  ok=true`), and a refused `[::1]` port fails in 0 ms with a clean
+  `ConnectionRefused`, not a hang.
 - **#25 is under-scoped.** `net.zig` uses `std.posix` in five places and
   `kujamba_main.zig:21-23` does `@cInclude("signal.h")` for Ctrl+C. Windows
   needs a shim and a console handler, not a build-flag flip.
