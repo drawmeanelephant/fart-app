@@ -24,10 +24,11 @@ Tracking issue for this map: [#31](https://github.com/drawmeanelephant/fart-app/
 
 ## The short version
 
-Six issues are effectively unblocked and everything else is downstream of them.
-Start there. The two things most likely to be picked up first from a
-milestone-number ordering — #8 and #9 — are both **blocked**, and the one that
-unblocks them (#11) is the smallest item in M4.
+Everything from the original Wave 0–3 plan has landed and closed (M4–M7
+complete; M8 lacks only #25). What remains open: **#25** cross-platform
+builds, **#29** the batched vendored-file upstreaming, and this meta issue.
+The table below records how the plan played out; the one that unblocked the
+most (#11, smallest item in M4) and the rest are all done.
 
 | Start here | Why it's unblocked | What it unblocks |
 |---|---|---|
@@ -37,11 +38,13 @@ unblocks them (#11) is the smallest item in M4.
 | **#12** Re-anchor on config change | ✅ **done** — split the counters, see below | #24, #29 |
 | **#19** Offline render | ✅ **done** — `kujamba render`, see below | verification harness for M6 |
 | **#8** Phrase bank | ✅ **done** — `--phrases FILE` + `!kujamba <n\|name>` | M4 complete |
-| **#27** CI demo | Extends the existing `build-test` job with the live reference-server run | #28 (flake rate), the safety net for everything |
+| **#27** CI demo | ✅ **done** — PRs #45 + #52: `demo-e2e` on macOS, required on main's ruleset, reference build cached | #28's flake-rate data, the safety net for everything |
 | **#13** Server-clock discipline | ✅ **done** — `ServerClock`, bounded slew, encode lead | M5 complete |
 | **#14** Upload backpressure | ✅ **done** — measured, then bounded write + drop-and-continue | M5 complete |
 
-Everything else is Wave 2+ and can proceed in parallel once the above land.
+Wave 4 (#29) is the only sequencing stage left, and #25 can proceed in
+parallel with it — their file sets barely overlap (#25 is `net.zig`/platform
+shims, #29 is `session.zig` first).
 
 ---
 
@@ -187,11 +190,12 @@ recommended answer.
 ## Sequencing
 
 ### Wave 0 — the unblocked six
-`#11`✅ · `#10`✅ · `#18`✅ · `#12`✅ · `#19`✅ · `#27`
+`#11`✅ · `#10`✅ · `#18`✅ · `#12`✅ · `#19`✅ · `#27`✅
 
 Six independent items; in practice three or four people can work in parallel
-with zero collisions. Five have landed; `#27` is the last one standing. `#12`
-and `#19` are the two that paid off fastest and both have landed: one was a bug
+with zero collisions. All six have landed — `#27` was the last, landed
+report-only in PR #45 and flipped to required in PR #52 after the green
+streak. `#12` and `#19` are the two that paid off fastest: one was a bug
 fix, the other is the harness that makes M6 verifiable without a room.
 
 ### Wave 1 — milestone payoffs, once Wave 0 lands
@@ -203,16 +207,23 @@ fix, the other is the harness that makes M6 verifiable without a room.
   clock, and the upload of that bar happens inline on the same path. #13 makes
   the clock honest about being late; #14 stops it being late on a peer's
   schedule. Fixing either alone leaves the other half of the stall.
-- **M6:** #15, #16, #17
+- **M6:** #15 ✅, #16 ✅, #17 ✅ — ✅ **M6 is complete.** #15 and #16 landed
+  together in PR #50 on #18's `VoiceKnobs` vehicle (intensity: 0.25–4 effort
+  scaling level + noise + stress emphasis; cents: `2^(N/1200)` on the vowel
+  table, base-only so `PITCH_DROP` keeps the character). #17 needed no code:
+  the loop wrap is already exactly click-free, and a crossfade regresses.
 - **M8:** #26 (fuzz — keep the harness out-of-tree) — ✅ **landed**
 
 ### Wave 2 — standalone instrument + hardening
-- **M7:** #21, #22, #20
+- **M7:** #21 ✅, #22 ✅, #20 ✅ — ✅ **M7 is complete.** #21's `kujamba trigger`
+  (PR #48) drives `[map]` note bindings from stdin or `--script`, rendering on
+  the note-on itself (<50 ms); hardware MIDI (CoreMIDI/ALSA) was deliberately
+  left out and would be its own issue.
 - **M8:** #23 ✅, #24 ✅, #25 — #23 landed the family-agnostic connect path
   (IPv6 literal fast path, `AF.UNSPEC` hints, per-entry socket family; see the
-  findings below). #24's `--reconnect` is off by default on purpose (see Wave
-  3): flipping the demo/default to reconnect-on belongs to the same change
-  that closes #28.
+  findings below). #24's `--reconnect` stays off by default: #28 closed with
+  still-zero reproductions (PR #54), so there was never a flake to paper over,
+  and the required gate keeps reporting connection deaths verbatim.
 
 `#20` and `#25` share the `-Dlive` build option. `#25`'s Windows half is
 honestly a separate job (Winsock shim + console handler) — consider splitting it
@@ -240,9 +251,9 @@ and landing Linux first.
   The suspected window has therefore been hit on the order of a hundred times
   without a recurrence. What would still reproduce it: the real network (the
   incident's latency/timeout profile is not reachable on loopback), or a
-  server build other than the reference one. #28 stays open as the umbrella
-  for the required-gate's flake rate; with the gate now required (#27), every
-  merge is another data point.
+  server build other than the reference one. **#28 closed 2026-10-01** on that
+  evidence (PR #54); the required gate stays the standing monitor — every
+  merge is still a data point, and a recurrence just reopens the investigation.
 
 ### Wave 4 — vendored reconciliation
 - **#29** — batched, last.
