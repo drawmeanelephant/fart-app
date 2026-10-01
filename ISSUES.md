@@ -121,13 +121,22 @@ socket — #24 should pick that up.
 (commit `f428caf`). The "12 of 12 byte-identical" invariant in #29 is only
 maintainable if new divergence is batched, not dripped in per-issue.
 
+> **Recon 2026-10-01** (full report on #29): upstream's `agent/zclient` tip has
+> moved six commits past the pin (`17905c5b` — vendor contract, a Linux libogg
+> build fix, Phase B miniaudio duplex live audio, `--live` dedup), touching only
+> `main.zig` (±8) and `session.zig` (−2). Measured local divergence: `session.zig`
+> 1784 lines / 31 hunks, `net.zig` 601 / 10, `audio.zig` 43 (the row below was
+> stale); the other nine files are byte-identical to the pin. The upstream-PR
+> surface is therefore exactly three files, and the reconcile target should be
+> the tip, not the pin.
+
 | File | Status | Diverged by |
 |---|---|---|
 | `src/ninjam/session.zig` | **already diverged** (kujamba hooks) | #12, #13, #14, #24, #25 |
 | `src/ninjam/net.zig` | **already diverged** (bounded legacy writes; #14 nonblocking frame-tail/control queue, yielding reads, platform-correct `O_NONBLOCK`) | #14, #23, #25 |
 | `src/ninjam/proto.zig` | byte-identical | #26 — *only if* the harness lands in-tree |
 | `src/ninjam/buf.zig` | byte-identical | #26 — *only if* the harness lands in-tree |
-| `src/ninjam/audio.zig` | byte-identical (live path compiled out) | #20 (`-Dlive` toggle + miniaudio) |
+| `src/ninjam/audio.zig` | **diverged** — playback-only `Device.openPlayback` + `zc_playback_device_open` so #20's audition path never opens the capture side (no mic permission ever asked) | #20 (`-Dlive` toggle + miniaudio) |
 | `src/ninjam_out.zig` | **new** (not vendored) | #10, #11, #12, #13, #17, #22, #24 |
 | `src/kujamba_main.zig` | **new** (not vendored) | #8, #9, #19, #20, #21, #22, #25 |
 | `src/kujamba_timing.zig` | **new** (not vendored) | #13, #14, #24 — the M5 timing harness + the reconnect test rig |
