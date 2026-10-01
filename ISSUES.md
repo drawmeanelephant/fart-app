@@ -204,9 +204,31 @@ fix, the other is the harness that makes M6 verifiable without a room.
 honestly a separate job (Winsock shim + console handler) — consider splitting it
 and landing Linux first.
 
-### Wave 3 — investigation close-out- **#28** — local repros can start immediately; the *close* waits on #27's rate.
+### Wave 3 — investigation close-out
+
+- **#28** — local repros can start immediately; the *close* waits on #27's rate.
   Do not close via #24: reconnect makes the symptom survivable, which masks a
   real server-side or local-side defect rather than fixing it.
+- **Measured 2026-09-30, still zero reproductions.** Three lines of evidence,
+  all clean:
+  - **Isolation** (`demo/repro_double_run.sh`, no refpeer): **30/30** same-seed
+    sessions OK — 30 more on top of the issue's original 3, same result.
+  - **Teardown churn** (`demo/repro_teardown_churn.sh`, new): the incident
+    geometry — a refpeer teardown landing inside another client's upload burst —
+    amplified from once per ~90 s demo to **60 teardowns across 5 victim
+    sessions** (a refpeer joins, uploads one interval, and drops every ~7 s
+    while the victim streams continuously). All 5 victims completed
+    `intervals_uploaded=24`, `intervals_dropped=0`, `ok=true`. The server log
+    shows every teardown handled normally.
+  - **CI**: the `demo-e2e` job has run the exact original scenario on every
+    PR since #45 — **18 completed runs, 18 green** (skips, where an earlier
+    job failed first, are not demo outcomes).
+  The suspected window has therefore been hit on the order of a hundred times
+  without a recurrence. What would still reproduce it: the real network (the
+  incident's latency/timeout profile is not reachable on loopback), or a
+  server build other than the reference one. #28 stays open as the umbrella
+  for the required-gate's flake rate; with the gate now required (#27), every
+  merge is another data point.
 
 ### Wave 4 — vendored reconciliation
 - **#29** — batched, last.
