@@ -139,6 +139,9 @@ pub const Stats = struct {
     /// and the encoded bytes thrown away with them.
     intervals_dropped: u64 = 0,
     upload_bytes_dropped: u64 = 0,
+    /// kujamba (#14): subset of intervals_dropped caused by write backpressure,
+    /// not a reconnect. Conscious vendored Stats divergence for #29.
+    intervals_backpressured: u64 = 0,
 
     /// #24: successful rejoins after a connection-level loss. An attempt that
     /// never lands does not count — it is priced into `outage_ms` instead.
@@ -361,7 +364,7 @@ pub const Session = struct {
     // the wall clock rather than the server's epoch.
     timing: kujamba_out.ServerClock = .{},
     // kujamba (#14): has *this* bar already been counted as dropped? Cleared at
-    // the top of `finalizeInterval`, so N channels failing on one bar is one
+    // the start of each interval, so N channels failing on one bar is one
     // lost bar, not N.
     drop_marked: bool = false,
     // kujamba (#24): when the current outage began, if the session is
@@ -505,7 +508,7 @@ pub const Session = struct {
         }
         if (abandoned) {
             // one lost bar, not N — same accounting rule as a socket-drop
-            self.stats.intervals_dropped += 1;
+            if (!self.drop_marked) self.stats.intervals_dropped += 1;
             self.stats.upload_bytes_dropped += abandoned_bytes;
             self.log.line("reconnect: bar {d} abandoned mid-flight ({d} bytes discarded) — resuming at the next bar", .{
                 self.index.seq, abandoned_bytes,
@@ -744,7 +747,12 @@ pub const Session = struct {
     // ---- connection ----------------------------------------------------------
 
     fn send(self: *Session, mtype: u8, payload: []const u8) !void {
-        try self.conn.?.sendMessage(mtype, payload);
+        // #14: control messages share the audio thread too. Queue behind any
+        // in-flight upload tail instead of waiting for the peer to read.
+        self.conn.?.queueMessage(mtype, payload) catch |e| {
+            self.markConnectionLost("control write failed: {s}", .{@errorName(e)});
+            return error.ConnectionLost;
+        };
         self.stats.msgs_sent += 1;
         self.stats.bytes_sent += payload.len + 5;
         self.last_keepalive_ms = clock.nowMs(self.io);
@@ -756,10 +764,10 @@ pub const Session = struct {
         try self.send(proto.MSG_CHAT_MESSAGE, f.slice());
     }
 
-    fn sendKeepaliveIfDue(self: *Session, now_ms: i64) void {
+    fn sendKeepaliveIfDue(self: *Session, now_ms: i64) !void {
         const idle_ms = now_ms - self.last_keepalive_ms;
         if (idle_ms >= @as(i64, @intCast(self.keepalive_s)) * 1000) {
-            self.send(proto.MSG_KEEPALIVE, "") catch {};
+            try self.send(proto.MSG_KEEPALIVE, "");
             self.log.line("C>S KEEPALIVE (idle {d}ms)", .{idle_ms});
         }
     }
@@ -767,6 +775,7 @@ pub const Session = struct {
     // ---- upload path (§6.5) ---------------------------------------------------
 
     fn startIntervalEncoders(self: *Session) !void {
+        self.drop_marked = false;
         if (self.opts.plan) |pl| {
             // kujamba (#11, #12): the plan returns a full selection for this
             // bar and it is applied HERE — once, at the bar boundary, before any
@@ -800,6 +809,7 @@ pub const Session = struct {
                 lc.enc = null;
             }
             lc.pending.clear();
+            lc.dump.clear();
             lc.begun = false;
             lc.produced = 0;
             lc.dropped = false;
@@ -832,7 +842,7 @@ pub const Session = struct {
     /// finalize and restart the interval at the boundary.
     fn advanceAudio(self: *Session, now_ns: i128) !void {
         if (self.interval_len_samples == 0) return;
-        const elapsed_ns = now_ns - self.interval_start_ns;
+        const elapsed_ns = @max(0, now_ns - self.interval_start_ns);
         const elapsed_samples: u64 = @intCast(@divFloor(elapsed_ns * @as(i128, self.opts.srate), 1_000_000_000));
         // kujamba (#13): the encode target leads the wall clock by a bounded
         // margin, so the last block is already encoded — and the flush and the
@@ -859,6 +869,9 @@ pub const Session = struct {
                 if (!lc.broadcast) continue;
                 var block: [encode_block_samples]f32 = undefined;
                 encodeBlockFor(self.opts.source, self.opts.srate, lc, if (self.dev != null) live_block[0..n] else null, block[0..n]);
+                // #14: keep the source/playhead and capture clock moving after
+                // a drop, but do not encode or retain the rest of a lost bar.
+                if (lc.dropped) continue;
                 var out: std.ArrayList(u8) = .empty;
                 defer out.deinit(self.alloc);
                 lc.enc.?.encode(block[0..n], &out) catch |e| {
@@ -888,46 +901,21 @@ pub const Session = struct {
         }
     }
 
-    /// #14: send one upload message, refusing to wait for a peer that cannot
-    /// keep up. Returns false when the socket would block and the bar is being
-    /// abandoned — see `dropInterval` for what happens next.
-    ///
-    /// `self.send` is deliberately NOT used here. `send` goes through
-    /// `net.zig`'s `sendMessage`, whose EAGAIN path polls in a loop until the
-    /// peer reads (see the note on `writeAllBounded`): unbounded, on the audio
-    /// clock's own path. The zero budget turns "wait forever" into "ask once",
-    /// which is the difference between dropping a bar and hanging the session.
-    ///
-    /// `false` is returned only for `SendOutcome.declined`, which is a promise
-    /// that not one byte reached the wire — that promise is what makes dropping a
-    /// bar safe, and it is why the frame-fit check lives in `sendMessageBounded`
-    /// rather than here. `.partial` gets no such promise: part of the frame is
-    /// already on the wire and the peer is about to eat the next bar's bytes as
-    /// this frame's missing tail, so continuing would turn a dropped bar into a
-    /// session that uploads nothing for the rest of its life. That is a
-    /// connection-level failure and it fails the session.
-    fn sendUpload(self: *Session, mtype: u8, payload: []const u8) !bool {
-        const conn = &(self.conn orelse return false);
-        switch (try conn.sendMessageBounded(mtype, payload, upload_write_budget_ms)) {
-            .sent => {},
-            .declined => return false,
-            // #24: a torn frame is a connection-level failure, never a bar-level
-            // one (#14) — and a dead connection is what reconnect exists for.
-            // With `reconnect_attempts = 0` the run loop turns this into the
-            // same session failure #14 specified; with a budget, the session
-            // rejoins and the stream re-frames from zero on the new connection.
-            .partial => {
-                self.markConnectionLost(
-                    "upload frame of {d} bytes could not be written whole; the byte stream can no longer be framed, so this connection is finished",
-                    .{payload.len + 5},
-                );
-                return error.ConnectionLost;
-            },
-        }
+    /// #14: attempt a frame without waiting. On a short write Conn owns the
+    /// mandatory frame tail; the caller abandons the rest of the interval.
+    fn sendUpload(self: *Session, mtype: u8, payload: []const u8) !netmod.WriteOutcome {
+        const t0 = clock.nowNs(self.io);
+        defer self.noteUploadStall(clock.nowNs(self.io) - t0);
+        const conn = &(self.conn orelse return .declined);
+        const outcome = conn.trySendMessage(mtype, payload) catch |e| {
+            self.markConnectionLost("upload write failed: {s}", .{@errorName(e)});
+            return error.ConnectionLost;
+        };
+        if (outcome == .declined) return outcome;
         self.stats.msgs_sent += 1;
         self.stats.bytes_sent += payload.len + 5;
         self.last_keepalive_ms = clock.nowMs(self.io);
-        return true;
+        return outcome;
     }
 
     /// #14: abandon this channel's bar because the socket would block.
@@ -941,21 +929,29 @@ pub const Session = struct {
     /// room would hear as a rest), and the session moves on to the next bar with
     /// a fresh guid.
     fn dropInterval(self: *Session, lc: *LocalChannel, reason: []const u8) void {
-        const discarded = lc.pending.len + lc.dump.len;
+        if (lc.dropped) return;
+        const discarded = lc.pending.len;
         lc.dropped = true;
         lc.begun = false;
+        if (lc.enc) |e| {
+            e.destroy();
+            lc.enc = null;
+        }
         lc.pending.clear();
         lc.dump.clear();
+        // Every channel's unsent bytes count, even though the bar counts once.
+        // Dumps are already accepted bytes, not bytes discarded from the wire.
+        self.stats.upload_bytes_dropped += discarded;
         // count once per bar, not once per channel: a dropped bar is one lost
         // bar, and counting per channel would report N losses for one silence
         if (!self.drop_marked) {
             self.drop_marked = true;
             self.stats.intervals_dropped += 1;
-            self.stats.upload_bytes_dropped += discarded;
-            self.log.line("UPLOAD DROPPED: {s} — bar {d} skipped (socket would block, {d} bytes discarded); continuing at the next bar", .{
-                reason, self.index.seq, discarded,
-            });
+            self.stats.intervals_backpressured += 1;
         }
+        self.log.line("UPLOAD DROPPED: {s} — bar {d} channel {d} skipped (socket would block, {d} bytes discarded); continuing at the next bar", .{
+            reason, self.index.seq, self.channelIndex(lc), discarded,
+        });
     }
 
     fn sendUploadBegin(self: *Session, lc: *LocalChannel) !bool {
@@ -966,7 +962,7 @@ pub const Session = struct {
             .fourcc = proto.FOURCC_OGGV,
             .chidx = @intCast(self.channelIndex(lc)),
         }, &f);
-        if (!try self.sendUpload(proto.MSG_UPLOAD_INTERVAL_BEGIN, f.slice())) {
+        if (try self.sendUpload(proto.MSG_UPLOAD_INTERVAL_BEGIN, f.slice()) != .sent) {
             self.dropInterval(lc, "0x83 would block");
             return false;
         }
@@ -1010,7 +1006,7 @@ pub const Session = struct {
             // must terminate the transfer even with no data: empty write
             var f0 = Fixed{};
             try proto.buildUploadIntervalWrite(.{ .guid = lc.guid, .flags = 1, .data = "" }, &f0);
-            if (!try self.sendUpload(proto.MSG_UPLOAD_INTERVAL_WRITE, f0.slice())) {
+            if (try self.sendUpload(proto.MSG_UPLOAD_INTERVAL_WRITE, f0.slice()) != .sent) {
                 self.dropInterval(lc, "final 0x84 would block");
                 return false;
             }
@@ -1021,21 +1017,29 @@ pub const Session = struct {
         while (remaining.len > 0) {
             const n = @min(remaining.len, cap);
             const is_last = (n == remaining.len);
-            if (self.opts.payload_dump_dir != null) {
-                try lc.dump.add(remaining[0..n]);
-            }
             var f = Fixed{};
             try proto.buildUploadIntervalWrite(.{
                 .guid = lc.guid,
                 .flags = if (final and is_last) 1 else 0,
                 .data = remaining[0..n],
             }, &f);
-            if (!try self.sendUpload(proto.MSG_UPLOAD_INTERVAL_WRITE, f.slice())) {
+            const outcome = try self.sendUpload(proto.MSG_UPLOAD_INTERVAL_WRITE, f.slice());
+            if (outcome == .declined) {
+                lc.pending.len = remaining.len;
                 self.dropInterval(lc, "0x84 would block");
                 return false;
             }
             self.stats.upload_chunks += 1;
             self.stats.upload_bytes += n;
+            if (outcome == .pending) {
+                // This frame is owned by Conn and will finish asynchronously;
+                // only the bytes AFTER it are discarded. Never splice a new
+                // guid/control frame into its missing tail.
+                lc.pending.len = remaining.len - n;
+                self.dropInterval(lc, "0x84 tail pending");
+                return false;
+            }
+            if (self.opts.payload_dump_dir != null) try lc.dump.add(remaining[0..n]);
             self.log.line("C>S 0x84 WRITE guid={s} flags={d} bytes={d}", .{
                 hexBuf(&lc.guid, &self.hex_scratch), @as(u8, if (final and is_last) 1 else 0), n,
             });
@@ -1083,7 +1087,6 @@ pub const Session = struct {
         // disguised as late generation.
         const boundary_ns = stall_start_ns;
 
-        self.drop_marked = false;
         for (self.locals) |*lc| {
             // #14: a channel whose bar was abandoned mid-interval sends nothing
             // further this bar — not the tail, and not a silence marker, because
@@ -1109,7 +1112,7 @@ pub const Session = struct {
                             .fourcc = 0,
                             .chidx = @intCast(self.channelIndex(lc)),
                         }, &f);
-                        if (!try self.sendUpload(proto.MSG_UPLOAD_INTERVAL_BEGIN, f.slice())) {
+                        if (try self.sendUpload(proto.MSG_UPLOAD_INTERVAL_BEGIN, f.slice()) != .sent) {
                             self.dropInterval(lc, "silence marker would block");
                             continue;
                         }
@@ -1120,7 +1123,7 @@ pub const Session = struct {
                     }
                 }
                 if (lc.dropped) continue;
-                _ = try self.sendUploadChunk(lc, true);
+                if (!try self.sendUploadChunk(lc, true)) continue;
                 if (self.opts.payload_dump_dir) |dump_dir| {
                     try self.writePayloadDump(lc, dump_dir);
                 }
@@ -1133,7 +1136,7 @@ pub const Session = struct {
                     .fourcc = 0,
                     .chidx = @intCast(self.channelIndex(lc)),
                 }, &f);
-                if (!try self.sendUpload(proto.MSG_UPLOAD_INTERVAL_BEGIN, f.slice())) {
+                if (try self.sendUpload(proto.MSG_UPLOAD_INTERVAL_BEGIN, f.slice()) != .sent) {
                     self.dropInterval(lc, "silence marker would block");
                     continue;
                 }
@@ -1486,6 +1489,18 @@ pub const Session = struct {
 
     // ---- main loop -------------------------------------------------------------------
 
+    /// #14: idle polling spends only the time left until the next audio block,
+    /// not a fresh 20 ms before every advance (especially on short bars).
+    fn audioPollMs(self: *Session, now_ns: i128) i32 {
+        if (self.state != .active or self.interval_len_samples == 0 or self.locals.len == 0) return 20;
+        const next_sample = @min(self.locals[0].produced + encode_block_samples, self.interval_len_samples);
+        const lead = self.timing.encodeLeadSamples(self.interval_len_samples);
+        const due_ns = self.interval_start_ns +
+            @divTrunc(@as(i128, next_sample -| lead) * std.time.ns_per_s, self.opts.srate);
+        const left = @max(0, due_ns - now_ns);
+        return @intCast(@min(20, @divTrunc(left + std.time.ns_per_ms - 1, std.time.ns_per_ms)));
+    }
+
     pub fn run(self: *Session) !Stats {
         std.Io.Dir.cwd().createDirPath(self.io, self.opts.out_dir) catch {};
         if (self.opts.payload_dump_dir) |dump_dir| {
@@ -1595,35 +1610,12 @@ pub const Session = struct {
                 break;
             }
 
-            // drain any readable messages
-            var readable = true;
-            while (readable and self.state != .done) {
-                readable = self.conn.?.pollReadable(0) catch |e| {
-                    self.markConnectionLost("poll failed: {s}", .{@errorName(e)});
-                    continue :outer;
-                };
-                if (!readable) break;
-                const msg = self.conn.?.readMessage(&self.payload) catch |e| switch (e) {
-                    error.WouldBlock => break,
-                    else => {
-                        self.markConnectionLost("read failed: {s}", .{@errorName(e)});
-                        continue :outer;
-                    },
-                };
-                self.dispatch(msg) catch |e| switch (e) {
-                    error.SessionFailed => return e,
-                    // #24: a connection-level error surfaced from inside a
-                    // handler (e.g. an upload frame tore mid-finalize). The
-                    // connection is already torn down; go dial a new one.
-                    error.ConnectionLost => continue :outer,
-                    else => return e,
-                };
-            }
-            if (self.state != .done) {
-                // wait up to 20 ms for the next message
-                _ = self.conn.?.pollReadable(20) catch {};
-            }
-
+            // #14: service the audio clock BEFORE network work. Writes only
+            // flush available space, and input dispatch is capped per pass.
+            _ = self.conn.?.flushWrites() catch |e| {
+                self.markConnectionLost("write flush failed: {s}", .{@errorName(e)});
+                continue :outer;
+            };
             if (self.state == .active) {
                 const now2 = clock.nowNs(self.io);
                 self.advanceAudio(now2) catch |e| switch (e) {
@@ -1640,8 +1632,9 @@ pub const Session = struct {
                 if (self.opts.chat != null and !self.chat_sent and
                     now2 - self.start_ns >= @as(i128, self.opts.chat_delay_ms) * 1_000_000)
                 {
-                    self.sendChatMsg(&[_][]const u8{ "MSG", self.opts.chat.? }) catch |e| {
-                        return self.failSession("chat send failed: {s}", .{@errorName(e)});
+                    self.sendChatMsg(&[_][]const u8{ "MSG", self.opts.chat.? }) catch |e| switch (e) {
+                        error.ConnectionLost => continue :outer,
+                        else => return self.failSession("chat send failed: {s}", .{@errorName(e)}),
                     };
                     self.chat_sent = true;
                     self.stats.chat_sent += 1;
@@ -1649,12 +1642,39 @@ pub const Session = struct {
                 }
             }
 
+            var dispatched: usize = 0;
+            while (dispatched < 32 and self.state != .done) : (dispatched += 1) {
+                // Try buffered frames as well as fd-readable ones. A previous
+                // read may have buffered several messages before EAGAIN.
+                const msg = self.conn.?.readMessage(&self.payload) catch |e| switch (e) {
+                    error.WouldBlock => break,
+                    else => {
+                        self.markConnectionLost("read failed: {s}", .{@errorName(e)});
+                        continue :outer;
+                    },
+                };
+                self.dispatch(msg) catch |e| switch (e) {
+                    error.SessionFailed => return e,
+                    error.ConnectionLost => continue :outer,
+                    else => return e,
+                };
+            }
+            if (self.state == .done) break;
             const now_ms = clock.nowMs(self.io);
             if (now_ms - self.conn.?.last_recv_ms > @as(i64, @intCast(self.keepalive_s)) * 3000) {
                 self.markConnectionLost("connection stalled: no data for {d}ms", .{now_ms - self.conn.?.last_recv_ms});
                 continue :outer;
             }
-            if (self.state == .active) self.sendKeepaliveIfDue(now_ms);
+            if (self.state == .active) self.sendKeepaliveIfDue(now_ms) catch continue :outer;
+            if (dispatched < 32) {
+                const poll_ns = clock.nowNs(self.io);
+                const deadline_ms: i32 = @intCast(@min(20, @max(0, @divTrunc(deadline_ns - poll_ns, std.time.ns_per_ms))));
+                const wait_ms = @min(self.audioPollMs(poll_ns), deadline_ms);
+                _ = self.conn.?.pollReadable(wait_ms) catch |e| {
+                    self.markConnectionLost("poll failed: {s}", .{@errorName(e)});
+                    continue :outer;
+                };
+            }
         }
 
         // a session that ends mid-outage still reports the outage it suffered
@@ -2263,6 +2283,7 @@ test "kujamba: a mid-interval chunk that would block drops the bar and stays dro
     s.interval_len_samples = 96000;
     s.interval_start_ns = clock.nowNs(io) - @as(i128, 96000) * 1_000_000_000 / 48000;
     s.timing.anchor(s.interval_start_ns, s.bpm, s.bpi);
+    adapter.mode = .loop;
     try s.startIntervalEncoders();
 
     // the peer stops reading before the bar even starts
@@ -2270,13 +2291,18 @@ test "kujamba: a mid-interval chunk that would block drops the bar and stays dro
     @memset(&junk, 0xA5);
     _ = fillUntilBlocked(fds[0], &junk);
 
-    // generate a whole bar's worth: the chunk streaming inside advanceAudio has
-    // to try to send, and must fail without blocking. Note that advanceAudio
-    // finalises the bar itself once `produced` reaches the end, so the drop is
-    // observed through the counters rather than through `lc.dropped`, which the
-    // next `startIntervalEncoders` has already cleared.
+    // First generate only part of the bar, so the dropped state is visible.
+    // It owns no encoder or queued audio, but its phrase cursor keeps moving.
     const t0 = clock.nowNs(io);
+    try s.advanceAudio(s.interval_start_ns + 100 * std.time.ns_per_ms);
+    try std.testing.expect(s.locals[0].dropped);
+    try std.testing.expect(s.locals[0].enc == null);
+    try std.testing.expectEqual(@as(usize, 0), s.locals[0].pending.len);
+    try std.testing.expectEqual(@as(usize, 0), s.locals[0].dump.len);
+    try std.testing.expectEqual(s.locals[0].produced, fill.cursor);
+    // Finishing the bar advances the playhead without rebuilding lost audio.
     try s.advanceAudio(clock.nowNs(io));
+    try std.testing.expectEqual(@as(u64, 96000), fill.cursor);
     const elapsed_ms = @divTrunc(clock.nowNs(io) - t0, std.time.ns_per_ms);
 
     // the mid-interval send tripped the gate, and the bar was counted once
@@ -2352,6 +2378,40 @@ test "kujamba: one lost bar is counted once, however many channels were on it (#
     try std.testing.expectEqual(@as(u64, 0), s.stats.upload_channels);
     // but the clock moved exactly one bar, not two
     try std.testing.expectEqual(@as(u64, 1), s.index.seq);
+}
+
+test "kujamba: mid-bar and final drops count one bar and every channel's unsent bytes (#14)" {
+    const io = std.testing.io;
+    const fds = try saturatedSocketPair();
+    defer _ = std.posix.system.close(fds[1]);
+    var s = try Session.init(std.testing.allocator, io, .{
+        .channel_names = &.{ "one", "two" },
+    });
+    defer s.deinit();
+    s.conn = .{ .io = io, .fd = fds[0] };
+    s.log.quiet = true;
+    s.state = .active;
+    s.bpm = 120;
+    s.bpi = 4;
+    s.interval_len_samples = 96000;
+    s.interval_start_ns = clock.nowNs(io);
+    s.timing.anchor(s.interval_start_ns, s.bpm, s.bpi);
+    try s.locals[0].pending.add("first");
+    try s.locals[0].dump.add("already sent, not discarded");
+    try s.locals[1].pending.add("second");
+    var junk = [_]u8{0xa5} ** 4096;
+    _ = fillUntilBlocked(fds[0], &junk);
+
+    s.dropInterval(&s.locals[0], "mid-bar");
+    // Calling drop twice is harmless. Finalizing the other channel must not
+    // reset the per-bar latch and count this same interval for a second time.
+    s.dropInterval(&s.locals[0], "again");
+    try s.finalizeInterval();
+    try std.testing.expectEqual(@as(u64, 1), s.stats.intervals_dropped);
+    try std.testing.expectEqual(@as(u64, 1), s.stats.intervals_backpressured);
+    try std.testing.expectEqual(@as(u64, 11), s.stats.upload_bytes_dropped);
+    try std.testing.expectEqual(@as(u64, 1), s.index.seq);
+    try std.testing.expect(!s.drop_marked); // fresh bar, fresh drop latch
 }
 
 // #14: the clock keeps walking while every bar is refused.

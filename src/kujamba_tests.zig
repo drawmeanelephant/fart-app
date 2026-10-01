@@ -19,5 +19,6 @@ test {
     _ = @import("proto_fuzz.zig");
     std.testing.refAllDecls(@import("kujamba_timing.zig"));
     _ = @import("kujamba_timing.zig");
+    _ = @import("kujamba_backpressure.zig");
     _ = @import("ninjam/tests.zig");
 }

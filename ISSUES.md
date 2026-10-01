@@ -121,7 +121,7 @@ maintainable if new divergence is batched, not dripped in per-issue.
 | File | Status | Diverged by |
 |---|---|---|
 | `src/ninjam/session.zig` | **already diverged** (kujamba hooks) | #12, #13, #14, #24, #25 |
-| `src/ninjam/net.zig` | **already diverged** (`writeAllBounded` / `sendMessageBounded` / `writable` / `sendRoom` / `SendOutcome`) | #14, #23, #25 |
+| `src/ninjam/net.zig` | **already diverged** (bounded legacy writes; #14 nonblocking frame-tail/control queue, yielding reads, platform-correct `O_NONBLOCK`) | #14, #23, #25 |
 | `src/ninjam/proto.zig` | byte-identical | #26 — *only if* the harness lands in-tree |
 | `src/ninjam/buf.zig` | byte-identical | #26 — *only if* the harness lands in-tree |
 | `src/ninjam/audio.zig` | byte-identical (live path compiled out) | #20 (`-Dlive` toggle + miniaudio) |
@@ -137,9 +137,23 @@ maintainable if new divergence is batched, not dripped in per-issue.
 > non-blocking, so a peer that stops reading turns `write` into EAGAIN, and the
 > EAGAIN branch polls for 1000 ms in a loop while discarding the result. No
 > caller can bound that from outside — the only lever a caller has is whether to
-> call, and "don't call" is not the same as "call and give up". The change is
-> purely additive: `writeAllRaw`/`sendMessage` are untouched and still used by
-> every non-upload message, and three new functions sit beside them.
+> call, and "don't call" is not the same as "call and give up". The original
+> bounded-write API is retained for its existing measurements, but the #14
+> follow-up moves **every session write**, including control messages, to a
+> nonblocking writer. A partial frame's mandatory tail stays in a fixed-size
+> queue, never abandoned or interleaved with another frame. Reads also yield
+> on incomplete frames. `SO_SNDBUF` minus queue depth is advisory, not an
+> atomic-write guarantee.
+
+**#14 follow-up (2026-10-01):** the constrained `Session.run()` reproduction
+failed after ~803 ms with zero complete uploads: a short write closed the
+connection, rather than merely dropping one interval. After the fix it walks
+the interval grid throughout the four-second blockage and decodes new bars
+on the same connection once the peer drains. See `demo/backpressure.md`.
+`Stats.intervals_backpressured` is a conscious additional vendored field for
+#29: it separates write pressure from #24's reconnect losses. Byte accounting
+now counts every channel's unsent bytes once, excludes already-sent dump
+bytes, and keeps the per-bar drop latch across mid-bar and final writes.
 
 **Rule of thumb:** if a change can live in `ninjam_out.zig` or
 `kujamba_main.zig`, it should. Push down into `src/ninjam/` only when there's no
@@ -161,8 +175,8 @@ recommended answer.
 | **Is the voice preset part of the render key?** There is no render key today — `synth.zig:408` seeds the PRNG from `Wyhash.hash(0x5EED_F00D, phrase)`, text only. | #15, #16 | Decide once, document as a determinism claim. Keeping intensity *out* of the seed gives two intensities of one phrase identical noise — arguably better for A/B. |
 | **`interval_seq` vs `interval_idx`** | #12, #24, #29 | **Settled** — split as `IntervalIndex{seq, grid}`. See the bug section above. |
 | **Is the bar grid open or closed loop?** | #13, #24, #29 | **Settled — closed loop, correcting toward the wall clock.** `interval_start_ns += interval_ns` silently inherited every stall into the next bar. `ServerClock` measures each crossing and applies a correction bounded by both a fraction of the bar and 40 ms absolute. Deliberately *not* locked to the server's epoch: that offset is a constant of unknown one-way latency and the server re-times on arrival anyway. See "What drift actually is" above. |
-| **How long may a socket write wait?** | #14, #24 | **Settled — zero, on the audio-clock path.** A bar is worth one bar of audio and the socket is not worth any of it. Uploads get `sendMessageBounded(..., 0)`; control messages (keepalive, chat, registration) keep using the unbounded `sendMessage`, because losing those ends the session rather than skipping a bar, and they are a handful of bytes against a socket with room. |
-| **May a write be half-done and then abandoned?** | #14, #31 | **Settled — no, never.** The NINJAM frame is `[u8 type][u32 LE len][payload]` on a byte stream with **no resync marker**, so a torn frame does not merely lose one message: the peer finishes it with the *next* frame's bytes, then reads a header from mid-stream, and every message after that is garbage. A half-written frame is therefore a connection-level failure, never a bar-level one. `sendMessageBounded` returns a three-valued `SendOutcome` — `sent` / `declined` / `partial` — so a caller *cannot* mistake "nothing went out" for "some went out". Only `declined` may drop a bar, and it carries a promise that not one byte reached the wire; `partial` fails the session. The drop is made atomic by measuring the send buffer's real free space (`SO_SNDBUF` − queue depth) against the whole frame before touching the wire. |
+| **How long may a socket write wait?** | #14, #24 | **Settled — zero for every session write.** Uploads use `trySendMessage`; keepalive, chat, and registration use the bounded control queue. All flushes return on EAGAIN without polling. Small control messages are not exempt: they can block on a full socket too. |
+| **May a write be half-done and then abandoned?** | #14, #31 | **Settled — no, never.** Frames have no resync marker. A short write's mandatory tail stays owned by `Conn` and finishes asynchronously, ahead of later control/upload frames. The rest of the bar is dropped. Free-space estimates are advisory; correctness comes from tail ownership, not an assumed atomic TCP write. Real connection errors still go through #24. |
 | **Where does the loop crossfade live?** | #17, #8 | In `Fill.copyInto` (`cursor % n` at `ninjam_out.zig:72`), **not** in `renderPhraseF32`. In the render it would double-fade and wrongly affect `repeat`/`once`. |
 | **Golden hash for the synth** | #15, #16, #17, #18 | **Settled, and not a byte hash.** An exact WAV SHA-256 was tried and rejected on measurement: Debug and ReleaseSafe render different exact bytes from identical source, because LLVM contracts the synth's `@exp`/`@sin` differently per optimization level. Measured across all 7 baseline entries, the exact WAV hash differs between modes for **3 of them** (`kujamba karibu`, `asante sana kijiji`, `shuzi seed 0`) — the shorter, simpler renders happen to be stable, so a byte-hash guard would look fine locally and go red on CI. `src/golden.zig` instead asserts syllable count, sample count, peak, zero crossings, and a SHA-256 of the 10 ms windowed RMS envelope, which is bit-identical across modes on all 7. Expect it to fire on every M6 change; that is the point. |
 | **CI gate strictness** | #27, #28 | Start report-only, flip to required after a green streak. That streak is the flake-rate data #28 needs. |
