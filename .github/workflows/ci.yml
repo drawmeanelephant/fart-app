@@ -8,7 +8,11 @@
 #
 # Merge gate (#27): main's "Protect main" ruleset requires exactly these two
 # check contexts, and nothing else —
-#   {"type":"required_status_checks","parameters":{"required_checks":[{"context":"build-test"},{"context":"demo-e2e"}],"strict_required_status_checks_policy":false}}
+#   {"type":"required_status_checks","parameters":{
+#     "required_status_checks":[{"context":"build-test"},{"context":"demo-e2e"}],
+#     "strict_required_status_checks_policy":false}}
+# (the REST API's parameter key is `required_status_checks`; the ruleset web
+# UI's export spells it `required_checks` — the API shape is what is live)
 # Context names are the job `name:` fields below, verified against real check
 # runs before the flip. `demo-e2e` needs `build-test-macos`, so the macOS unit
 # suites gate merges transitively without their own required context.
