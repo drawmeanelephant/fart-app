@@ -27,6 +27,8 @@ Tracking issue for this map: [#31](https://github.com/drawmeanelephant/fart-app/
 Everything from the original Wave 0–3 plan has landed and closed (M4–M7
 complete; M8 lacks only #25). What remains open: **#25** cross-platform
 builds, **#29** the batched vendored-file upstreaming, and this meta issue.
+macOS/Linux builds and smoke checks are verified; #25's remaining Windows
+work is deferred and does not block #58's provisioning hardening or #29.
 The table below records how the plan played out; the one that unblocked the
 most (#11, smallest item in M4) and the rest are all done.
 

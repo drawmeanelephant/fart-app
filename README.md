@@ -436,14 +436,22 @@ file is what a listener would have heard:
 bash demo/run_demo.sh
 ```
 
-Builds the UNMODIFIED reference server and client core out-of-tree from a
-fresh checkout of `drawmeanelephant/ninjam` main (or set `NINJAM_REPO` to an
-existing checkout), runs 6 intervals against it with `demo/refpeer.cpp` (the
-reference client core) as the receiving second client, asserts energy, then
-re-runs for the determinism check. Evidence lands in
-`demo/evidence/<timestamp>/`. CI runs the same demo as a required merge gate
-(the `demo-e2e` job, #27 — a red demo blocks merge on `main`) — the reference
-build is cached, and every run's evidence is uploaded as a workflow artifact.
+Resolves `drawmeanelephant/ninjam` main once, builds that exact UNMODIFIED
+reference revision out-of-tree, and verifies its source/build manifest
+before using a warm cache. Set `NINJAM_REF_SHA` to pin a revision; an optional
+`NINJAM_REPO` checkout must be clean and match it, and is never reset/deleted.
+The demo runs 6 intervals with `demo/refpeer.cpp` (the reference client core)
+as receiver, asserts energy and the rest bar, rejects a silence negative
+control, then re-runs for byte-identical determinism.
+
+Fresh evidence lands in `demo/evidence/run-<timestamp>-<pid>/` (override with
+`KUJ_EVIDENCE_DIR`); `receipt.json` records phase, expected/actual SHA, cache
+outcomes, and failures even if the demo never starts. CI runs the same
+required `demo-e2e` gate (#27), retries only transient reference network
+operations within fixed caps, and uploads only that run attempt's evidence,
+not checked-in historical fixtures. See [the provisioning policy and
+validation recipe](demo/provisioning.md). macOS/Linux are the current
+completion targets; Windows is deferred and does not block #58 or #29.
 
 ---
 
