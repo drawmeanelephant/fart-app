@@ -573,9 +573,12 @@ to remove the thing it claims to break.
   final encode block of a bar splits at a different point — and libvorbis then
   packs a slightly different packet from the same PCM: measured at **one to
   eight bytes per bar** (same serial, same granule totals, same guid). The
-  resume tests therefore compare byte-for-byte only where the rhythm is
-  unchanged (bar 0, pre-outage), and pin identity where it actually lives:
-  guid and serial derive from `(seed, seq)` and are untouched. Two
+  resume tests therefore pin identity where it actually lives — guid and
+  serial derive from `(seed, seq)` and are untouched — and assert the serial
+  straight out of each dump's ogg page header plus that every dump decodes.
+  Cross-run byte-for-byte dump comparison is not asserted at all: even the
+  pre-outage bar 0 differed across two runs on a slow ReleaseSafe runner,
+  because the session's first partial encode block is scheduling jitter. Two
   consequences worth keeping: the demo's determinism evidence is unaffected
   (it compares two healthy runs and the demo never reconnects), and — more
   interesting — a direct `vorbis_analysis` experiment showed chunk splits
