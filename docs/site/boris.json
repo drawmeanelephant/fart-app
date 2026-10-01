@@ -1,0 +1,23 @@
+{
+  "format": "boris-publication-profile",
+  "schema_version": 1,
+  "input": "content",
+  "site": {
+    "title": "Flatlophone",
+    "description": "Serious documentation for an unserious instrument.",
+    "url": "https://drawmeanelephant.github.io/fart-app"
+  },
+  "publication": {
+    "target": "github-pages",
+    "base_url": "https://drawmeanelephant.github.io/fart-app",
+    "origin": "https://drawmeanelephant.github.io",
+    "base_path": "/fart-app"
+  },
+  "targets": [{
+    "name": "public",
+    "output": "dist",
+    "public": true,
+    "theme": "themes/flatlophone",
+    "sitemap": {"path": "sitemap.xml"}
+  }]
+}
