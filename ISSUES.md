@@ -12,19 +12,24 @@ Windows (#25). `zig build test` → **218/218 pass**, in Debug, ReleaseSafe and
 `-Dlive=false`, plus the hardware-independent C audio test. CI runs native
 Linux/macOS builds and tests, with `build-test` and `demo-e2e` required on main.
 #58 provisioning hardening has landed. The #26 crash bugs (#40, #41) are fixed.
-#29's upstream feature batch landed in ninjam#38. The byte-identical downstream
-subset is pinned to its actual merge commit and ready for downstream review;
-#29 remains open until the downstream PR lands.
+#29 is complete: upstream ninjam#38 and downstream PR #61 have merged. The
+shared subset is byte-identical to the actual upstream merge commit.
+User instructions live in [the docs site](docs/README.md); this map preserves
+the engineering sequence and decisions.
 
 Tracking issue for this map: [#31](https://github.com/drawmeanelephant/fart-app/issues/31).
+
+The historical tables below preserve the build order and findings. Source
+line numbers and early interfaces are not the current API reference; use
+the [field manual](docs/site/content/reference/cli.md) for current behavior.
 
 ---
 
 ## The short version
 
 Everything from the original Wave 0–3 plan has landed and closed (M4–M7
-complete; M8 lacks only #25). What remains open: **#25** cross-platform
-builds, **#29** the batched vendored-file upstreaming, and this meta issue.
+complete; M8 lacks only #25). Remaining engineering work is **#25**, deferred
+Windows support. #29 is closed. This meta issue (#31) is docs bookkeeping.
 macOS/Linux builds and smoke checks are verified; #25's remaining Windows
 work is deferred and does not block #58's provisioning hardening or #29.
 The table below records how the plan played out; the one that unblocked the
@@ -37,14 +42,13 @@ most (#11, smallest item in M4) and the rest are all done.
 | **#18** voiceSpec knobs | ✅ **done** — `--voice` multipliers, see below | #15, #16 |
 | **#12** Re-anchor on config change | ✅ **done** — split the counters, see below | #24, #29 |
 | **#19** Offline render | ✅ **done** — `kujamba render`, see below | verification harness for M6 |
-| **#8** Phrase bank | ✅ **done** — `--phrases FILE` + `!kujamba <n\|name>` | M4 complete |
+| **#8** Phrase bank | ✅ **done** — `--phrases FILE` + `kujamba <n\|name>` (no bang on the reference server) | M4 complete |
 | **#27** CI demo | ✅ **done** — PRs #45 + #52: `demo-e2e` on macOS, required on main's ruleset, reference build cached | #28's flake-rate data, the safety net for everything |
 | **#13** Server-clock discipline | ✅ **done** — `ServerClock`, bounded slew, encode lead | M5 complete |
 | **#14** Upload backpressure | ✅ **done** — measured, then bounded write + drop-and-continue | M5 complete |
 
-Wave 4 (#29) is the only sequencing stage left. #25's Windows work is deferred;
-coordinate future transport/platform edits with the #29 batch rather than
-making Windows a merge prerequisite.
+Wave 4 (#29) has landed. #25's Windows work is deferred; future shared
+transport/platform changes still need upstream-first coordination.
 
 ---
 
@@ -64,9 +68,11 @@ making Windows a merge prerequisite.
 
 ### The four edges that matter most
 
-1. **#11 before #8 and #9.** ✅ Done — the hook is now `selectFor(...) -> Selection{broadcast, mode, samples}`,
-   consulted once per interval and applied at the bar boundary. **#8 and #9 no longer need to
-   reshape the vendored hook.** The original note: `IntervalPlan.broadcastFor` returned `bool`. All three
+1. **#11 before #8 and #9.** ✅ Done — local `selectFor(...)` chooses
+   `Selection{broadcast, mode, samples}` once per interval. After #29, the
+   vendored plan is a generic boolean callback; application policy remains local.
+   **#8 and #9 no longer need to reshape the vendored hook.** The original note:
+   `IntervalPlan.broadcastFor` returned `bool`. All three
    issues need it to carry *which phrase* and *which mode*. Doing #8 or #9 first
    means reshaping this vendored hook twice. The hook is consulted exactly once
    per interval, *before* any audio is generated — which is what makes
@@ -122,7 +128,7 @@ All **15 of 15** files in `src/ninjam/` now match the upstream merge commit
 The C shim and generated Ogg config header also match, with no source
 exceptions. The merged zclient tree is identical to the reviewed feature
 commit; identity checks and the reference demo have been repeated.
-Only downstream review/merge remains before #29 can close.
+Downstream PR #61 merged and closed #29 on 2026-10-01.
 The old `f428caf` pin and three-file divergence ledger are superseded.
 See `vendor/README.md` for the exact identity check.
 
@@ -165,7 +171,7 @@ bytes, and keeps the per-bar drop latch across mid-bar and final writes.
 
 **Rule of thumb:** if a change can live in `ninjam_out.zig` or
 `kujamba_main.zig`, it should. Push down into `src/ninjam/` only when there's no
-choice, and batch those pushes into #29.
+choice, and coordinate those changes in a new upstream PR before repinning.
 
 #29 is a **feature PR upstream**, in transport, audio, and generic-session
 commits. The application policies stay local. The legacy bounded writer and
@@ -189,7 +195,7 @@ recommended answer.
 | **Is the bar grid open or closed loop?** | #13, #24, #29 | **Settled — closed loop, correcting toward the wall clock.** `interval_start_ns += interval_ns` silently inherited every stall into the next bar. `ServerClock` measures each crossing and applies a correction bounded by both a fraction of the bar and 40 ms absolute. Deliberately *not* locked to the server's epoch: that offset is a constant of unknown one-way latency and the server re-times on arrival anyway. See "What drift actually is" above. |
 | **How long may a socket write wait?** | #14, #24 | **Settled — zero for every session write.** Uploads use `trySendMessage`; keepalive, chat, and registration use the bounded control queue. All flushes return on EAGAIN without polling. Small control messages are not exempt: they can block on a full socket too. |
 | **May a write be half-done and then abandoned?** | #14, #31 | **Settled — no, never.** Frames have no resync marker. A short write's mandatory tail stays owned by `Conn` and finishes asynchronously, ahead of later control/upload frames. The rest of the bar is dropped. Free-space estimates are advisory; correctness comes from tail ownership, not an assumed atomic TCP write. Real connection errors still go through #24. |
-| **Where does the loop crossfade live?** | #17, #8 | In `Fill.copyInto` (`cursor % n` at `ninjam_out.zig:72`), **not** in `renderPhraseF32`. In the render it would double-fade and wrongly affect `repeat`/`once`. |
+| **Where does the loop crossfade live?** | #17, #8 | **Settled — none is needed.** The synth reaches zero at both ends; measured crossfades made the wrap worse. Preserve the zero-endpoint regression instead. |
 | **Golden hash for the synth** | #15, #16, #17, #18 | **Settled, and not a byte hash.** An exact WAV SHA-256 was tried and rejected on measurement: Debug and ReleaseSafe render different exact bytes from identical source, because LLVM contracts the synth's `@exp`/`@sin` differently per optimization level. Measured across all 7 baseline entries, the exact WAV hash differs between modes for **3 of them** (`kujamba karibu`, `asante sana kijiji`, `shuzi seed 0`) — the shorter, simpler renders happen to be stable, so a byte-hash guard would look fine locally and go red on CI. `src/golden.zig` instead asserts syllable count, sample count, peak, zero crossings, and a SHA-256 of the 10 ms windowed RMS envelope, which is bit-identical across modes on all 7. Expect it to fire on every M6 change; that is the point. |
 | **CI gate strictness** | #27, #28 | Start report-only, flip to required after a green streak. That streak is the flake-rate data #28 needs. |
 | **Offline `--pattern` semantics** | #19 | **Settled — silence bytes.** A rest bar uploads a NINJAM silence marker in a live session, so the room hears nothing and the cursor does not advance. Writing silence keeps the offline timeline identical to the live one; skipping the bars would produce a file that disagrees with what it previews. |
@@ -209,8 +215,9 @@ fix, the other is the harness that makes M6 verifiable without a room.
 
 ### Wave 1 — milestone payoffs, once Wave 0 lands
 - **M4:** #8, #9 — ✅ **M4 is complete.** A bandleader can now shape the
-  performance entirely from room chat: `!kujamba <verb>` for transport,
-  `!kujamba <n|name>` for the phrase, every one of them landing on a bar line.
+  performance entirely from room chat: `kujamba <verb>` for transport,
+  `kujamba <n|name>` for the phrase, applied on a bar line. Stop finalizes
+  already-generated samples immediately rather than waiting out the bar.
 - **M5:** #13, #14 — ✅ **M5 is complete.** Both landed together because they are
   the same defect seen from two sides: a bar's audio is generated on a wall
   clock, and the upload of that bar happens inline on the same path. #13 makes
@@ -234,9 +241,8 @@ fix, the other is the harness that makes M6 verifiable without a room.
   still-zero reproductions (PR #54), so there was never a flake to paper over,
   and the required gate keeps reporting connection deaths verbatim.
 
-`#20` and `#25` share the `-Dlive` build option. `#25`'s Windows half is
-honestly a separate job (Winsock shim + console handler) — consider splitting it
-and landing Linux first.
+`#20` and `#25` share the `-Dlive` build option. Linux has landed.
+`#25`'s Windows half is a separate, deferred job (Winsock shim + console handler).
 
 ### Wave 3 — investigation close-out
 
@@ -265,7 +271,8 @@ and landing Linux first.
   merge is still a data point, and a recurrence just reopens the investigation.
 
 ### Wave 4 — vendored reconciliation
-- **#29** — batched, last.
+- **#29** — complete: upstream ninjam#38 and downstream #61 merged; all 15
+  shared Zig files and C sources match the merged upstream pin.
 
 ---
 
@@ -520,7 +527,8 @@ to remove the thing it claims to break.
   `get(0..4)` returning empty slices). Fuzz a dispatch step, not just the parser.
 - **The `test` step description is stale.** ~~`build.zig:77` says "Run audit +
   synth unit tests" but it runs three suites (59 tests).~~ **Fixed** alongside
-  the golden fingerprints: it now runs five suites (102 tests) and says so.
+  the golden fingerprints: at that point it ran five suites (102 tests).
+  The current measured count is recorded at the top, not in this history.
 - **Darwin does not implement `TIOCOUTQ` for sockets, and the replacement is not
   obvious.** Linux answers "how full is the send queue" with `ioctl(TIOCOUTQ)`.
   On macOS that returns `ENOTSUP` — for *both* the `'t'` spelling from its own
