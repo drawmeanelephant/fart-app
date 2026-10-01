@@ -7,16 +7,14 @@ and which decisions get made once instead of three times.
 The dependency edges below are also encoded as GitHub `blocked-by` relations on
 the issues themselves, so `gh issue view 12` shows them without reading this.
 
-**State at time of writing:** 4 milestones (M4–M8), M4 complete and M5 complete
-(#13 + #14 landed together). `zig build test` → **180/180 pass** in five suites,
-in Debug, ReleaseSafe and `-Dlive=false`. CI gates pushes and PRs (build + test,
-`build-test`, on Linux); it is not yet required by `main`'s ruleset, and it does
-not yet run the live demo (#27).
-
-Two open issues (#40, #41) are crash bugs the #26 fuzzer found in the client:
-a wire-controlled `channel_id >= 32` and a `bpm=0` config both panic. Both are
-small, and both belong in `src/ninjam/session.zig` — so they cannot be picked up
-in parallel with each other, or with #8's branch, which also edits that file.
+**Current status (#29 reconciliation):** M4–M7 are complete; M8 defers only
+Windows (#25). `zig build test` → **218/218 pass**, in Debug, ReleaseSafe and
+`-Dlive=false`, plus the hardware-independent C audio test. CI runs native
+Linux/macOS builds and tests, with `build-test` and `demo-e2e` required on main.
+#58 provisioning hardening has landed. The #26 crash bugs (#40, #41) are fixed.
+#29's upstream feature batch landed in ninjam#38. The byte-identical downstream
+subset is pinned to its actual merge commit and ready for downstream review;
+#29 remains open until the downstream PR lands.
 
 Tracking issue for this map: [#31](https://github.com/drawmeanelephant/fart-app/issues/31).
 
@@ -44,9 +42,9 @@ most (#11, smallest item in M4) and the rest are all done.
 | **#13** Server-clock discipline | ✅ **done** — `ServerClock`, bounded slew, encode lead | M5 complete |
 | **#14** Upload backpressure | ✅ **done** — measured, then bounded write + drop-and-continue | M5 complete |
 
-Wave 4 (#29) is the only sequencing stage left, and #25 can proceed in
-parallel with it — their file sets barely overlap (#25 is `net.zig`/platform
-shims, #29 is `session.zig` first).
+Wave 4 (#29) is the only sequencing stage left. #25's Windows work is deferred;
+coordinate future transport/platform edits with the #29 batch rather than
+making Windows a merge prerequisite.
 
 ---
 
@@ -60,7 +58,8 @@ shims, #29 is `session.zig` first).
 
         #27 ──> #28
 
-        #12 #13 #14 #23 #24 #25 #26 ──> #29   (final vendored reconciliation)
+        #12 #13 #14 #23 #24 #26 ──> #29   (final vendored reconciliation)
+        #25 Windows: deferred, not a blocker
 ```
 
 ### The four edges that matter most
@@ -99,7 +98,7 @@ carrying different payload bytes**. Separately, `writePayloadDump` names files
 evidence the demo depends on.
 
 **Fix shipped.** The two roles are now split as suggested, in `IntervalIndex`
-(`src/ninjam_out.zig`):
+(`src/ninjam/instrument.zig`, reexported by `src/ninjam_out.zig`):
 
 | Field | Drives | Property |
 |---|---|---|
@@ -110,40 +109,35 @@ A `0x02` config change now moves the grid geometry and nothing else. This makes
 #24's "resume at the next bar" meaningful, and keeps determinism intact across a
 reconnect.
 
-Config changes are now covered by tests, including a seam test that drives a
-real `0x02` through `Session.dispatch`. The one path not covered is the
-`--intervals` cap, which lives in `finalizeInterval` and is unreachable without a
-socket — #24 should pick that up.
+Config changes and the interval cap are covered by real-socket regressions.
+The #29 selector-count regression also verifies that a mid-bar config change
+selects the next interval once, and never selects past the interval cap.
 
 ---
 
 ## Vendored-file ledger
 
-`src/ninjam/` is vendored from `drawmeanelephant/ninjam` branch `agent/zclient`
-(commit `f428caf`). The "12 of 12 byte-identical" invariant in #29 is only
-maintainable if new divergence is batched, not dripped in per-issue.
+All **15 of 15** files in `src/ninjam/` now match the upstream merge commit
+`ae9a4d4325addd42d844047c080b9e1c0d6080d4` (ninjam#38 into `agent/zclient`).
+The C shim and generated Ogg config header also match, with no source
+exceptions. The merged zclient tree is identical to the reviewed feature
+commit; identity checks and the reference demo have been repeated.
+Only downstream review/merge remains before #29 can close.
+The old `f428caf` pin and three-file divergence ledger are superseded.
+See `vendor/README.md` for the exact identity check.
 
-> **Recon 2026-10-01** (full report on #29): upstream's `agent/zclient` tip has
-> moved six commits past the pin (`17905c5b` — vendor contract, a Linux libogg
-> build fix, Phase B miniaudio duplex live audio, `--live` dedup), touching only
-> `main.zig` (±8) and `session.zig` (−2). Measured local divergence: `session.zig`
-> 1784 lines / 31 hunks, `net.zig` 601 / 10, `audio.zig` 43 (the row below was
-> stale); the other nine files are byte-identical to the pin. The upstream-PR
-> surface is therefore exactly three files, and the reconcile target should be
-> the tip, not the pin.
-
-| File | Status | Diverged by |
+| File | Status | Responsibility |
 |---|---|---|
-| `src/ninjam/session.zig` | **already diverged** (kujamba hooks) | #12, #13, #14, #24, #25 |
-| `src/ninjam/net.zig` | **already diverged** (bounded legacy writes; #14 nonblocking frame-tail/control queue, yielding reads, platform-correct `O_NONBLOCK`) | #14, #23, #25 |
-| `src/ninjam/proto.zig` | byte-identical | #26 — *only if* the harness lands in-tree |
-| `src/ninjam/buf.zig` | byte-identical | #26 — *only if* the harness lands in-tree |
-| `src/ninjam/audio.zig` | **diverged** — playback-only `Device.openPlayback` + `zc_playback_device_open` so #20's audition path never opens the capture side (no mic permission ever asked) | #20 (`-Dlive` toggle + miniaudio) |
-| `src/ninjam_out.zig` | **new** (not vendored) | #10, #11, #12, #13, #17, #22, #24 |
-| `src/kujamba_main.zig` | **new** (not vendored) | #8, #9, #19, #20, #21, #22, #25 |
-| `src/kujamba_timing.zig` | **new** (not vendored) | #13, #14, #24 — the M5 timing harness + the reconnect test rig |
-| `src/synth.zig` | **new** (not vendored) | #15, #16, #18 |
-| `src/golden.zig` | **new** (not vendored) | guards #15, #16, #17, #18 |
+| `src/ninjam/session.zig` | byte-identical | generic source/plan/chat/stop, config, reconnect, drop policy |
+| `src/ninjam/net.zig` | byte-identical | IPv6, yielding reads, bounded frame-tail/control queue |
+| `src/ninjam/instrument.zig` | byte-identical | monotonic identity, deterministic IDs/dumps, clock and backoff |
+| `src/ninjam/audio.zig` + `vendor/miniaudio_impl.c` | byte-identical | playback-only allocation, context/ID ownership, signed errors |
+| `src/ninjam/{backpressure_test,session_timing_test}.zig` | byte-identical | synthetic PCM socket/clock/reconnect fixtures |
+| Remaining 9 `src/ninjam/` files + C dependency subset | byte-identical | protocol, framing, codecs, WAV and shared test root |
+| `src/ninjam_out.zig` + `src/kujamba_main.zig` | local | phrase/mode/pattern/CLI/chat policy and callback wiring |
+| `src/kujamba_session_tests.zig` + `src/proto_fuzz.zig` | local | app integration and hostile-stream regressions |
+| `src/kujamba_backpressure.zig` | local compatibility entrypoint | existing `repro-backpressure` build target |
+| `src/synth.zig` + `src/golden.zig` | local, unchanged | synth behavior and render regressions |
 
 > **`net.zig` had to be touched, and it is worth being honest about why.** The
 > rule above is "push down into `src/ninjam/` only when there's no choice", and
@@ -173,9 +167,13 @@ bytes, and keeps the per-bar drop latch across mid-bar and final writes.
 `kujamba_main.zig`, it should. Push down into `src/ninjam/` only when there's no
 choice, and batch those pushes into #29.
 
-#29 is therefore best reframed as a **feature PR upstream** (instrument hooks +
-IPv6 + any net fixes, in one go) rather than a local-hygiene chore. That's a
-much easier ask of the upstream repo than "take our local edits."
+#29 is a **feature PR upstream**, in transport, audio, and generic-session
+commits. The application policies stay local. The legacy bounded writer and
+pressure executable entrypoint retain existing base-branch consumers; the
+unused timing wrapper and stale per-channel interval counter are removed.
+Historical deterministic-ID hash tags remain because changing them changes
+payload bytes. The final reference demo passes, and all five upload hashes
+match the pre-refactor #58 baseline.
 
 ---
 
@@ -397,10 +395,10 @@ to remove the thing it claims to break.
   78 699 of 79 380 samples identical, 415 differ by 1 LSB (i16 → f32 → i16), and
   all 266 samples differing by 2–6 LSB sit inside the final 352 — the fade
   window. A test pins the relationship.
-- **#20's real first step is a build option, not an `un-if`.** `build.zig:120`
-  hardcodes `live = false` with no `-Dlive` flag, so the live path cannot be
-  compiled from the CLI at all. And `miniaudio` is *not vendored*, so this issue
-  needs a vendoring step the issue body doesn't mention.
+- **#20 needed a build option and vendoring, not just an `un-if`.** Landed:
+  miniaudio is vendored, `-Dlive` controls production device support, and
+  local audition uses playback only. #29 upstreams the shared allocation,
+  device-ID/context lifetime and signed-error fixes with null-backend tests.
 - **#23 is a rewrite, not a flag.** `net.zig` hardcodes `AF.INET` in
   `openStreamSocket` and types `connectSockaddr` as
   `*const std.posix.sockaddr.in` — the IPv4 struct. The CLI already parses

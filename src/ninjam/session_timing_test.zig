@@ -24,9 +24,9 @@
 //!    a slow link; `toneSource` makes the uploads big enough to actually fill a
 //!    buffer.
 //!
-//! Everything here is deliberately OUTSIDE `src/ninjam/` (see the file ledger
-//! in ISSUES.md) — the vendored subset keeps no harness, only the hooks the
-//! instrument needs.
+//! These portable fixtures use synthetic PCM, not application synthesis or
+//! phrase policy. The same regressions run in the conformance client and in
+//! applications that vendor its session engine.
 //!
 //! `runClockedSession` is the shared driver: it stands up a loopback listener,
 //! plays one scripted server, runs a real `Session` against it, and hands back
@@ -35,16 +35,29 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const session = @import("ninjam/session.zig");
-const proto = @import("ninjam/proto.zig");
-const net = @import("ninjam/net.zig");
-const kujamba_out = @import("ninjam_out.zig");
-const clock = @import("ninjam/clock.zig");
-const vorbis = @import("ninjam/vorbis.zig");
+const session = @import("session.zig");
+const proto = @import("proto.zig");
+const net = @import("net.zig");
+const instrument = @import("instrument.zig");
+const SampleSource = struct {
+    samples: []const f32,
+    fn source(self: *SampleSource) session.Source {
+        return .{ .custom = .{ .ctx = self, .fill = fill } };
+    }
+    fn fill(ctx: *anyopaque, offset: u64, dst: []f32) void {
+        const self: *SampleSource = @ptrCast(@alignCast(ctx));
+        for (dst, 0..) |*sample, i| {
+            const index = offset + i;
+            sample.* = if (index < self.samples.len) self.samples[@intCast(index)] else 0;
+        }
+    }
+};
+const clock = @import("clock.zig");
+const vorbis = @import("vorbis.zig");
 
 /// Relative on purpose: `Session.run` creates its out_dir via `Dir.cwd()`, and
 /// `zig-cache/` is already gitignored.
-const timing_out_dir = "zig-cache/timing-out";
+const timing_out_dir = "zig-cache/session-timing-out";
 
 /// The scripted server's side of a run, so a test can compare what the client
 /// *thought* it sent against what actually crossed the socket.
@@ -1103,7 +1116,7 @@ test "MEASURE #14: a slow peer never stalls the audio clock" {
     // — on an 800 ms bar the dominant term is the run loop's 20 ms poll, and any
     // bound tight enough to be interesting would be a measurement of the runner
     // rather than of the clock. `ServerClock`'s own bounds are asserted where
-    // they are implemented, in `ninjam_out.zig`, with no wall clock involved.
+    // they are implemented, in `instrument.zig`, with no wall clock involved.
 }
 
 // #14: the hazard itself, measured on a socket that really does fill.
@@ -1528,7 +1541,7 @@ fn runReconnect(script: ReconnectScript, opts_in: session.Options) !ReconnectRun
 /// makes "killed after N upload-begins" mean "killed mid-bar" deterministically.
 var reconnect_samples: [48000]f32 = undefined;
 var reconnect_samples_ready = false;
-var reconnect_fill = kujamba_out.Fill{ .samples = &reconnect_samples, .mode = .repeat };
+var reconnect_fill = SampleSource{ .samples = &reconnect_samples };
 fn reconnectSource() session.Source {
     if (!reconnect_samples_ready) {
         var st: u64 = 0x9E3779B97F4A7C15;
@@ -1540,7 +1553,7 @@ fn reconnectSource() session.Source {
         }
         reconnect_samples_ready = true;
     }
-    return .{ .kujamba = &reconnect_fill };
+    return reconnect_fill.source();
 }
 
 fn reconnectOpts() session.Options {
@@ -1580,7 +1593,7 @@ test "reconnect: a killed connection is rejoined and the --intervals cap counts 
     // one bar two identities and hand the room the start of a phrase it can
     // never hear finish.
     var expected: [4][16]u8 = undefined;
-    for (0..4) |i| kujamba_out.deriveGuid(42, i, 0, &expected[i]);
+    for (0..4) |i| instrument.deriveGuid(42, i, 0, &expected[i]);
     var seen_on_conn: [4][2]bool = [_][2]bool{ .{ false, false }, .{ false, false }, .{ false, false }, .{ false, false } };
     for (0..2) |conn| {
         var last_seq: i64 = -1;
@@ -1609,7 +1622,7 @@ test "reconnect: a killed connection is rejoined and the --intervals cap counts 
 
 test "reconnect: re-sent payloads carry the deterministic serial and decode (#24)" {
     const alloc = std.testing.allocator;
-    const dump_dir = "zig-cache/timing-out/recon-dump";
+    const dump_dir = "zig-cache/session-timing-out/recon-dump";
 
     var opts = reconnectOpts();
     opts.stop_after_intervals = 4;
@@ -1638,7 +1651,7 @@ test "reconnect: re-sent payloads carry the deterministic serial and decode (#24
         defer alloc.free(bytes);
         try std.testing.expect(bytes.len > 27 + 4);
         const serial = std.mem.readInt(u32, bytes[14..18], .little);
-        try std.testing.expectEqual(kujamba_out.deriveSerial(42, i, 0) & 0x7FFFFFFF, serial);
+        try std.testing.expectEqual(instrument.deriveSerial(42, i, 0) & 0x7FFFFFFF, serial);
         // and the payload is real, decodable vorbis — not framing debris from
         // the dead connection
         var dec = vorbis.decodeMemory(alloc, bytes) catch |e| {
@@ -1652,7 +1665,7 @@ test "reconnect: re-sent payloads carry the deterministic serial and decode (#24
 
 test "reconnect: exhausting the dial budget fails the session with the loss reason (#24)" {
     const alloc = std.testing.allocator;
-    const transcript_path = "zig-cache/timing-out/reconnect-exhausted.log";
+    const transcript_path = "zig-cache/session-timing-out/reconnect-exhausted.log";
     std.Io.Dir.cwd().deleteFile(std.testing.io, transcript_path) catch {};
 
     var opts = reconnectOpts();
@@ -1695,7 +1708,7 @@ test "reconnect: the stall detector rejoins a server that went silent (#24)" {
     const alloc = std.testing.allocator;
     var opts = reconnectOpts();
     opts.stop_after_intervals = 7;
-    opts.transcript_path = "zig-cache/timing-out/reconnect-stall.log";
+    opts.transcript_path = "zig-cache/session-timing-out/reconnect-stall.log";
     const run = try runReconnect(
         // keepalive 1 s -> the client's stall threshold is 3 s. The server
         // keeps READING while silent, so the client's sends keep landing and
@@ -1716,7 +1729,7 @@ test "reconnect: the stall detector rejoins a server that went silent (#24)" {
     // EOF, so the rejoin lands within milliseconds of the threshold
     try std.testing.expect(run.stats.outage_ms > 0);
     // and the trigger really was the stall detector, not a read error
-    const stall_text = std.Io.Dir.cwd().readFileAlloc(std.testing.io, "zig-cache/timing-out/reconnect-stall.log", alloc, .limited(1 << 20)) catch
+    const stall_text = std.Io.Dir.cwd().readFileAlloc(std.testing.io, "zig-cache/session-timing-out/reconnect-stall.log", alloc, .limited(1 << 20)) catch
         return error.TranscriptMissing;
     defer alloc.free(stall_text);
     try std.testing.expect(std.mem.indexOf(u8, stall_text, "CONNECTION LOST: connection stalled") != null);
@@ -1734,11 +1747,11 @@ test "reconnect: the stall detector rejoins a server that went silent (#24)" {
     try std.testing.expectEqual(@as(u32, 4), run.view.uploads_per_conn[1]);
     var g: [16]u8 = undefined;
     for (0..4) |i| {
-        kujamba_out.deriveGuid(42, i, 0, &g);
+        instrument.deriveGuid(42, i, 0, &g);
         try std.testing.expectEqualSlices(u8, &g, &run.view.guids[0][i]);
     }
     for (3..7) |i| {
-        kujamba_out.deriveGuid(42, i, 0, &g);
+        instrument.deriveGuid(42, i, 0, &g);
         try std.testing.expectEqualSlices(u8, &g, &run.view.guids[1][i - 3]);
     }
 }

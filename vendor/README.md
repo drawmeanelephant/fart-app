@@ -10,23 +10,55 @@ ecosystem. Each dependency is a single file or a source-only tree.
 | `libvorbis/` | https://xiph.org/vorbis/ | 1.3.7 (2020-07-04) | BSD-3-Clause (`libvorbis/COPYING`) | Vorbis encoding of the kujamba channel |
 | `miniaudio.h` + `miniaudio_impl.c` | https://github.com/mackron/miniaudio | 0.11.25 (2026-03-04) | public domain / MIT-0 (statement at the end of `miniaudio.h`) | live audio device behind the `zc_*` shim (#20: `kujamba play`/`trigger` local playback) |
 
-Provenance: these trees were taken from zclient
-(`drawmeanelephant/ninjam`, branch `agent/zclient`, commit `f428caf`) and are
+Provenance: the 15 Zig files in `src/ninjam/`, both Xiph source trees, and
+the miniaudio/stb headers and shims match zclient in `drawmeanelephant/ninjam`
+at **`ae9a4d4325addd42d844047c080b9e1c0d6080d4`** byte-for-byte. The null-audio
+ABI test also matches upstream (`src/audio_shim_test.c` here,
+`zclient/tests/audio_shim_test.c` there). The C dependencies are
 compiled exactly as zclient's `build.zig` compiles them (same source list,
 same `-fno-sanitize=undefined` flag for libvorbis). zclient's own provenance
 work (trimming the Xiph tarballs to the files the build needs) is preserved;
 `libvorbis` is 1.3.7 because that is what the reference client's CMake
 FetchContent also uses, so both encoders link the same version.
 
-Provenance: miniaudio was taken unchanged from zclient
-(`drawmeanelephant/ninjam`, branch `agent/zclient`, commit `4d40aa1c`) except
-for the shim fixes this PR needed: the custom-device-id path now resolves ids
-through backend enumeration (the old code passed a `ma_device_id*` as
-`ma_device_init`'s context argument), `zc_playback_device_open` was added for
-the playback-only audition path, and `zc_error_string` no longer negates the
-result code twice. The miniaudio TU compiles only when `-Dlive` is on
+**Merged upstream pin:** [ninjam#38](https://github.com/drawmeanelephant/ninjam/pull/38)
+landed in `agent/zclient` on 2026-10-01 at the commit above. Its zclient tree
+is unchanged from reviewed feature commit
+`c2a0d95848c590f8e259cbe105fb68b9a128e791`. The exact identity checks and
+reference demo have been repeated after the merge. Windows (#25) remains
+deferred separately and is not a prerequisite for downstream reconciliation.
+
+The shared shim resolves playback and capture IDs separately from one
+enumeration snapshot, retains its context until close, supports playback-only
+opening, and returns native negative miniaudio errors. Ring-allocation failures
+are tested without opening a device. The production miniaudio TU compiles only when `-Dlive` is on
 (default for macOS targets): `zig build` on Linux stays ALSA-free unless the
-flag asks for audio.
+flag asks for audio. `zig build test` also compiles a standalone null-backend
+ABI test regardless of that flag; it never opens real audio hardware.
+
+## Verify the pinned subset
+
+Use a clean upstream checkout at the exact pin (not merely the branch tip).
+Run from this repository, with `NINJAM_CHECKOUT` set to that checkout:
+
+```sh
+set -e
+pin=ae9a4d4325addd42d844047c080b9e1c0d6080d4
+test "$(git -C "$NINJAM_CHECKOUT" rev-parse HEAD)" = "$pin"
+git -C "$NINJAM_CHECKOUT" diff --exit-code HEAD -- zclient/src zclient/vendor zclient/tests
+diff -r "$NINJAM_CHECKOUT/zclient/src" src/ninjam
+diff -r "$NINJAM_CHECKOUT/zclient/vendor/libogg" vendor/libogg
+diff -r "$NINJAM_CHECKOUT/zclient/vendor/libvorbis" vendor/libvorbis
+for file in miniaudio.h miniaudio_impl.c stb_vorbis.c stb_vorbis_impl.c; do
+  cmp "$NINJAM_CHECKOUT/zclient/vendor/$file" "vendor/$file" || exit 1
+done
+cmp "$NINJAM_CHECKOUT/zclient/tests/audio_shim_test.c" src/audio_shim_test.c
+```
+
+No local exceptions remain in the shared source subset. Upstream's
+`zclient/vendor/refresh-vendor.sh --check` independently regenerates and verifies
+the pinned third-party downloads and trim rule. Local README/build/test-root
+layout is intentionally separate from the vendored source contract.
 
 ## What was trimmed (per zclient)
 
