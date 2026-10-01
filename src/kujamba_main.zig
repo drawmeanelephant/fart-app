@@ -510,7 +510,7 @@ fn cmdJoin(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: [
     var out_buf: [2048]u8 = undefined;
     const line = std.fmt.bufPrint(
         &out_buf,
-        "RESULT ok={} err=\"{s}\" seed={d} play={s} phrases={d} phrase={d} phrase_switches={d} phrase_rejected={d} intervals_uploaded={d} intervals_broadcast={d} silence_markers={d} payload_dumps={d} upload_chunks={d} upload_bytes={d} intervals_downloaded={d} msgs_sent={d} msgs_recv={d} intervals_dropped={d} upload_bytes_dropped={d} upload_stall_ms={d} drift_ms={d} max_drift_ms={d} clock_corrections={d} reconnects={d} outage_ms={d}\n",
+        "RESULT ok={} err=\"{s}\" seed={d} play={s} phrases={d} phrase={d} phrase_switches={d} phrase_rejected={d} intervals_uploaded={d} intervals_broadcast={d} silence_markers={d} payload_dumps={d} upload_chunks={d} upload_bytes={d} intervals_downloaded={d} msgs_sent={d} msgs_recv={d} intervals_dropped={d} intervals_backpressured={d} upload_bytes_dropped={d} upload_stall_ms={d} drift_ms={d} max_drift_ms={d} clock_corrections={d} reconnects={d} outage_ms={d}\n",
         .{
             ok,
             err_text,
@@ -533,6 +533,7 @@ fn cmdJoin(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: [
             // user should ever notice: a non-zero value means the room heard
             // gaps, and the transcript names which bars and why.
             stats.intervals_dropped,
+            stats.intervals_backpressured,
             stats.upload_bytes_dropped,
             @divTrunc(stats.upload_stall_ns, std.time.ns_per_ms),
             @divTrunc(stats.drift_ns, std.time.ns_per_ms),

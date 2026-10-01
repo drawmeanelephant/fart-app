@@ -72,6 +72,23 @@ pub fn build(b: *std.Build) void {
     kujamba_run_step.dependOn(&run_kujamba.step);
 
     // -------------------------------------------------------------------------
+    // repro-backpressure: the complete session on a constrained stream socket
+    // -------------------------------------------------------------------------
+    const backpressure_exe = b.addExecutable(.{
+        .name = "kujamba-backpressure",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/kujamba_backpressure.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    kujambaDeps(b, backpressure_exe.root_module, live, live_option);
+    const run_backpressure = b.addRunArtifact(backpressure_exe);
+    if (b.args) |args| run_backpressure.addArgs(args);
+    const backpressure_step = b.step("repro-backpressure", "Measure a real session on a constrained stream socket");
+    backpressure_step.dependOn(&run_backpressure.step);
+
+    // -------------------------------------------------------------------------
     // test: audit + synth + golden + kujamba
     // -------------------------------------------------------------------------
     const audit_tests = b.addTest(.{

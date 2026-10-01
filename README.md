@@ -247,6 +247,33 @@ zig build
 * `kujamba check-ogg FILE --min-rms R` decodes a raw interval and fails if it
   is silent; `kujamba encode-silence FILE` is the negative-control generator.
 
+### Upload backpressure (#14)
+
+A slow peer costs an interval, not the audio clock. Upload writes never wait:
+the remaining bar is discarded on backpressure, its source/playhead keeps
+advancing, and the next bar gets a fresh guid. A short write retains only the
+mandatory frame tail, so the next upload cannot corrupt the byte stream.
+Control messages queue behind that tail in a fixed-size buffer, rather than
+blocking the same session thread. Partial reads also yield to the clock, and
+idle polling is bounded by the next audio deadline.
+
+`RESULT` reports `intervals_dropped`, `intervals_backpressured` (the subset
+caused by socket pressure, not reconnects), and `upload_bytes_dropped` (unsent
+encoded bytes, summed across channels). Each dropped channel/bar is logged
+as `UPLOAD DROPPED` in the transcript.
+
+```bash
+zig build repro-backpressure -Doptimize=ReleaseSafe
+```
+
+This runs the real handshake and `Session.run()` on an 8 KiB constrained
+stream socket. The peer stops reading for four seconds but keeps sending
+pings, then drains and decodes fresh intervals on the same connection.
+It asserts continued interval generation during the blockage, counted drops,
+frame alignment, and non-silent recovery. It also runs in `zig build test`.
+See [`demo/backpressure.md`](demo/backpressure.md) for before/after measurements
+and the distinction between a dropped interval and an audible-gap claim.
+
 ### Local playback + the sampler (#20, #21)
 
 `kujamba play` renders like `render` and plays it on the local output device
@@ -392,10 +419,12 @@ file is what a listener would have heard:
   markers, Ogg encode/decode, WAV analysis) — and `vendor/` (libogg,
   libvorbis, stb_vorbis). Taken from **drawmeanelephant/ninjam, branch
   `agent/zclient`, commit `f428caf`** (PR #12); see `vendor/README.md`. The
-  only edits to vendored files are the instrument hooks in `session.zig` (a
+  instrument edits to vendored files include the hooks in `session.zig` (a
   `kujamba` source variant, a per-interval broadcast plan, deterministic ids,
-  payload dumps) plus its unit tests picking up the new channel field — every
-  hook is marked with a `kujamba` comment.
+  payload dumps), plus timing, reconnect, and backpressure changes tracked in
+  the vendored-file ledger in `ISSUES.md`. #14 consciously adds a Stats field
+  and nonblocking frame-tail/control-queue handling in `net.zig`; #29 must
+  reconcile these with upstream.
 * NEW: `src/ninjam_out.zig` (phrase→grid mapping, bar patterns, deterministic
   ids) and `src/kujamba_main.zig` (CLI). `src/synth.zig` is untouched.
 * Headless by construction: `miniaudio` is not vendored and the live-audio

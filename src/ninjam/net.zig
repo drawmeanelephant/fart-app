@@ -37,10 +37,15 @@ pub const SendOutcome = enum {
     partial,
 };
 
+/// The session's nonblocking writer owns a short write's tail, so it can finish
+/// that frame later without corrupting TCP framing or holding up the clock.
+pub const WriteOutcome = enum { sent, declined, pending };
+
 pub const Error = error{
     BadFrame,
     EndOfStream,
     ConnectionClosed,
+    WriteQueueFull,
 } || std.posix.ReadError || std.posix.PollError || std.posix.UnexpectedError || std.mem.Allocator.Error;
 
 pub const Conn = struct {
@@ -50,6 +55,13 @@ pub const Conn = struct {
     rbuf: [65536]u8 = undefined,
     rhead: usize = 0,
     rtail: usize = 0,
+
+    // #14: bounded storage, not a backlog of stale audio. Uploads may leave
+    // only ONE in-flight frame here; small control frames queue behind its
+    // mandatory tail. A control flood fails explicitly rather than growing.
+    wbuf: [4 * (max_payload + 5)]u8 = undefined,
+    woff: usize = 0,
+    wlen: usize = 0,
 
     last_recv_ms: i64 = 0,
     last_send_ms: i64 = 0,
@@ -150,9 +162,12 @@ pub const Conn = struct {
         _ = std.posix.errno(std.posix.system.close(fd));
     }
 
-    fn setNonblocking(fd: std.posix.socket_t) void {
+    fn setNonblocking(fd: std.posix.socket_t) !void {
         const flags = std.c.fcntl(fd, std.c.F.GETFL, @as(c_int, 0));
-        _ = std.c.fcntl(fd, std.c.F.SETFL, flags | 0o4000);
+        if (flags < 0) return error.SocketFlags;
+        var o: std.c.O = @bitCast(@as(u32, @intCast(flags)));
+        o.NONBLOCK = true;
+        if (std.c.fcntl(fd, std.c.F.SETFL, @as(c_int, @bitCast(o))) < 0) return error.SocketFlags;
     }
 
     fn sockaddrIn(ip4: std.Io.net.Ip4Address) std.posix.sockaddr.in {
@@ -196,7 +211,10 @@ pub const Conn = struct {
             .ISCONN => {},
             else => return error.ConnectionRefused,
         }
-        setNonblocking(fd);
+        try setNonblocking(fd);
+        if (builtin.os.tag == .macos) {
+            try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.NOSIGPIPE, &std.mem.toBytes(@as(c_int, 1)));
+        }
         return connected(io, fd);
     }
 
@@ -258,14 +276,9 @@ pub const Conn = struct {
             const before = self.rtail - self.rhead;
             try self.fillMore();
             if (self.rtail - self.rhead == before) {
-                // no progress; wait for readability (bounded by poll timeout)
-                if (self.fd < 0) return error.ConnectionClosed;
-                var fds = [_]std.posix.pollfd{.{
-                    .fd = self.fd,
-                    .events = std.posix.POLL.IN,
-                    .revents = 0,
-                }};
-                _ = try std.posix.poll(&fds, 100);
+                // #14: even a partial inbound frame must return control to the
+                // audio clock. Keep its bytes buffered until the next pass.
+                return error.WouldBlock;
             }
         }
     }
@@ -315,6 +328,74 @@ pub const Conn = struct {
         std.mem.writeInt(u32, hdr[1..5], @intCast(payload.len), .little);
         try self.writeAllRaw(&hdr);
         if (payload.len > 0) try self.writeAllRaw(payload);
+    }
+
+    /// #14: no polling, sleeping, or retry-on-EAGAIN on the session's write
+    /// path. A partial frame remains owned here until its tail is flushed.
+    /// Work is bounded by the fixed queue size, even if the peer keeps reading.
+    pub fn flushWrites(self: *Conn) Error!bool {
+        if (self.fd < 0) return error.ConnectionClosed;
+        while (self.woff < self.wlen) {
+            const bytes = self.wbuf[self.woff..self.wlen];
+            const rc = if (builtin.os.tag == .macos)
+                std.posix.system.write(self.fd, bytes.ptr, bytes.len)
+            else
+                std.posix.system.send(self.fd, bytes.ptr, bytes.len, std.posix.MSG.NOSIGNAL);
+            switch (std.posix.errno(rc)) {
+                .SUCCESS => {
+                    if (rc == 0) return error.ConnectionClosed;
+                    self.woff += @intCast(rc);
+                    self.last_send_ms = clock.nowMs(self.io);
+                },
+                .AGAIN, .INTR => return false,
+                else => return error.ConnectionClosed,
+            }
+        }
+        self.woff = 0;
+        self.wlen = 0;
+        return true;
+    }
+
+    fn appendFrame(self: *Conn, mtype: u8, payload: []const u8) Error!void {
+        if (payload.len > max_payload) return error.BadFrame;
+        const need = payload.len + 5;
+        if (self.wlen + need > self.wbuf.len and self.woff > 0) {
+            std.mem.copyForwards(u8, self.wbuf[0 .. self.wlen - self.woff], self.wbuf[self.woff..self.wlen]);
+            self.wlen -= self.woff;
+            self.woff = 0;
+        }
+        if (self.wlen + need > self.wbuf.len) return error.WriteQueueFull;
+        const frame = self.wbuf[self.wlen..][0..need];
+        frame[0] = mtype;
+        std.mem.writeInt(u32, frame[1..5], @intCast(payload.len), .little);
+        @memcpy(frame[5..], payload);
+        self.wlen += need;
+    }
+
+    /// Control frames cannot be dropped, but must not block behind an upload.
+    /// Preserve their order in the bounded queue and flush from the run loop.
+    pub fn queueMessage(self: *Conn, mtype: u8, payload: []const u8) Error!void {
+        _ = try self.flushWrites();
+        try self.appendFrame(mtype, payload);
+        _ = try self.flushWrites();
+    }
+
+    /// Attempt an upload once. No bytes written => decline; some written =>
+    /// retain only this frame's tail and tell the caller to drop the bar.
+    /// Never append another upload behind a stalled frame.
+    pub fn trySendMessage(self: *Conn, mtype: u8, payload: []const u8) Error!WriteOutcome {
+        if (payload.len > max_payload) return error.BadFrame;
+        if (!try self.flushWrites()) return .declined;
+        // This is an optimization, not an atomicity promise: Linux buffer
+        // accounting and Darwin AF_UNIX queue depth can overstate the room.
+        if (self.sendRoom()) |room| {
+            if (room < payload.len + 5) return .declined;
+        }
+        try self.appendFrame(mtype, payload);
+        if (try self.flushWrites()) return .sent;
+        if (self.woff > 0) return .pending;
+        self.wlen = 0;
+        return .declined;
     }
 
     /// Send `data`, giving the socket at most `budget_ms` **in total** to accept
@@ -559,6 +640,8 @@ fn expectRoundTrip(io: std.Io, host: []const u8, server: *std.Io.net.Server) !vo
 /// payload — the whole framing contract in one exchange. `server` must already
 /// have `conn` in its backlog.
 fn assertRoundTrip(conn: *Conn, server: *std.Io.net.Server) !void {
+    const flags: std.c.O = @bitCast(@as(u32, @intCast(std.c.fcntl(conn.fd, std.c.F.GETFL, @as(c_int, 0)))));
+    try std.testing.expect(flags.NONBLOCK);
     try conn.sendMessage(0x41, "hello");
 
     // Accept *after* the client has connected and sent: the connection waits
@@ -649,4 +732,89 @@ test "sockaddrIn6: builds the wire struct for a loopback literal" {
     try std.testing.expectEqual(@as(u8, 1), sa.addr[15]);
     try std.testing.expectEqualSlices(u8, &[_]u8{0} ** 15, sa.addr[0..15]);
     try std.testing.expectEqual(@as(u32, 0), sa.scope_id);
+}
+
+fn nonblockingTestPair() ![2]std.posix.socket_t {
+    var fds: [2]std.posix.socket_t = undefined;
+    if (std.posix.errno(std.posix.system.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds)) != .SUCCESS) return error.SocketPairFailed;
+    errdefer for (fds) |fd| Conn.closeFd(fd);
+    for (fds) |fd| try Conn.setNonblocking(fd);
+    try std.posix.setsockopt(fds[0], std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, &std.mem.toBytes(@as(c_int, 4096)));
+    try std.posix.setsockopt(fds[1], std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, &std.mem.toBytes(@as(c_int, 4096)));
+    return fds;
+}
+
+test "#14: a partial frame retains its tail ahead of control messages, without waiting" {
+    const fds = try nonblockingTestPair();
+    defer for (fds) |fd| Conn.closeFd(fd);
+    var conn = Conn{ .io = std.testing.io, .fd = fds[0] };
+    const payload = [_]u8{0x5a} ** max_payload;
+    const t0 = clock.nowNs(std.testing.io);
+    // Control queuing uses the same writer as uploads and deliberately bypasses
+    // the advisory sendRoom gate. Force a short write to test tail ownership.
+    try conn.queueMessage(0x84, &payload);
+    try std.testing.expect(conn.woff > 0);
+    try std.testing.expect(conn.woff < conn.wlen);
+    try conn.queueMessage(0xc0, "ping");
+    try std.testing.expectEqual(WriteOutcome.declined, try conn.trySendMessage(0x83, "next bar"));
+    try std.testing.expect(clock.nowNs(std.testing.io) - t0 < 500 * std.time.ns_per_ms);
+
+    var expected: [max_payload + 5 + 9]u8 = undefined;
+    expected[0] = 0x84;
+    std.mem.writeInt(u32, expected[1..5], max_payload, .little);
+    @memcpy(expected[5..][0..max_payload], &payload);
+    expected[max_payload + 5] = 0xc0;
+    std.mem.writeInt(u32, expected[max_payload + 6 ..][0..4], 4, .little);
+    @memcpy(expected[max_payload + 10 ..], "ping");
+
+    var received: [expected.len]u8 = undefined;
+    var got: usize = 0;
+    const deadline = clock.nowMs(std.testing.io) + 2000;
+    while (got < received.len and clock.nowMs(std.testing.io) < deadline) {
+        _ = try conn.flushWrites();
+        const n = std.posix.read(fds[1], received[got..]) catch |e| switch (e) {
+            error.WouldBlock => continue,
+            else => return e,
+        };
+        if (n == 0) return error.EndOfStream;
+        got += n;
+    }
+    try std.testing.expectEqual(expected.len, got);
+    try std.testing.expectEqualSlices(u8, &expected, &received);
+    try std.testing.expect(try conn.flushWrites());
+    try std.testing.expectEqual(WriteOutcome.sent, try conn.trySendMessage(0x83, "next bar"));
+}
+
+test "#14: the control queue is bounded even while the peer never drains" {
+    const fds = try nonblockingTestPair();
+    defer for (fds) |fd| Conn.closeFd(fd);
+    var conn = Conn{ .io = std.testing.io, .fd = fds[0] };
+    const payload = [_]u8{0x5a} ** max_payload;
+    var full = false;
+    for (0..8) |_| {
+        conn.queueMessage(0xc0, &payload) catch |e| {
+            try std.testing.expectEqual(error.WriteQueueFull, e);
+            full = true;
+            break;
+        };
+    }
+    try std.testing.expect(full);
+    try std.testing.expect(conn.wlen <= conn.wbuf.len);
+}
+
+test "#14: an incomplete incoming frame yields and resumes from buffered bytes" {
+    const fds = try nonblockingTestPair();
+    defer for (fds) |fd| Conn.closeFd(fd);
+    var conn = Conn{ .io = std.testing.io, .fd = fds[1] };
+    var payload = bufmod.Buf.init(std.testing.allocator);
+    defer payload.deinit();
+    const first = "\xc0\x06\x00\x00\x00abc";
+    try std.testing.expectEqual(@as(isize, first.len), std.posix.system.write(fds[0], first.ptr, first.len));
+    const t0 = clock.nowNs(std.testing.io);
+    try std.testing.expectError(error.WouldBlock, conn.readMessage(&payload));
+    try std.testing.expect(clock.nowNs(std.testing.io) - t0 < 500 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(isize, 3), std.posix.system.write(fds[0], "def", 3));
+    const msg = try conn.readMessage(&payload);
+    try std.testing.expectEqual(@as(u8, 0xc0), msg.mtype);
+    try std.testing.expectEqualStrings("abcdef", msg.payload);
 }
