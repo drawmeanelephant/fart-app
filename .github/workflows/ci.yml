@@ -2,12 +2,20 @@
 #
 # Pins Zig via direct tarball downloads from ziglang.org (checksum-verified) —
 # no third-party setup action. Both jobs run the same steps; the Linux job
-# keeps the check context name `build-test` (the one main's ruleset requires —
-# see the JSON below) and additionally proves the fart app itself runs on
-# Linux (`fart kujamba`, silent mode when the runner has no audio player):
+# keeps the check context name `build-test` and additionally proves the fart
+# app itself runs on Linux (`fart kujamba`, silent mode when the runner has no
+# audio player).
+#
+# Merge gate (#27): main's "Protect main" ruleset requires exactly these two
+# check contexts, and nothing else —
 #   {"type":"required_status_checks","parameters":{"required_checks":[{"context":"build-test"},{"context":"demo-e2e"}],"strict_required_status_checks_policy":false}}
-# (demo-e2e is the live reference-server gate from #27; verify exact
-# context names from real runs before adding them).
+# Context names are the job `name:` fields below, verified against real check
+# runs before the flip. `demo-e2e` needs `build-test-macos`, so the macOS unit
+# suites gate merges transitively without their own required context.
+# `strict=false` on purpose: the gate judges each PR's own head, and forcing
+# branch-up-to-date would only add rebase churn to a one-agent-at-a-time lane.
+# Flipped after the job went 18-for-18 green across every completed run since
+# it landed (skips, where an earlier job failed first, don't count either way).
 #
 # Steps per OS:
 #   zig build                              (Debug)
