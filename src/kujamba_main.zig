@@ -321,6 +321,10 @@ fn applyChatCommand(ctx: *anyopaque, cmd: kujamba_out.ChatCommand) void {
     }
 }
 
+fn receiveChat(ctx: *anyopaque, message: @import("ninjam/proto.zig").ChatParms) void {
+    applyChatCommand(ctx, kujamba_out.commandFromChat(message));
+}
+
 fn cmdJoin(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: []const []const u8) !void {
     var s = JoinSettings{};
 
@@ -466,7 +470,7 @@ fn cmdJoin(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: [
     // kujamba (#11): the plan owns the selection — the pattern (rest bars) plus
     // the mode and phrase the session should bind each bar. A live switch just
     // updates the adapter; the session picks it up at the next bar boundary.
-    var adapter = kujamba_out.PlanAdapter{ .pattern = &s.pattern, .mode = s.play_mode, .bank = &bank };
+    var adapter = kujamba_out.PlanAdapter{ .pattern = &s.pattern, .mode = s.play_mode, .bank = &bank, .fill = &fill };
 
     var opts = session.Options{
         .host = s.host,
@@ -475,11 +479,11 @@ fn cmdJoin(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: [
         .pass = s.pass,
         .srate = synth.SAMPLE_RATE,
         .channel_names = &.{"kujamba"},
-        .source = .{ .kujamba = &fill },
+        .source = fill.source(),
         .id_seed = s.seed,
-        .plan = .{ .ctx = @ptrCast(&adapter), .selectFor = kujamba_out.PlanAdapter.selectForFn },
-        .chat_command = applyChatCommand,
-        .chat_ctx = @ptrCast(&adapter),
+        .plan = .{ .ctx = @ptrCast(&adapter), .selectFor = kujamba_out.PlanAdapter.broadcastForFn },
+        .on_chat = .{ .ctx = @ptrCast(&adapter), .receive = receiveChat },
+        .stop = .{ .requested = kujamba_out.sessionStopRequested },
         .out_dir = s.out_dir,
         .payload_dump_dir = s.dump_dir,
         .stop_after_intervals = s.intervals,

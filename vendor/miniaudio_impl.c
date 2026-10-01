@@ -6,9 +6,8 @@
  * handful of entry points below and hands us one C function pointer for the
  * real-time data path. That keeps the Zig build fast and the shim auditable.
  *
- * fart-app (#20): the same shim also serves kujamba's local playback path
- * (kujamba play / kujamba trigger) via zc_playback_device_open, a
- * playback-only device with the same callback contract.
+ * zc_playback_device_open uses the same callback contract without creating
+ * a capture device or requesting microphone permission.
  */
 #define MA_NO_ENCODING
 #define MA_NO_GENERATION
@@ -17,6 +16,8 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
+#include <errno.h>
 
 /* mono-in / mono-out data path, called from the miniaudio audio thread */
 typedef void (*zc_fill_fn)(void *user, float *out, float *in, unsigned int frames);
@@ -24,7 +25,9 @@ typedef void (*zc_fill_fn)(void *user, float *out, float *in, unsigned int frame
 typedef struct
 {
     ma_device device;
-    ma_device_id id; /* resolved from --device; must outlive ma_device_init */
+    ma_context context;
+    ma_device_id playback_id;
+    ma_device_id capture_id;
     zc_fill_fn fill;
     void *user;
     ma_uint64 frames_seen;
@@ -48,17 +51,31 @@ static void zc_data_cb(ma_device *pDevice, void *pOutput, const void *pInput, ma
  * is a case-insensitive substring match on playback device names. Writes the
  * ma_device_id into *out_id (which must outlive ma_device_init) and returns 0,
  * or a negative ma_result-derived code when nothing matches. */
-static int zc_resolve_device_id(const char *device_id, ma_device_id *out_id)
+static int zc_name_contains(const char *name, const char *needle)
 {
-    ma_context ctx;
-    ma_device_info *infos = NULL;
-    ma_uint32 count = 0;
+    for (; *name != 0; ++name) {
+        const char *a = name;
+        const char *b = needle;
+        while (*a != 0 && *b != 0 &&
+               tolower((unsigned char)*a) == tolower((unsigned char)*b)) {
+            ++a;
+            ++b;
+        }
+        if (*b == 0) return 1;
+    }
+    return 0;
+}
+
+static int zc_resolve_device_id(const ma_device_info *infos, ma_uint32 count,
+                                const char *device_id, ma_device_id *out_id)
+{
     ma_result result;
     int all_digits = 1;
     const char *p;
 
-    if (device_id == NULL || device_id[0] == 0 || out_id == NULL) {
-        return -(int)MA_INVALID_ARGS;
+    if (device_id == NULL || device_id[0] == 0 || out_id == NULL ||
+        (infos == NULL && count != 0)) {
+        return (int)MA_INVALID_ARGS;
     }
     for (p = device_id; *p != 0; ++p) {
         if (*p < '0' || *p > '9') {
@@ -66,41 +83,32 @@ static int zc_resolve_device_id(const char *device_id, ma_device_id *out_id)
             break;
         }
     }
-    result = ma_context_init(NULL, 0, NULL, &ctx);
-    if (result != MA_SUCCESS) {
-        return -(int)result;
-    }
-    result = ma_context_get_devices(&ctx, &infos, &count, NULL, NULL);
-    if (result != MA_SUCCESS) {
-        ma_context_uninit(&ctx);
-        return -(int)result;
-    }
     result = MA_DOES_NOT_EXIST; /* a clean "no such device" for the caller */
     if (all_digits) {
-        unsigned long idx = (unsigned long)strtoul(device_id, NULL, 10);
-        if (idx < count) {
+        unsigned long idx;
+        errno = 0;
+        idx = strtoul(device_id, NULL, 10);
+        if (errno != ERANGE && idx < count) {
             *out_id = infos[idx].id;
             result = MA_SUCCESS;
         }
     } else {
         ma_uint32 i;
         for (i = 0; i < count; ++i) {
-            if (infos[i].name[0] != 0 && strstr(infos[i].name, device_id) != NULL) {
+            if (zc_name_contains(infos[i].name, device_id)) {
                 *out_id = infos[i].id;
                 result = MA_SUCCESS;
                 break;
             }
         }
     }
-    ma_context_uninit(&ctx);
-    /* plain negative ma_result codes: the callers negate when they need to */
     return (result == MA_SUCCESS) ? 0 : (int)result;
 }
 
 /* Open a device at `srate` (duplex for zc_device_open, playback-only for
  * zc_playback_device_open). Returns 0 on success, a negative zc error code
  * otherwise; `out` receives an opaque handle for the calls below.
- * `period_frames` of 0 lets the backend pick. `device_id` (duplex only)
+ * `period_frames` of 0 lets the backend pick. `device_id`
  * selects a specific playback+capture pair via zc_resolve_device_id; NULL or
  * empty means the system default. */
 static int zc_device_open_common(void **out, unsigned int srate, unsigned int period_frames,
@@ -111,17 +119,23 @@ static int zc_device_open_common(void **out, unsigned int srate, unsigned int pe
     ma_device_config config;
     ma_result result;
 
-    if (out == NULL || fill == NULL) {
-        return -1;
+    if (out == NULL) {
+        return (int)MA_INVALID_ARGS;
     }
     *out = NULL;
+    if (fill == NULL) return (int)MA_INVALID_ARGS;
 
     self = (zc_device*)calloc(1, sizeof(zc_device));
     if (self == NULL) {
-        return -2;
+        return (int)MA_OUT_OF_MEMORY;
     }
     self->fill = fill;
     self->user = user;
+    result = ma_context_init(NULL, 0, NULL, &self->context);
+    if (result != MA_SUCCESS) {
+        free(self);
+        return (int)result;
+    }
 
     config = ma_device_config_init(type);
     config.playback.format = ma_format_f32;
@@ -138,28 +152,44 @@ static int zc_device_open_common(void **out, unsigned int srate, unsigned int pe
     config.pUserData = self;
 
     if (device_id != NULL && device_id[0] != 0) {
-        /* the id's storage must outlive ma_device_init, so it lives in the
-         * device struct (the old custom.s trick never worked: it passed the
-         * ma_device_id as ma_device_init's pContext argument) */
-        int rc = zc_resolve_device_id(device_id, &self->id);
+        ma_device_info *playback = NULL, *capture = NULL;
+        ma_uint32 playback_count = 0, capture_count = 0;
+        int rc;
+        /* Resolve both IDs from one enumeration snapshot. */
+        result = ma_context_get_devices(&self->context, &playback, &playback_count,
+                                         &capture, &capture_count);
+        if (result != MA_SUCCESS) {
+            ma_context_uninit(&self->context);
+            free(self);
+            return (int)result;
+        }
+        rc = zc_resolve_device_id(playback, playback_count, device_id, &self->playback_id);
+        if (rc == 0 && type == ma_device_type_duplex) {
+            /* Capture IDs must come from capture enumeration, not playback. */
+            rc = zc_resolve_device_id(capture, capture_count, device_id, &self->capture_id);
+        }
         if (rc != 0) {
+            ma_context_uninit(&self->context);
             free(self);
             return rc; /* already a negative ma_result code */
         }
-        config.playback.pDeviceID = &self->id;
+        config.playback.pDeviceID = &self->playback_id;
         if (type == ma_device_type_duplex) {
-            config.capture.pDeviceID = &self->id;
+            config.capture.pDeviceID = &self->capture_id;
         }
     }
-    result = ma_device_init(NULL, &config, &self->device);
+    result = ma_device_init(&self->context, &config, &self->device);
     if (result != MA_SUCCESS) {
+        ma_context_uninit(&self->context);
         free(self);
-        return -(int)result;
+        return (int)result;
     }
-    if (ma_device_start(&self->device) != MA_SUCCESS) {
+    result = ma_device_start(&self->device);
+    if (result != MA_SUCCESS) {
         ma_device_uninit(&self->device);
+        ma_context_uninit(&self->context);
         free(self);
-        return -3;
+        return (int)result;
     }
     *out = (void*)self;
     return 0;
@@ -190,6 +220,7 @@ void zc_device_close(void *handle)
         return;
     }
     ma_device_uninit(&self->device);
+    ma_context_uninit(&self->context);
     free(self);
 }
 
@@ -229,9 +260,6 @@ ma_uint64 zc_device_frames_seen(void *handle)
 /* human-readable text for a negative zc_device_open code */
 const char* zc_error_string(int code)
 {
-    if (code == -1) return "bad arguments";
-    if (code == -2) return "out of memory";
-    if (code == -3) return "ma_device_start failed";
     if (code < 0) {
         /* ma_result codes ARE negative; pass the code through unchanged */
         return ma_result_description((ma_result)code);
@@ -258,12 +286,12 @@ int zc_probe(const char* backend, unsigned int* out_srate, char* name_buf, unsig
     }
     result = ma_context_init(NULL, 0, NULL, &ctx);
     if (result != MA_SUCCESS) {
-        return -(int)result;
+        return (int)result;
     }
     result = ma_context_get_devices(&ctx, &infos, &count, NULL, NULL);
     if (result != MA_SUCCESS) {
         ma_context_uninit(&ctx);
-        return -(int)result;
+        return (int)result;
     }
     for (ma_uint32 i = 0; i < count; ++i) {
         if (!infos[i].isDefault) {

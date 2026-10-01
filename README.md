@@ -17,7 +17,7 @@ fart-app/
 │   ├── proto_fuzz.zig — Fuzz harness: hostile server bytes through the full dispatch (#26)
 │   ├── ninjam_out.zig — Instrument glue: phrase sequencer + deterministic ids
 │   └── ninjam/        — Vendored zclient subset (protocol + encode, see below)
-├── vendor/          — Vendored C deps (libogg, libvorbis, stb_vorbis)
+├── vendor/          — Vendored C deps (libogg, libvorbis, stb_vorbis, miniaudio)
 ├── demo/            — Live demo vs the reference ninjamsrv + refpeer.cpp + evidence
 ├── examples/        — Documented example configs (examples/kujamba.toml)
 ├── build.zig        — Zig build script (fart + audit + kujamba, all test suites)
@@ -414,21 +414,22 @@ file is what a listener would have heard:
 
 ### Where the code comes from
 
-* VENDORED (do not edit): `src/ninjam/` — zclient's protocol/encode subset
-  (framing, handshake, auth, interval engine, upload chunking, silence
-  markers, Ogg encode/decode, WAV analysis) — and `vendor/` (libogg,
-  libvorbis, stb_vorbis). Taken from **drawmeanelephant/ninjam, branch
-  `agent/zclient`, commit `f428caf`** (PR #12); see `vendor/README.md`. The
-  instrument edits to vendored files include the hooks in `session.zig` (a
-  `kujamba` source variant, a per-interval broadcast plan, deterministic ids,
-  payload dumps), plus timing, reconnect, and backpressure changes tracked in
-  the vendored-file ledger in `ISSUES.md`. #14 consciously adds a Stats field
-  and nonblocking frame-tail/control-queue handling in `net.zig`; #29 must
-  reconcile these with upstream.
-* NEW: `src/ninjam_out.zig` (phrase→grid mapping, bar patterns, deterministic
-  ids) and `src/kujamba_main.zig` (CLI). `src/synth.zig` is untouched.
-* Headless by construction: `miniaudio` is not vendored and the live-audio
-  path is compiled out (`live = false`).
+* VENDORED (upstream changes first): all **15 files** in `src/ninjam/` and
+  the C dependency subset match **drawmeanelephant/ninjam commit
+  `c2a0d95848c590f8e259cbe105fb68b9a128e791`** byte-for-byte.
+  This is the #29 review branch `droid/instrument-interfaces-29`, based on
+  `agent/zclient`, **not a merged upstream pin**. Downstream merging waits
+  for upstream to land, followed by a final merged-commit repin and identity
+  check. See [`vendor/README.md`](vendor/README.md) for reproducible checks.
+* LOCAL: `src/ninjam_out.zig` owns phrase banks, bar patterns and play modes;
+  `src/kujamba_main.zig` owns CLI/chat commands and stop wiring.
+  App integration tests live in `src/kujamba_session_tests.zig`. The shared
+  engine exposes source, interval-selection, raw-chat and stop callbacks,
+  with no application imports. `src/synth.zig` is unchanged.
+* `join` remains headless, with no mic or speaker opened. The vendored
+  miniaudio path is used by local `play`/`trigger`, playback only, behind
+  `-Dlive` (on by default on macOS). `-Dlive=false` builds without production
+  audio-device dependencies; null-backend ABI tests still run without hardware.
 
 ### Reproduce the live demo
 
