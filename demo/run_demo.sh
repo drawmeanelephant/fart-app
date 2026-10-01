@@ -14,62 +14,64 @@
 # Negative control: the rest bar must emit silence markers (no payload), and
 #   a synthesized silent interval must FAIL the energy check.
 #
-# Evidence lands in demo/evidence/<timestamp>/.
-set -uo pipefail
+# Evidence is a fresh per-run directory, never the historical fixtures.
+set -euo pipefail
 
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 RUNTIME=${KUJ_RUNTIME:-/tmp/kujamba-demo}
-NINJAM_REPO=${NINJAM_REPO:-$RUNTIME/ninjam-src}
-SRVBUILD=${KUJ_SRV_BUILD:-$RUNTIME/srv-build}
-COREBUILD=${KUJ_CORE_BUILD:-$RUNTIME/core-build}
 PORT=${DEMO_PORT:-20531}
-EVDIR="$REPO/demo/evidence/$(date +%Y%m%d-%H%M%S)"
-mkdir -p "$RUNTIME" "$EVDIR"
+EVDIR=${KUJ_EVIDENCE_DIR:-"$REPO/demo/evidence/run-$(date +%Y%m%d-%H%M%S)-$$"}
+PROVISION="$REPO/demo/provision_reference.py"
+if [ "${KUJ_EVIDENCE_INITIALIZED:-0}" != 1 ]; then
+  python3 "$PROVISION" init --evidence "$EVDIR"
+fi
+EVDIR=$(cd "$EVDIR" && pwd)
+phase() { python3 "$PROVISION" phase --evidence "$EVDIR" --phase "$1" --status "$2"; }
+CURRENT_PHASE=provisioning
+SRVPID=""; R=""
+# shellcheck disable=SC2329 # Invoked by the EXIT trap.
+cleanup() {
+  local rc=$?
+  trap - EXIT
+  if [ -n "$R" ]; then kill "$R" 2>/dev/null || true; wait "$R" 2>/dev/null || true; fi
+  if [ -n "$SRVPID" ]; then kill "$SRVPID" 2>/dev/null || true; wait "$SRVPID" 2>/dev/null || true; fi
+  if [ "$rc" -ne 0 ]; then phase "$CURRENT_PHASE" failed || true; fi
+  exit "$rc"
+}
+trap cleanup EXIT
 
 fail() { echo "DEMO FAIL: $*"; exit 1; }
 
 echo "== checking port $PORT is free =="
-if lsof -nP -iTCP:$PORT -sTCP:LISTEN >/dev/null 2>&1; then fail "port $PORT already in use"; fi
+if lsof -nP "-iTCP:$PORT" -sTCP:LISTEN >/dev/null 2>&1; then fail "port $PORT already in use"; fi
 
+echo "== pinned reference provisioning =="
+# "$@" safely expands to zero arguments under nounset even in macOS Bash 3.2,
+# unlike an empty array. Keep optional checkout paths as one quoted argument.
+set --
+if [ -n "${NINJAM_REPO:-}" ]; then set -- --source "$NINJAM_REPO"; fi
+python3 "$PROVISION" provision --evidence "$EVDIR" --runtime "$RUNTIME" \
+  --sha "${NINJAM_REF_SHA:-}" "$@"
+REFERENCE_ROOT=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["root"])' "$EVDIR/reference.json")
+SRV="$REFERENCE_ROOT/srv-build/bin/ninjamsrv"
+REFPEER="$REFERENCE_ROOT/refpeer"
+CURRENT_PHASE=application-build
+phase "$CURRENT_PHASE" running
 echo "== building kujamba (zig 0.16, ReleaseSafe) =="
 ( cd "$REPO" && zig build -Doptimize=ReleaseSafe ) || fail "zig build"
 KUJ="$REPO/zig-out/bin/kujamba"
+phase "$CURRENT_PHASE" passed
 
+CURRENT_PHASE=unit-tests
+phase "$CURRENT_PHASE" running
 echo "== unit tests =="
 ( cd "$REPO" && zig build test --summary all ) > "$EVDIR/unit-tests.txt" 2>&1 || { cat "$EVDIR/unit-tests.txt"; fail "zig build test"; }
-
-echo "== reference checkout (unmodified main) =="
-if [ ! -d "$NINJAM_REPO/.git" ]; then
-  git clone --depth 1 https://github.com/drawmeanelephant/ninjam "$NINJAM_REPO" || fail "clone ninjam"
-fi
-echo "ninjam checkout: $(git -C "$NINJAM_REPO" rev-parse HEAD)" | tee "$EVDIR/reference-sha.txt"
-
-echo "== building reference server (out-of-tree, unmodified) =="
-if [ ! -x "$SRVBUILD/bin/ninjamsrv" ]; then
-  cmake -S "$NINJAM_REPO" -B "$SRVBUILD" -DCMAKE_BUILD_TYPE=Release -DNINJAM_BUILD_CLIENT=OFF -DNINJAM_BUILD_TESTS=OFF || fail "cmake server"
-  cmake --build "$SRVBUILD" -j 8 || fail "build server"
-fi
-SRV="$SRVBUILD/bin/ninjamsrv"
+phase "$CURRENT_PHASE" passed
 shasum -a 256 "$SRV" | tee "$EVDIR/ninjamsrv.sha256"
+CURRENT_PHASE=demo
+phase demo running
 
-echo "== building reference client core (for refpeer) =="
-if [ ! -f "$COREBUILD/libninjam_core.a" ]; then
-  cmake -S "$NINJAM_REPO" -B "$COREBUILD" -DCMAKE_BUILD_TYPE=Release -DNINJAM_BUILD_CLIENT=OFF -DNINJAM_BUILD_TESTS=OFF || fail "cmake core"
-  cmake --build "$COREBUILD" -j 8 || fail "build core"
-fi
-if [ ! -x "$RUNTIME/refpeer" ]; then
-  VOR=$COREBUILD/_deps/vorbis-src; OGGS=$COREBUILD/_deps/ogg-src
-  clang++ -std=c++17 -O2 "$REPO/demo/refpeer.cpp" -I"$NINJAM_REPO" \
-    -I"$OGGS/include" -I"$VOR/include" -I"$VOR/lib" \
-    "$COREBUILD/libninjam_core.a" "$COREBUILD/libninjam_net.a" \
-    "$COREBUILD/_deps/vorbis-build/lib/libvorbisenc.a" \
-    "$COREBUILD/_deps/vorbis-build/lib/libvorbis.a" \
-    "$COREBUILD/_deps/ogg-build/libogg.a" \
-    -framework CoreFoundation -framework CoreServices \
-    -o "$RUNTIME/refpeer" || fail "build refpeer"
-fi
-
-cat > "$RUNTIME/demo.cfg" <<CFG
+cat > "$EVDIR/demo.cfg" <<CFG
 Port $PORT
 MaxUsers 10
 MaxChannels 8 2
@@ -83,10 +85,8 @@ DefaultBPI 8
 SetKeepAlive 3
 CFG
 
-"$SRV" "$RUNTIME/demo.cfg" -logfile "$EVDIR/server.log" &
+"$SRV" "$EVDIR/demo.cfg" -logfile "$EVDIR/server.log" &
 SRVPID=$!
-cleanup() { kill $SRVPID 2>/dev/null; wait $SRVPID 2>/dev/null; }
-trap cleanup EXIT
 
 # Wait for the server to actually listen instead of a blind sleep (#27): on a
 # cold CI runner a fixed 0.7s can race process startup, and both clients fail
@@ -95,38 +95,39 @@ echo "== waiting for ninjamsrv to listen on $PORT =="
 server_up=0
 for _ in $(seq 1 50); do
   if ! kill -0 $SRVPID 2>/dev/null; then fail "ninjamsrv exited during startup (see server.log)"; fi
-  if lsof -nP -iTCP:$PORT -sTCP:LISTEN >/dev/null 2>&1; then server_up=1; break; fi
+  if lsof -nP "-iTCP:$PORT" -sTCP:LISTEN >/dev/null 2>&1; then server_up=1; break; fi
   sleep 0.2
 done
 [ "$server_up" -eq 1 ] || fail "ninjamsrv did not listen on $PORT within 10s (see server.log)"
 
-D1="$RUNTIME/payloads-run1"; D2="$RUNTIME/payloads-run2"
-O1="$RUNTIME/out-run1"; O2="$RUNTIME/out-run2"
-rm -rf "$D1" "$D2" "$O1" "$O2"
+D1="$EVDIR/payloads-run1"; D2="$EVDIR/payloads-run2"
+O1="$EVDIR/out-run1"; O2="$EVDIR/out-run2"
 
 echo "== scenario A: kujamba (6 intervals, pattern 3+1) + reference client core =="
-"$RUNTIME/refpeer" --host 127.0.0.1:$PORT --user anonymous:refpeer --pass x \
+"$REFPEER" --host "127.0.0.1:$PORT" --user anonymous:refpeer --pass x \
   --duration 40 --freq 660 --amp 0.3 --report "$EVDIR/refpeer-report.txt" \
   > "$EVDIR/refpeer.log" 2>&1 &
 R=$!
 sleep 1.5
-"$KUJ" join --host 127.0.0.1:$PORT --user kujamba --pass secret \
+K=0
+"$KUJ" join --host "127.0.0.1:$PORT" --user kujamba --pass secret \
   --phrase "kujamba karibu" --seed 42 --pattern "3+1" --intervals 6 \
   --duration 90 --out-dir "$O1" --dump-dir "$D1" \
   --transcript "$EVDIR/kujamba-transcript.txt" \
-  > "$EVDIR/kujamba-summary.txt" 2>&1
-K=$?
-wait $R; RP=$?
+  > "$EVDIR/kujamba-summary.txt" 2>&1 || K=$?
+RP=0
+wait "$R" || RP=$?
+R=""
 [ "$K" -eq 0 ] || fail "kujamba exit $K (see kujamba-summary.txt)"
 [ "$RP" -eq 0 ] || fail "refpeer exit $RP (see refpeer-report.txt)"
 
 echo "== scenario B: determinism — second run, same seed + phrase + BPI =="
-"$KUJ" join --host 127.0.0.1:$PORT --user kujamba --pass secret \
+K2=0
+"$KUJ" join --host "127.0.0.1:$PORT" --user kujamba --pass secret \
   --phrase "kujamba karibu" --seed 42 --pattern "3+1" --intervals 6 \
   --duration 90 --out-dir "$O2" --dump-dir "$D2" \
   --transcript "$EVDIR/kujamba-transcript-run2.txt" \
-  > "$EVDIR/kujamba-summary-run2.txt" 2>&1
-K2=$?
+  > "$EVDIR/kujamba-summary-run2.txt" 2>&1 || K2=$?
 [ "$K2" -eq 0 ] || fail "kujamba run2 exit $K2"
 
 echo "== assertions =="
@@ -184,5 +185,6 @@ done
 grep -E "Incoming connection|login|accepted|disconnected" "$EVDIR/server.log" | head -20 || true
 
 echo
+phase demo passed
 echo "DEMO PASS"
 exit 0

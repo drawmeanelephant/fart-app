@@ -52,6 +52,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Provisioning failure-path tests
+        run: python3 -m unittest discover -s demo -p 'test_*.py' -v
+
       - name: Install Zig (direct tarball from ziglang.org)
         run: |
           set -euo pipefail
@@ -106,6 +109,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Provisioning failure-path tests
+        run: python3 -m unittest discover -s demo -p 'test_*.py' -v
+
       - name: Install Zig (direct tarball from ziglang.org)
         run: |
           set -euo pipefail
@@ -152,17 +158,24 @@ jobs:
     # UNMODIFIED reference ninjamsrv, refpeer (reference client core) receives
     # and decodes, determinism re-run + negative control, per demo/run_demo.sh.
     # Runs after the unit-test job; the reference build (checkout, ninjamsrv,
-    # client core, refpeer) is cached on the reference main SHA + the refpeer
-    # source hash, so steady-state wall time is one demo run, not a C++ build.
+    # client core, refpeer) is cached on the resolved SHA + verified build
+    # inputs. #58 separates restore failure from a miss, and only network
+    # provisioning gets bounded retries. Compile/demo failures stay red.
     # No restore-keys fallback on purpose: a stale reference binary under a
     # new SHA would test the wrong server and still look green.
     runs-on: macos-latest
     timeout-minutes: 30
     env:
       KUJ_RUNTIME: ${{ github.workspace }}/demo-runtime
+      KUJ_EVIDENCE_DIR: ${{ github.workspace }}/demo-runtime/evidence/run-${{ github.run_id }}-${{ github.run_attempt }}
+      KUJ_EVIDENCE_INITIALIZED: "1"
+      SEGMENT_DOWNLOAD_TIMEOUT_MINS: "2"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Initialize current-run evidence
+        run: python3 demo/provision_reference.py init --evidence "$KUJ_EVIDENCE_DIR"
 
       - name: Install Zig (direct tarball from ziglang.org)
         run: |
@@ -180,64 +193,60 @@ jobs:
         id: refkey
         run: |
           set -euo pipefail
-          REF_SHA=$(git ls-remote https://github.com/drawmeanelephant/ninjam refs/heads/main | cut -f1)
-          KEY="ninjam-ref-${REF_SHA}-${{ hashFiles('demo/refpeer.cpp') }}"
-          echo "sha=${REF_SHA}" >> "$GITHUB_OUTPUT"
-          echo "key=${KEY}" >> "$GITHUB_OUTPUT"
-          echo "cache key: ${KEY}"
+          python3 demo/provision_reference.py resolve --evidence "$KUJ_EVIDENCE_DIR"
 
       - name: Restore reference build
         id: refcache
-        uses: actions/cache@v4
+        # A restore error is not a test failure. Record it and take the same
+        # bounded cold path as a miss; provisioning must still succeed.
+        continue-on-error: true
+        timeout-minutes: 3
+        uses: actions/cache/restore@v4
         with:
-          # everything run_demo.sh skips when already present under KUJ_RUNTIME
-          path: |
-            demo-runtime/ninjam-src
-            demo-runtime/srv-build
-            demo-runtime/core-build
-            demo-runtime/refpeer
+          path: demo-runtime/reference-cache
           key: ${{ steps.refkey.outputs.key }}
 
-      - name: Build reference server + client core + refpeer (cache miss only)
-        if: steps.refcache.outputs.cache-hit != 'true'
+      - name: Provision and verify the pinned reference
+        id: provision
+        env:
+          NINJAM_REF_SHA: ${{ steps.refkey.outputs.sha }}
+          CACHE_RESTORE_OUTCOME: ${{ steps.refcache.outcome }}
+          CACHE_HIT: ${{ steps.refcache.outputs.cache-hit }}
         run: |
           set -euo pipefail
-          RT="${KUJ_RUNTIME}"
-          mkdir -p "$RT"
-          if [ ! -d "$RT/ninjam-src/.git" ]; then
-            git clone --depth 1 https://github.com/drawmeanelephant/ninjam "$RT/ninjam-src"
-          fi
-          echo "reference sha: $(git -C "$RT/ninjam-src" rev-parse HEAD) (expected ${{ steps.refkey.outputs.sha }})"
-          if [ ! -x "$RT/srv-build/bin/ninjamsrv" ]; then
-            cmake -S "$RT/ninjam-src" -B "$RT/srv-build" -DCMAKE_BUILD_TYPE=Release -DNINJAM_BUILD_CLIENT=OFF -DNINJAM_BUILD_TESTS=OFF
-            cmake --build "$RT/srv-build" -j 4
-          fi
-          if [ ! -f "$RT/core-build/libninjam_core.a" ]; then
-            cmake -S "$RT/ninjam-src" -B "$RT/core-build" -DCMAKE_BUILD_TYPE=Release -DNINJAM_BUILD_CLIENT=OFF -DNINJAM_BUILD_TESTS=OFF
-            cmake --build "$RT/core-build" -j 4
-          fi
-          if [ ! -x "$RT/refpeer" ]; then
-            VOR="$RT/core-build/_deps/vorbis-src"; OGGS="$RT/core-build/_deps/ogg-src"
-            clang++ -std=c++17 -O2 demo/refpeer.cpp -I"$RT/ninjam-src" \
-              -I"$OGGS/include" -I"$VOR/include" -I"$VOR/lib" \
-              "$RT/core-build/libninjam_core.a" "$RT/core-build/libninjam_net.a" \
-              "$RT/core-build/_deps/vorbis-build/lib/libvorbisenc.a" \
-              "$RT/core-build/_deps/vorbis-build/lib/libvorbis.a" \
-              "$RT/core-build/_deps/ogg-build/libogg.a" \
-              -framework CoreFoundation -framework CoreServices \
-              -o "$RT/refpeer"
-          fi
-          echo "reference build ready:"
-          ls -l "$RT/srv-build/bin/ninjamsrv" "$RT/refpeer"
+          python3 demo/provision_reference.py provision --evidence "$KUJ_EVIDENCE_DIR" \
+            --runtime "$KUJ_RUNTIME" --sha "$NINJAM_REF_SHA" \
+            --cache-directory "$KUJ_RUNTIME/reference-cache" \
+            --cache-outcome "$CACHE_RESTORE_OUTCOME" --cache-hit "$CACHE_HIT"
+
+      - name: Save only verified reference builds
+        if: steps.provision.outputs.cache-ready == 'true' && steps.refcache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        timeout-minutes: 3
+        uses: actions/cache/save@v4
+        with:
+          # Must exactly match restore's path (cache versions include paths).
+          path: demo-runtime/reference-cache
+          key: ${{ steps.refkey.outputs.key }}
 
       - name: Run the live demo (gates merges, #27)
+        env:
+          NINJAM_REF_SHA: ${{ steps.refkey.outputs.sha }}
         run: bash demo/run_demo.sh
+
+      - name: Finalize current-run failure receipt
+        if: always() && (failure() || cancelled())
+        run: |
+          if [ -f "$KUJ_EVIDENCE_DIR/receipt.json" ]; then
+            python3 demo/provision_reference.py phase --evidence "$KUJ_EVIDENCE_DIR" \
+              --phase ci --status failed
+          fi
 
       - name: Upload demo evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: demo-evidence-${{ github.run_id }}
-          path: demo/evidence/
+          name: demo-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.KUJ_EVIDENCE_DIR }}/
           if-no-files-found: warn
           retention-days: 14

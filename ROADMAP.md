@@ -199,8 +199,9 @@ real instrument is **control while it runs**.
       measuring it. The `RESULT` line reports `reconnects=` and the total
       `outage_ms=` either way.
 - [ ] **Cross-platform builds.** (#25) `kujamba` is mostly portable (posix sockets);
-      verify on Linux and Windows (Winsock) and drop the macOS-only assumption
-      that lives in `src/main.zig`, not the instrument.
+      macOS/Linux builds and smoke checks are verified. Windows (Winsock,
+      console handler, audio/speech) remains a deferred follow-up and does not
+      block the current macOS/Linux completion lane (#58, then #29).
 - [ ] **Fuzz the protocol parsers.** (#26) `proto.zig`/`buf.zig` are length-checked
       but feed a network — add a fuzz target over `parseIntervalBegin/Write`,
       `parseUserinfoRecords`, `parseChat`.
