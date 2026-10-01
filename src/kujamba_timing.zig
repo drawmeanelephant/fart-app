@@ -1380,17 +1380,25 @@ fn drainSilently(cfd: std.posix.socket_t, view: *ReconnectView, conn_idx: usize,
     var buf: [8192]u8 = undefined;
     var len: usize = 0;
     var waited: u32 = 0;
-    var since_ping: u32 = 0;
+    // The ping cadence is WALL time, deliberately. A first cut counted
+    // WouldBlock iterations, and a victim uploading continuously never yields
+    // one — so the "healthy" connection never pinged, the client's stall
+    // detector fired on it too, and the test failed exactly the way a machine
+    // slower than the author's does. Deadlines that matter are wall-clock.
+    const io = harnessIo();
+    const started_ms: i64 = clock.nowMs(io);
+    var last_ping_ms: i64 = started_ms;
     while (waited < deadline_ms) {
-        if (ka_s != 0 and since_ping >= @as(u32, ka_s) * 1000) {
+        const now_ms = clock.nowMs(io);
+        if (now_ms - started_ms > deadline_ms) return;
+        if (ka_s != 0 and now_ms - last_ping_ms >= @as(i64, ka_s) * 1000) {
             if (!sendFrame(cfd, proto.MSG_KEEPALIVE, "")) return;
-            since_ping = 0;
+            last_ping_ms = now_ms;
         }
         const n = std.posix.read(cfd, buf[len..]) catch |e| switch (e) {
             error.WouldBlock => {
                 _ = sleepMs(1);
                 waited += 1;
-                since_ping += 1;
                 continue;
             },
             else => return,
@@ -1444,10 +1452,14 @@ fn reconnectServer(listener: *Listener, script: ReconnectScript, view: *Reconnec
         }
 
         switch (step) {
+            // An early false from readUploadBegins means the CLIENT hung up
+            // first (EOF) — on a slow runner the stall can fire before the
+            // first upload-begin crosses. That is not the end of the script:
+            // the client is about to dial the next connection, so move on.
             .close_after_uploads => |want| {
                 if (!readUploadBegins(cfd, view, conn_idx, want, script.lifetime_ms)) {
                     _ = std.posix.errno(std.posix.system.close(cfd));
-                    return;
+                    continue;
                 }
                 // clean FIN, deliberately: the client must read EndOfStream,
                 // the exact symptom the #28 incident logged
@@ -1457,7 +1469,7 @@ fn reconnectServer(listener: *Listener, script: ReconnectScript, view: *Reconnec
             .silent_ms => |ms| {
                 if (!readUploadBegins(cfd, view, conn_idx, 1, script.lifetime_ms)) {
                     _ = std.posix.errno(std.posix.system.close(cfd));
-                    return;
+                    continue;
                 }
                 // ka_s = 0: this connection is the deliberate silence
                 drainSilently(cfd, view, conn_idx, ms, 0);
@@ -1548,30 +1560,50 @@ test "reconnect: a killed connection is rejoined and the --intervals cap counts 
     opts.stop_after_intervals = 4;
     const run = try runReconnect(.{ .conns = &.{ .{ .close_after_uploads = 2 }, .drain } }, opts);
 
-    // the cap was reached, not restarted by the reconnect: bars 0..3 uploaded
-    // in total, one of them on the second connection
+    // The cap was reached, not restarted by the reconnect. Where exactly the
+    // kill lands inside the bar grid is the machine's business (a slow runner
+    // lags generation), so the assertions count only what the reconnect
+    // itself determines.
     try std.testing.expect(run.stats.ok);
     try std.testing.expectEqual(@as(u64, 4), run.stats.intervals_uploaded);
     try std.testing.expectEqual(@as(u64, 1), run.stats.reconnects);
     try std.testing.expect(run.stats.outage_ms >= 10);
     // the bar that was mid-flight when the server hung up is one lost bar,
-    // with its bytes accounted — not a silent gap in the ledger
-    try std.testing.expectEqual(@as(u64, 1), run.stats.intervals_dropped);
-    // two upload-begins crossed the killed connection, three crossed the
-    // resumed one: the abandoned bar's seq was re-sent, NOT replaced. A fresh
-    // guid there would give one bar two identities and hand the room the start
-    // of a phrase it can never hear finish.
-    try std.testing.expectEqual(@as(u32, 2), run.view.uploads_per_conn[0]);
-    try std.testing.expectEqual(@as(u32, 3), run.view.uploads_per_conn[1]);
-    var g: [16]u8 = undefined;
-    for (0..2) |i| {
-        kujamba_out.deriveGuid(42, i, 0, &g);
-        try std.testing.expectEqualSlices(u8, &g, &run.view.guids[0][i]);
+    // with its bytes accounted — not a silent gap in the ledger. Zero is also
+    // legal (the kill can land on a boundary); more than one is not: the
+    // server hung up exactly once.
+    try std.testing.expect(run.stats.intervals_dropped <= 1);
+    // Every upload-begin on either connection carries a guid derived from
+    // (seed, seq 0..3) — nothing outside the cap's range, i.e. no re-issued
+    // or reinvented identity. A fresh guid for the abandoned bar would give
+    // one bar two identities and hand the room the start of a phrase it can
+    // never hear finish.
+    var expected: [4][16]u8 = undefined;
+    for (0..4) |i| kujamba_out.deriveGuid(42, i, 0, &expected[i]);
+    var seen_on_conn: [4][2]bool = [_][2]bool{ .{ false, false }, .{ false, false }, .{ false, false }, .{ false, false } };
+    for (0..2) |conn| {
+        var last_seq: i64 = -1;
+        for (0..run.view.guid_counts[conn]) |gi| {
+            var matched: ?usize = null;
+            for (0..4) |i| {
+                if (std.mem.eql(u8, &expected[i], &run.view.guids[conn][gi])) matched = i;
+            }
+            try std.testing.expect(matched != null);
+            // per connection, the sequence ascends: one connection sees the
+            // bars in order, never backwards
+            try std.testing.expect(@as(i64, @intCast(matched.?)) > last_seq);
+            last_seq = @intCast(matched.?);
+            seen_on_conn[matched.?][conn] = true;
+        }
     }
-    for (1..4) |i| {
-        kujamba_out.deriveGuid(42, i, 0, &g);
-        try std.testing.expectEqualSlices(u8, &g, &run.view.guids[1][i - 1]);
+    // and the abandoned bar was RE-SENT: its guid crossed both the killed
+    // connection and the resumed one. A resume that skips or replaces it
+    // leaves one conn never seeing that guid.
+    var resent = false;
+    for (0..4) |i| {
+        if (seen_on_conn[i][0] and seen_on_conn[i][1]) resent = true;
     }
+    try std.testing.expect(resent);
 }
 
 test "reconnect: the resumed session re-sends byte-identical bar payloads where the rhythm is unchanged (#24)" {
@@ -1675,11 +1707,12 @@ test "reconnect: the stall detector rejoins a server that went silent (#24)" {
         opts,
     );
 
+    // The cap is what matters: however many bars the slow side managed before
+    // the 3 s threshold, the rejoined session finishes the job. Counting bars
+    // inside the stall window would measure the runner, not the code (see
+    // ISSUES.md: a test that asserts a wall-clock count measures the machine).
     try std.testing.expect(run.stats.ok);
-    // three bars crossed the silent connection before the stall fired, the
-    // fourth was mid-flight, and the resumed connection carried bars 3..6
     try std.testing.expectEqual(@as(u64, 7), run.stats.intervals_uploaded);
-    try std.testing.expectEqual(@as(u64, 1), run.stats.intervals_dropped);
     try std.testing.expectEqual(@as(u64, 1), run.stats.reconnects);
     // the outage is the dial, not the silence: the client closes the silent
     // connection when the stall fires, and the server's drain returns on the
@@ -1698,6 +1731,8 @@ test "reconnect: the stall detector rejoins a server that went silent (#24)" {
         }
         break :blk n;
     });
+    // the resumed connection was healthy: no further stalls after the rejoin
+    try std.testing.expect(std.mem.indexOf(u8, stall_text, "read failed") == null);
     try std.testing.expectEqual(@as(u32, 4), run.view.uploads_per_conn[0]);
     try std.testing.expectEqual(@as(u32, 4), run.view.uploads_per_conn[1]);
     var g: [16]u8 = undefined;
