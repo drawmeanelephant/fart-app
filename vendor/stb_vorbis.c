@@ -3759,6 +3759,17 @@ static int start_decoder(vorb *f)
 
       if (c->dimensions == 0 && c->entries != 0)    return error(f, VORBIS_invalid_setup);
 
+      // fart local delta (#66): entries*dimensions sizes the codebook's
+      // multiplicands array through an int (sizeof(float) * entries *
+      // dimensions). A spec-legal header can claim a product whose byte size
+      // wraps to a small positive int — the ordered-run length encoding puts
+      // this within reach of a ~2 KB stream — handing the type-1
+      // pre-expansion loop a tiny array while it writes entries*dimensions
+      // floats. Bound the product so the allocation cannot wrap; no real
+      // codebook is anywhere near this (that would be a >2 GB array).
+      if ((long long) c->entries * (long long) c->dimensions > (INT_MAX >> 2))
+         return error(f, VORBIS_invalid_setup);
+
       if (c->sparse)
          lengths = (uint8 *) setup_temp_malloc(f, c->entries);
       else
