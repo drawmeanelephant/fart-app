@@ -94,6 +94,17 @@ const fuzz_out_dir = "zig-cache/fuzz-out";
 /// session made of it. The fuzz target discards the stats; the regression test
 /// below asserts on them, which is the point of returning them.
 fn runDispatchStep(stream: []const u8) !session.Stats {
+    return runSessionAgainstStream(stream, fuzzOptions, fakeServer);
+}
+
+/// Same harness with a caller-supplied options builder (it receives the
+/// listener's port) and server thread. The #64 probes use a longer session cap
+/// and a server that holds the connection open instead of half-closing.
+fn runSessionAgainstStream(
+    stream: []const u8,
+    comptime opts_builder: fn (u16) session.Options,
+    comptime server_fn: fn (*Listener, []const u8) void,
+) !session.Stats {
     const alloc = std.testing.allocator;
     const io = harnessIo();
 
@@ -101,11 +112,11 @@ fn runDispatchStep(stream: []const u8) !session.Stats {
     var listener = Listener.init(try std.Io.net.IpAddress.listen(&addr, io, .{}), io);
     defer listener.close();
 
-    const srv = try std.Thread.spawn(.{}, fakeServer, .{ &listener, stream });
+    const srv = try std.Thread.spawn(.{}, server_fn, .{ &listener, stream });
     // Every exit from here joins the thread. Ordering matters: the session's
     // socket must close before the join, so the server's read sees EOF (or the
     // stop flag fires) and the thread can exit.
-    var s = session.Session.init(alloc, io, fuzzOptions(listener.port())) catch |e| {
+    var s = session.Session.init(alloc, io, opts_builder(listener.port())) catch |e| {
         listener.close(); // sets the stop flag; the accept loop gives up
         srv.join();
         return e;
@@ -201,11 +212,26 @@ const Listener = struct {
 /// not accept through the io vtable. Everything here is poll-gated instead, so
 /// the stop flag and the deadline can always interrupt it.
 const accept_deadline_waits: u32 = 2000; // ~2 s of 1 ms polls; a live session connects in well under a millisecond
+/// Same idea for a full socket while writing: how long to wait for the peer to
+/// drain before giving up on the write. Generous next to the 2 s probe caps.
+const write_retry_polls: u32 = 4000;
 /// Same idea for the post-write drain: how long to wait for a client that has
 /// gone quiet before giving up on it. Generous next to the 60 ms session cap.
 const read_idle_deadline_polls: u32 = 4000;
 
 fn fakeServer(listener: *Listener, stream: []const u8) void {
+    fakeServerInner(listener, stream, true);
+}
+
+/// Same, but the connection is held open (no half-close) after the stream is
+/// written: the session ends by its own duration cap instead of reading EOF,
+/// which is what makes a clean `failText()` assertion meaningful for the #64
+/// download probes below.
+fn fakeServerHold(listener: *Listener, stream: []const u8) void {
+    fakeServerInner(listener, stream, false);
+}
+
+fn fakeServerInner(listener: *Listener, stream: []const u8, half_close: bool) void {
     const lfd = listener.server.socket.handle;
 
     const cfd: std.posix.socket_t = cfd: {
@@ -259,14 +285,29 @@ fn fakeServer(listener: *Listener, stream: []const u8) void {
     }
 
     var off: usize = 0;
+    var full_socket_polls: u32 = 0;
     while (off < stream.len) {
         const n = rawSend(cfd, stream[off..]) orelse return;
-        if (n == 0) return;
+        if (n == 0) {
+            // Socket full. The #64 probes push ~1 MB into a socket whose peer
+            // drains at its own pace, so giving up here would close (RST) the
+            // connection mid-probe and fail the session under test; wait for
+            // writability instead. A peer that has gone away shows up as
+            // POLLERR/POLLHUP and rawSend's next call returns null.
+            full_socket_polls += 1;
+            if (full_socket_polls > write_retry_polls) return;
+            var fds = [_]std.posix.pollfd{.{ .fd = cfd, .events = std.posix.POLL.OUT, .revents = 0 }};
+            _ = std.posix.poll(&fds, 1) catch return;
+            continue;
+        }
+        full_socket_polls = 0;
         off += n;
     }
     // half-close: the session drains what we wrote, then reads EOF and fails
-    // the session; we keep reading so its outbound bytes never block it
-    _ = std.posix.errno(std.posix.system.shutdown(cfd, std.posix.SHUT.WR));
+    // the session; we keep reading so its outbound bytes never block it.
+    // The #64 probes skip this — they need the session to survive to its own
+    // deadline, not die of EOF mid-probe.
+    if (half_close) _ = std.posix.errno(std.posix.system.shutdown(cfd, std.posix.SHUT.WR));
 
     var scratch: [4096]u8 = undefined;
     var idle_polls: u32 = 0;
@@ -666,6 +707,108 @@ test "a live-path stream really goes live: the handshake is not a silent no-op" 
     try std.testing.expectEqual(@as(u64, 230400), sess.interval_len_samples);
     try std.testing.expectEqual(@as(u16, 100), sess.bpm);
     try std.testing.expectEqual(@as(u16, 8), sess.bpi);
+}
+
+// ---- #64: the download buffer is bounded --------------------------------------
+
+// The 0x04 carries estsize — the server declaring how big the transfer will be
+// — and the vendored session buffered 0x05 writes without ever consulting it
+// or anything else. A hostile server could grow client memory without limit
+// (measured: 8.3 MiB buffered against a declared 4096), and a transfer that
+// never set flags & 1 held its slot and its bytes until the session died.
+// These probes drive a real session against a server that does exactly that.
+
+const download_guid: [16]u8 = [_]u8{0xB1} ++ [_]u8{0} ** 15;
+
+/// One framed message of any size, appended to the stream under construction.
+fn appendRawFrame(alloc: std.mem.Allocator, out: *std.ArrayList(u8), mtype: u8, payload: []const u8) !void {
+    var hdr: [5]u8 = undefined;
+    hdr[0] = mtype;
+    std.mem.writeInt(u32, hdr[1..5], @intCast(payload.len), .little);
+    try out.appendSlice(alloc, &hdr);
+    try out.appendSlice(alloc, payload);
+}
+
+/// One 0x05 payload: guid | flags | data. Built inline — the corpus's
+/// intervalWritePayload helper is a 256-byte fixed array and these frames are
+/// wire-max.
+fn appendDownloadWrite(alloc: std.mem.Allocator, out: *std.ArrayList(u8), guid: [16]u8, flags: u8, data: []const u8) !void {
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(alloc);
+    try payload.appendSlice(alloc, &guid);
+    try payload.append(alloc, flags);
+    try payload.appendSlice(alloc, data);
+    try appendRawFrame(alloc, out, proto.MSG_DOWNLOAD_INTERVAL_WRITE, payload.items);
+}
+
+/// A live handshake, then a 0x04 declaring `estsize`, then download writes:
+/// `fit_frames` 2000-byte frames that respect the declaration, then
+/// `over_frames` wire-max (16367-byte) frames that blow past it. Held open
+/// (no half-close) so the session ends by its own deadline instead of
+/// reading EOF mid-probe — that is what makes the clean-failText assertion
+/// below meaningful.
+fn downloadFloodStream(alloc: std.mem.Allocator, estsize: u32, fit_frames: usize, over_frames: usize) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+
+    var head = StreamBuf{};
+    head.msg(proto.MSG_AUTH_CHALLENGE, &challengePayload(0x00000300, proto.PROTO_VER_CUR)) catch unreachable;
+    head.msg(proto.MSG_AUTH_REPLY, &authReplyPayload(true, "fuzzer", 8)) catch unreachable;
+    head.msg(proto.MSG_CONFIG_CHANGE_NOTIFY, &configPayload(100, 8)) catch unreachable;
+    try out.appendSlice(alloc, head.stream());
+
+    var begin = intervalBeginPayload(download_guid, proto.FOURCC_OGGV, 0, "evil");
+    std.mem.writeInt(u32, begin[16..20], estsize, .little);
+    try appendRawFrame(alloc, &out, proto.MSG_DOWNLOAD_INTERVAL_BEGIN, &begin);
+
+    const data = try alloc.alloc(u8, 16367);
+    defer alloc.free(data);
+    @memset(data, 0x42);
+    for (0..fit_frames) |_| try appendDownloadWrite(alloc, &out, download_guid, 0, data[0..2000]);
+    for (0..over_frames) |_| try appendDownloadWrite(alloc, &out, download_guid, 0, data);
+    return out.toOwnedSlice(alloc);
+}
+
+fn downloadProbeOptions(port: u16) session.Options {
+    var o = fuzzOptions(port);
+    // long enough that the session is live and draining; short enough that
+    // the tests stay quick
+    o.duration_ms = 2000;
+    // the expiry probe needs the sweep to fire inside the session
+    o.download_timeout_ms = 400;
+    return o;
+}
+
+test "a download that exceeds its declared estsize is bounded, not buffered" {
+    const alloc = std.testing.allocator;
+    // 4096 declared: the two 2000-byte frames fit; nothing after that does
+    const stream = try downloadFloodStream(alloc, 4096, 2, 64);
+    defer alloc.free(stream);
+    const stats = try runSessionAgainstStream(stream, downloadProbeOptions, fakeServerHold);
+
+    // the frames that respected the declaration were buffered, the first
+    // over-limit frame aborted the transfer, and the remaining frames hit an
+    // unknown guid and were ignored — pre-fix this number was ~1 MB (the
+    // whole flood) against a declared 4096
+    try std.testing.expectEqual(@as(u64, 4000), stats.download_bytes);
+    // the auditor's bound from the issue: declared size plus at most one wire
+    // frame of slack
+    try std.testing.expect(stats.download_bytes <= 4096 + 16367);
+    // and the session lived through the abuse and finished its other work
+    try std.testing.expectEqualStrings("", stats.failText());
+}
+
+test "a transfer that never finishes loses its slot instead of holding it forever" {
+    const alloc = std.testing.allocator;
+    // no declared size, one small write, no final write — the shape that used
+    // to sit in the table until the session ended. The expiry sweep (400 ms
+    // here, inside a 2 s session) must release it.
+    const stream = try downloadFloodStream(alloc, 0, 1, 0);
+    defer alloc.free(stream);
+    const stats = try runSessionAgainstStream(stream, downloadProbeOptions, fakeServerHold);
+    try std.testing.expectEqual(@as(u64, 1), stats.downloads_aborted);
+    try std.testing.expectEqual(@as(u64, 2000), stats.download_bytes);
+    try std.testing.expectEqualStrings("", stats.failText());
 }
 
 // ---- corpus sanity ---------------------------------------------------------------
