@@ -57,8 +57,15 @@ interval downloads are decoded with it.
    the entries that were actually initialized.
 4. `vorbis_deinit` no longer dereferences `comment_list` when the slot-array
    allocation failed (the count is already set by then).
+5. (#66) The codebook header's `entries * dimensions` product is bounded by
+   `INT_MAX/sizeof(float)` before anything is allocated with it. The type-1
+   pre-expansion sizes its multiplicands array through an `int`, and a
+   spec-legal header can claim a product whose byte size wraps to a small
+   positive value — reachable from a ~2 KB stream via the ordered-run length
+   encoding — after which the expansion loop marches 4 GB of writes past the
+   array.
 
-Upstream stb v1.22 (and the zclient pin) has all four bugs. The upstream move
+Upstream stb v1.22 (and the zclient pin) has all five bugs. The upstream move
 is to land the same guards in `drawmeanelephant/ninjam`'s `zclient/vendor` and
 re-pin here; the deltas are marked for exactly that reconciliation.
 

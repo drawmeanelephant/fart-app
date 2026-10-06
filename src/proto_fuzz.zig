@@ -59,6 +59,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const session = @import("ninjam/session.zig");
 const proto = @import("ninjam/proto.zig");
+const vorbis = @import("ninjam/vorbis.zig");
 
 // ---- fuzz target ------------------------------------------------------------
 
@@ -809,6 +810,139 @@ test "a transfer that never finishes loses its slot instead of holding it foreve
     try std.testing.expectEqual(@as(u64, 1), stats.downloads_aborted);
     try std.testing.expectEqual(@as(u64, 2000), stats.download_bytes);
     try std.testing.expectEqualStrings("", stats.failText());
+}
+
+// ---- #66: hostile codebooks are bounded ---------------------------------------
+
+// The codebook multiplicands array is sized `sizeof(float) * entries *
+// dimensions` through an int. A spec-legal codebook header can claim a product
+// that wraps to a small positive int — the #63 allocator guards only refuse
+// non-positive sizes — and the type-1 pre-expansion loop then writes
+// entries*dimensions floats into the tiny array. The ordered-lengths run
+// encoding means a ~2 KB stream can claim 3M entries x 358 dimensions: the
+// wrapped allocation is ~1 MB (inside the #63 decode-buffer cap), the true
+// expansion is 4.3 GB of writes. These helpers build that stream by hand.
+
+const BitWriter = struct {
+    bytes: std.ArrayList(u8) = .empty,
+    acc: u32 = 0,
+    nbits: u6 = 0,
+
+    // Vorbis bitpacking is LSB-first within bytes (matching stb_vorbis's
+    // get_bits accumulator)
+    fn bits(self: *BitWriter, alloc: std.mem.Allocator, value: u32, n: u6) !void {
+        var i: u6 = 0;
+        while (i < n) : (i += 1) {
+            self.acc |= ((value >> @as(u5, @intCast(i))) & 1) << @as(u5, @intCast(self.nbits));
+            self.nbits += 1;
+            if (self.nbits == 8) {
+                try self.bytes.append(alloc, @intCast(self.acc & 0xFF));
+                self.acc = 0;
+                self.nbits = 0;
+            }
+        }
+    }
+
+    fn flush(self: *BitWriter, alloc: std.mem.Allocator) !void {
+        if (self.nbits > 0) try self.bytes.append(alloc, @intCast(self.acc & 0xFF));
+        self.acc = 0;
+        self.nbits = 0;
+    }
+};
+
+/// One single-packet Ogg page (all packets here are <= 255 bytes). The CRC is
+/// left zero — stb_vorbis never checks it.
+fn appendOggPage(alloc: std.mem.Allocator, out: *std.ArrayList(u8), packet: []const u8, header_type: u8, serial: u32, seq: u32) !void {
+    var hdr: [27]u8 = undefined;
+    @memcpy(hdr[0..4], "OggS");
+    hdr[4] = 0;
+    hdr[5] = header_type;
+    @memset(hdr[6..14], 0);
+    std.mem.writeInt(u32, hdr[14..18], serial, .little);
+    std.mem.writeInt(u32, hdr[18..22], seq, .little);
+    @memset(hdr[22..26], 0);
+    hdr[26] = 1; // one segment; every packet here fits one lacing value
+    try out.appendSlice(alloc, &hdr);
+    try out.append(alloc, @intCast(packet.len));
+    try out.appendSlice(alloc, packet);
+}
+
+/// A minimal-but-valid Ogg/Vorbis stream whose setup header declares exactly
+/// one codebook: ordered, `entries` entries of one length, lookup type 1 with
+/// `dimensions`-wide vectors — sized so sizeof(float)*entries*dimensions wraps
+/// to a small positive int.
+fn hostileCodebookStream(alloc: std.mem.Allocator, entries: u32, dimensions: u32) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+
+    // identification header (30 bytes, what stb validates)
+    var ident: [30]u8 = undefined;
+    ident[0] = 1;
+    @memcpy(ident[1..7], "vorbis");
+    std.mem.writeInt(u32, ident[7..11], 0, .little); // version
+    ident[11] = 1; // channels
+    std.mem.writeInt(u32, ident[12..16], 44100, .little); // sample rate
+    std.mem.writeInt(u32, ident[16..20], 64000, .little); // bitrate nominal
+    std.mem.writeInt(u32, ident[20..24], 0, .little); // bitrate min
+    std.mem.writeInt(u32, ident[24..28], 0, .little); // bitrate max
+    ident[28] = 0x66; // blocksize 64/64
+    ident[29] = 0x01; // framing
+    try appendOggPage(alloc, &out, &ident, 0x02, 0x1234, 0);
+
+    // comment header: no vendor, no comments
+    var comment: [16]u8 = undefined;
+    comment[0] = 3;
+    @memcpy(comment[1..7], "vorbis");
+    std.mem.writeInt(u32, comment[7..11], 0, .little);
+    std.mem.writeInt(u32, comment[11..15], 0, .little);
+    comment[15] = 0x01;
+    try appendOggPage(alloc, &out, &comment, 0x00, 0x1234, 1);
+
+    // setup header: one hostile codebook
+    var bw = BitWriter{};
+    defer bw.bytes.deinit(alloc);
+    for ("\x05vorbis") |ch| try bw.bits(alloc, ch, 8);
+    try bw.bits(alloc, 0, 8); // codebook_count-1 = 0
+
+    try bw.bits(alloc, 0x42, 8); // sync
+    try bw.bits(alloc, 0x43, 8);
+    try bw.bits(alloc, 0x56, 8);
+    try bw.bits(alloc, dimensions, 16);
+    try bw.bits(alloc, entries, 24);
+    try bw.bits(alloc, 1, 1); // ordered
+    try bw.bits(alloc, 21, 5); // first run length = 22: Kraft-valid for 1.2M entries
+    // one run claiming every entry; ilog(entries) is 22 for the values below
+    var ilog_bits: u6 = 0;
+    var lim = entries;
+    while (lim > 0) : (lim >>= 1) ilog_bits += 1;
+    try bw.bits(alloc, entries, ilog_bits);
+    try bw.bits(alloc, 1, 4); // lookup_type = 1
+    try bw.bits(alloc, 0, 32); // minimum value
+    try bw.bits(alloc, 0, 32); // delta value
+    try bw.bits(alloc, 7, 4); // value_bits - 1 = 7 -> 8 bits per value
+    try bw.bits(alloc, 0, 1); // sequence_p
+    // lookup1_values lands on 1 or 2 depending on platform float saturation;
+    // two value bytes cover either, and the stream ends before anything else
+    // is read — the pre-expansion loop below is what crashes pre-fix
+    try bw.bits(alloc, 0, 8);
+    try bw.bits(alloc, 0, 8);
+    try bw.flush(alloc);
+
+    try appendOggPage(alloc, &out, bw.bytes.items, 0x04, 0x1234, 2);
+    return out.toOwnedSlice(alloc);
+}
+
+// entries x dimensions = 1,074,000,000: 4x that wraps a signed int to
+// ~1.03 MB, and the whole setup (1.2 MB lengths + 4.8 MB codewords + 9.6 MB
+// sorted tables + the wrapped multiplicands) fits the #63 16 MiB decode-buffer
+// cap with room to spare. The true expansion is 4.3 GB of writes into the
+// 1 MB array. Pre-fix this crashes (OOB write march past the decode buffer);
+// post-fix the product is bounded and the stream is refused.
+test "a codebook whose entries*dimensions wraps is refused, not marched out of" {
+    const alloc = std.testing.allocator;
+    const stream = try hostileCodebookStream(alloc, 1_200_000, 895);
+    defer alloc.free(stream);
+    try std.testing.expectError(error.OpenFailed, vorbis.decodeMemory(alloc, stream));
 }
 
 // ---- corpus sanity ---------------------------------------------------------------
