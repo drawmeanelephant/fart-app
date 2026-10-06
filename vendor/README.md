@@ -10,23 +10,36 @@ ecosystem. Each dependency is a single file or a source-only tree.
 | `libvorbis/` | https://xiph.org/vorbis/ | 1.3.7 (2020-07-04) | BSD-3-Clause (`libvorbis/COPYING`) | Vorbis encoding of the kujamba channel |
 | `miniaudio.h` + `miniaudio_impl.c` | https://github.com/mackron/miniaudio | 0.11.25 (2026-03-04) | public domain / MIT-0 (statement at the end of `miniaudio.h`) | live audio device behind the `zc_*` shim (#20: `kujamba play`/`trigger` local playback) |
 
-Provenance: the 15 Zig files in `src/ninjam/`, both Xiph source trees, and
-the miniaudio/stb headers and shims match zclient in `drawmeanelephant/ninjam`
-at **`ae9a4d4325addd42d844047c080b9e1c0d6080d4`** byte-for-byte. The null-audio
-ABI test also matches upstream (`src/audio_shim_test.c` here,
-`zclient/tests/audio_shim_test.c` there). The C dependencies are
-compiled exactly as zclient's `build.zig` compiles them (same source list,
-same `-fno-sanitize=undefined` flag for libvorbis). zclient's own provenance
-work (trimming the Xiph tarballs to the files the build needs) is preserved;
-`libvorbis` is 1.3.7 because that is what the reference client's CMake
-FetchContent also uses, so both encoders link the same version.
+Provenance: the vendored C trees — `libogg/`, `libvorbis/`, `miniaudio.h`,
+`stb_vorbis.c`, `stb_vorbis_impl.c` — match zclient in
+`drawmeanelephant/ninjam` at **`a423bd189f8c55fe5d4de8ceb7027349d914eafb`**
+byte-for-byte. The C dependencies are compiled exactly as zclient's
+`build.zig` compiles them (same source list, same `-fno-sanitize=undefined`
+flag for libvorbis). zclient's own provenance work (trimming the Xiph
+tarballs to the files the build needs) is preserved; `libvorbis` is 1.3.7
+because that is what the reference client's CMake FetchContent also uses, so
+both encoders link the same version.
 
-**Merged upstream pin:** [ninjam#38](https://github.com/drawmeanelephant/ninjam/pull/38)
-landed in `agent/zclient` on 2026-10-01 at the commit above. Its zclient tree
-is unchanged from reviewed feature commit
-`c2a0d95848c590f8e259cbe105fb68b9a128e791`. The exact identity checks and
-reference demo have been repeated after the merge. Windows (#25) remains
-deferred separately and is not a prerequisite for downstream reconciliation.
+**Merged upstream pin:** [ninjam#42](https://github.com/drawmeanelephant/ninjam/pull/42)
+merged on main on 2026-10-06 at the commit above. It carries the wire-safety
+work from this repo's #63/#64/#66: the five `stb_vorbis.c` guards and the
+bounded interval downloads in `session.zig`. Its follow-up
+[ninjam#43](https://github.com/drawmeanelephant/ninjam/pull/43) lands the
+caller-buffer `decodeMemory` from #63 — until that merges, `src/ninjam/vorbis.zig`
+is the one file whose wire-safety change is downstream-only.
+
+The Zig subset no longer mirrors whole-file. zclient reorganized after the
+previous pin (its `zclient/tests/` and the kujamba adapter files left that
+tree), and this repository's kujamba integration keeps evolving shared files
+(#13/#14/#20/#24). The split, per file, as of this pin:
+
+* byte-identical — `buf.zig`, `clock.zig`, `log.zig`, `wav.zig`, `auth.zig`,
+  `main.zig`
+* kujamba-integrated divergence (upstream does not carry the kujamba
+  features) — `audio.zig` (#20), `net.zig` (#13/#14), `proto.zig`,
+  `session.zig` (#24, plus the upstreamed #64 bounds),
+  `instrument.zig`, `backpressure_test.zig`, `session_timing_test.zig`
+  (fart-app-side files), and `vorbis.zig` (#63, pending ninjam#43)
 
 The shared shim resolves playback and capture IDs separately from one
 enumeration snapshot, retains its context until close, supports playback-only
@@ -36,38 +49,26 @@ are tested without opening a device. The production miniaudio TU compiles only w
 flag asks for audio. `zig build test` also compiles a standalone null-backend
 ABI test regardless of that flag; it never opens real audio hardware.
 
-## Local deltas
+The shared shim resolves playback and capture IDs separately from one
+enumeration snapshot, retains its context until close, supports playback-only
+opening, and returns native negative miniaudio errors. Ring-allocation failures
+are tested without opening a device. The production miniaudio TU compiles only when `-Dlive` is on
+(default for macOS targets): `zig build` on Linux stays ALSA-free unless the
+flag asks for audio. `zig build test` also compiles a standalone null-backend
+ABI test regardless of that flag; it never opens real audio hardware.
 
-**`stb_vorbis.c` carries a local security delta since #63** — it no longer
-matches the zclient pin above byte-for-byte, and the `cmp stb_vorbis.c` line
-of the verify script fails until upstream reconciles. The delta (each hunk is
-marked `fart local delta (#63)` in the file) makes stb_vorbis's error paths
-safe for wire-hostile input, which is a hard requirement here: server-supplied
-interval downloads are decoded with it.
+## Wire-safety deltas: upstreamed
 
-1. `setup_malloc` / `setup_temp_malloc` refuse non-positive sizes. Sizes are
-   wire-driven `int` products, so a hostile stream can wrap one negative
-   (e.g. a vendor/comment length near 2^31); the malloc-backed mode happened
-   to survive that (`malloc((size_t)negative)` fails), the caller-buffer mode
-   did not.
-2. The Vorbis comment count is bounded by `INT_MAX/8` and by the remaining
-   stream bytes before the slot array is allocated, so its `sizeof(char*) *
-   count` cannot truncate below the true size.
-3. When a comment-string allocation fails mid-list, the count is shrunk to
-   the entries that were actually initialized.
-4. `vorbis_deinit` no longer dereferences `comment_list` when the slot-array
-   allocation failed (the count is already set by then).
-5. (#66) The codebook header's `entries * dimensions` product is bounded by
-   `INT_MAX/sizeof(float)` before anything is allocated with it. The type-1
-   pre-expansion sizes its multiplicands array through an `int`, and a
-   spec-legal header can claim a product whose byte size wraps to a small
-   positive value — reachable from a ~2 KB stream via the ordered-run length
-   encoding — after which the expansion loop marches 4 GB of writes past the
-   array.
-
-Upstream stb v1.22 (and the zclient pin) has all five bugs. The upstream move
-is to land the same guards in `drawmeanelephant/ninjam`'s `zclient/vendor` and
-re-pin here; the deltas are marked for exactly that reconciliation.
+The wire-hostile audit (#63, #64, #66) left marked deltas in this subset —
+five `stb_vorbis.c` hunks (non-positive size refusal in the allocators, the
+comment-count bound, the partial-list shrink, the `NULL comment_list` guard
+in `vorbis_deinit`, and the codebook `entries * dimensions` product bound)
+and the bounded interval downloads in `session.zig`. **All of it now lives
+upstream**: ninjam#42 landed the stb guards and the session bounds, ninjam#43
+(pending) lands the caller-buffer `decodeMemory` from #63. The in-file marks
+(`fart local delta (#63)`, `(#66)`, `wire-hostile-audit delta`) stay as the
+paper trail — upstream carries the same comments — and the stb file is
+byte-identical to the pin again.
 
 ## Verify the pinned subset
 
@@ -76,24 +77,29 @@ Run from this repository, with `NINJAM_CHECKOUT` set to that checkout:
 
 ```sh
 set -e
-pin=ae9a4d4325addd42d844047c080b9e1c0d6080d4
+pin=a423bd189f8c55fe5d4de8ceb7027349d914eafb
 test "$(git -C "$NINJAM_CHECKOUT" rev-parse HEAD)" = "$pin"
-git -C "$NINJAM_CHECKOUT" diff --exit-code HEAD -- zclient/src zclient/vendor zclient/tests
-diff -r "$NINJAM_CHECKOUT/zclient/src" src/ninjam
+
+# vendored C trees: byte-identical
 diff -r "$NINJAM_CHECKOUT/zclient/vendor/libogg" vendor/libogg
 diff -r "$NINJAM_CHECKOUT/zclient/vendor/libvorbis" vendor/libvorbis
-for file in miniaudio.h miniaudio_impl.c stb_vorbis.c stb_vorbis_impl.c; do
+for file in miniaudio.h stb_vorbis.c stb_vorbis_impl.c; do
   cmp "$NINJAM_CHECKOUT/zclient/vendor/$file" "vendor/$file" || exit 1
 done
-cmp "$NINJAM_CHECKOUT/zclient/tests/audio_shim_test.c" src/audio_shim_test.c
+
+# mirrored Zig core: byte-identical (no kujamba integration, no pending deltas)
+for file in buf.zig clock.zig log.zig wav.zig auth.zig main.zig; do
+  cmp "$NINJAM_CHECKOUT/zclient/src/$file" "src/ninjam/$file" || exit 1
+done
 ```
 
-Until #63 the shared source subset had no local exceptions; the deltas in
-"Local deltas" below (`stb_vorbis.c` since #63, `session.zig` since #64) are
-wire-hostility fixes, marked in-file for reconciliation. Upstream's
-`zclient/vendor/refresh-vendor.sh --check` independently regenerates and verifies
-the pinned third-party downloads and trim rule. Local README/build/test-root
-layout is intentionally separate from the vendored source contract.
+`miniaudio_impl.c` and the kujamba-integrated Zig files listed above are
+checked by review, not by `cmp` — their divergence is the kujamba feature
+work, described in the provenance section. Upstream's
+`zclient/vendor/refresh-vendor.sh --check` independently regenerates the
+pinned third-party downloads, applies its documented local patches, and
+verifies the result. Local README/build/test-root layout is intentionally
+separate from the vendored source contract.
 
 ## What was trimmed (per zclient)
 
