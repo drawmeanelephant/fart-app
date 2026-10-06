@@ -93,6 +93,19 @@ pub const Options = struct {
     /// ceiling on one reconnect delay in ms
     reconnect_backoff_max_ms: i64 = 8_000,
 
+    // ---- download bounds (#64, fart local delta) ----
+    /// Hard ceiling on one interval download's buffered bytes, applied even
+    /// when the server declared a larger estsize. The reference client sends
+    /// estsize = 0 for its own uploads, so this ceiling — not estsize — is the
+    /// only bound for undeclared transfers. 16 MiB is hundreds of times the
+    /// largest interval a NINJAM peer legitimately encodes at the reference
+    /// client's 64 kbps mono.
+    max_download_bytes: u64 = 16 * 1024 * 1024,
+    /// A download that has not seen its final write (flags & 1) within this
+    /// long loses its slot, so a server that starts transfers and never
+    /// finishes them cannot pin all eight download slots forever.
+    download_timeout_ms: i64 = 30_000,
+
     // ---- Phase B: live audio ----
     /// capture the local device instead of generating --source, and play the
     /// decoded peer mix out of it. Falls back to --source + WAV dumps when no
@@ -163,6 +176,9 @@ pub const Stats = struct {
 
     intervals_downloaded: u64 = 0,
     download_bytes: u64 = 0,
+    /// #64: transfers dropped for exceeding their byte limit or for sitting
+    /// past download_timeout_ms without a final write
+    downloads_aborted: u64 = 0,
     samples_decoded: u64 = 0,
 
     chat_sent: u64 = 0,
@@ -254,6 +270,14 @@ const DownloadState = struct {
     chidx: u8 = 0,
     user: UserEntry = .{},
     buf: Buf,
+    // fart local delta (#64): the transfer is bounded. estsize is what the
+    // 0x04 declared (0 = undeclared — the reference client never declares a
+    // size for its own uploads); limit is what the client actually enforces;
+    // begin_ms drives the expiry sweep so a transfer that never sees its
+    // final write cannot hold its slot forever.
+    estsize: u64 = 0,
+    limit: u64 = 0,
+    begin_ms: i64 = 0,
 };
 
 const OutputFile = struct {
@@ -1189,7 +1213,10 @@ pub const Session = struct {
         return null;
     }
 
-    fn allocDownload(self: *Session, guid: *const [16]u8, fourcc: u32, chidx: u8, username: []const u8) ?*DownloadState {
+    // fart local delta (#64): the transfer carries its declared size and its
+    // effective limit. estsize = 0 means "undeclared" — bounded by
+    // opts.max_download_bytes, never by nothing.
+    fn allocDownload(self: *Session, guid: *const [16]u8, fourcc: u32, chidx: u8, username: []const u8, estsize: u32) ?*DownloadState {
         for (&self.downloads) |*d| {
             if (!d.active) {
                 d.active = true;
@@ -1198,10 +1225,29 @@ pub const Session = struct {
                 d.chidx = chidx;
                 d.user.setName(username);
                 d.buf.clear();
+                d.estsize = estsize;
+                d.limit = if (estsize != 0 and estsize < self.opts.max_download_bytes) estsize else self.opts.max_download_bytes;
+                d.begin_ms = clock.nowMs(self.io);
                 return d;
             }
         }
         return null;
+    }
+
+    // fart local delta (#64): a transfer that never receives its final write
+    // must not hold its slot and its buffered bytes forever.
+    fn expireDownloads(self: *Session, now_ms: i64) void {
+        for (&self.downloads) |*d| {
+            if (!d.active) continue;
+            if (now_ms - d.begin_ms > self.opts.download_timeout_ms) {
+                self.stats.downloads_aborted += 1;
+                self.log.line("download expired: user={s} {d} bytes held {d}ms without a final write", .{
+                    d.user.nameSlice(), d.buf.len, now_ms - d.begin_ms,
+                });
+                d.active = false;
+                d.buf.deinit();
+            }
+        }
     }
 
     fn finalizeDownload(self: *Session, d: *DownloadState) !void {
@@ -1425,9 +1471,11 @@ pub const Session = struct {
             self.log.line("S>C 0x04 SILENCE_MARKER user={s} ch={d}", .{ b.username, b.chidx });
             return;
         }
-        if (self.allocDownload(&b.guid, b.fourcc, b.chidx, b.username)) |_| {
-            self.log.line("S>C 0x04 DOWNLOAD_BEGIN user={s} ch={d} guid={s} fourcc=0x{X:0>8}", .{
-                b.username, b.chidx, hexBuf(&b.guid, &self.hex_scratch), b.fourcc,
+        if (self.allocDownload(&b.guid, b.fourcc, b.chidx, b.username, b.estsize)) |d| {
+            // fart local delta (#64): estsize and the enforced limit are part
+            // of the transfer's identity now — log both
+            self.log.line("S>C 0x04 DOWNLOAD_BEGIN user={s} ch={d} guid={s} fourcc=0x{X:0>8} estsize={d} limit={d}", .{
+                b.username, d.chidx, hexBuf(&b.guid, &self.hex_scratch), d.fourcc, d.estsize, d.limit,
             });
         } else {
             self.log.line("download table full, dropping transfer from {s}", .{b.username});
@@ -1442,6 +1490,19 @@ pub const Session = struct {
             self.log.line("S>C 0x05 WRITE for unknown guid (ignored)", .{});
             return;
         };
+        // fart local delta (#64): the one bound the protocol hands us. A frame
+        // that would push the transfer past its limit aborts the whole
+        // transfer — a server that lies about estsize (or says nothing and
+        // never stops) loses the slot, and the session stays alive.
+        if (d.buf.len + w.data.len > d.limit) {
+            self.stats.downloads_aborted += 1;
+            self.log.line("download aborted: user={s} frame would exceed {d}-byte limit (estsize={d}, have {d}, +{d})", .{
+                d.user.nameSlice(), d.limit, d.estsize, d.buf.len, w.data.len,
+            });
+            d.active = false;
+            d.buf.deinit();
+            return;
+        }
         try d.buf.add(w.data);
         self.stats.download_bytes += w.data.len;
         self.log.line("S>C 0x05 WRITE user={s} bytes={d} flags={d} total={d}", .{
@@ -1637,6 +1698,8 @@ pub const Session = struct {
             }
             if (self.state == .done) break;
             const now_ms = clock.nowMs(self.io);
+            // fart local delta (#64): unfinished downloads age out of the table
+            self.expireDownloads(now_ms);
             if (now_ms - self.conn.?.last_recv_ms > @as(i64, @intCast(self.keepalive_s)) * 3000) {
                 self.markConnectionLost("connection stalled: no data for {d}ms", .{now_ms - self.conn.?.last_recv_ms});
                 continue :outer;

@@ -81,9 +81,9 @@ done
 cmp "$NINJAM_CHECKOUT/zclient/tests/audio_shim_test.c" src/audio_shim_test.c
 ```
 
-Until #63 the shared source subset had no local exceptions; the stb_vorbis
-security delta in "Local deltas" below is the first, and is marked in-file for
-reconciliation. Upstream's
+Until #63 the shared source subset had no local exceptions; the deltas in
+"Local deltas" below (`stb_vorbis.c` since #63, `session.zig` since #64) are
+wire-hostility fixes, marked in-file for reconciliation. Upstream's
 `zclient/vendor/refresh-vendor.sh --check` independently regenerates and verifies
 the pinned third-party downloads and trim rule. Local README/build/test-root
 layout is intentionally separate from the vendored source contract.
