@@ -583,6 +583,7 @@ enum STBVorbisError
    #include <string.h>
    #include <assert.h>
    #include <math.h>
+   #include <limits.h> // fart local delta (#63): INT_MAX for the comment_list bound
 
    // find definition of alloca if it's not in stdlib.h:
    #if defined(_MSC_VER) || defined(__MINGW32__)
@@ -950,6 +951,11 @@ static void *make_block_array(void *mem, int count, int size)
 static void *setup_malloc(vorb *f, int sz)
 {
    sz = (sz+7) & ~7; // round up to nearest 8 for alignment of future allocs.
+   // fart local delta (#63): sizes are wire-driven and computed through int
+   // products, so they can wrap negative (e.g. a comment count whose byte
+   // size overflows). malloc() would fail on such a size and every caller
+   // NULL-checks, so refuse the same way instead of wrapping the bump offset.
+   if (sz <= 0) return NULL;
    f->setup_memory_required += sz;
    if (f->alloc.alloc_buffer) {
       void *p = (char *) f->alloc.alloc_buffer + f->setup_offset;
@@ -969,6 +975,9 @@ static void setup_free(vorb *f, void *p)
 static void *setup_temp_malloc(vorb *f, int sz)
 {
    sz = (sz+7) & ~7; // round up to nearest 8 for alignment of future allocs.
+   // fart local delta (#63): see setup_malloc — a negative size would move
+   // temp_offset outside the buffer.
+   if (sz < 0) return NULL;
    if (f->alloc.alloc_buffer) {
       if (f->temp_offset - sz < f->setup_offset) return NULL;
       f->temp_offset -= sz;
@@ -3658,6 +3667,14 @@ static int start_decoder(vorb *f)
    f->vendor[len] = (char)'\0';
    //user comments
    f->comment_list_length = get32_packet(f);
+   // fart local delta (#63): comment_list_length is wire-controlled and
+   // setup_malloc takes an int, so sizeof(char*) * len can truncate below the
+   // true size and hand the per-comment loop an undersized slot array. Bound
+   // it by what the stream could carry (each comment needs at least its own
+   // 4-byte length field) and by what fits an int slot count.
+   if (f->comment_list_length > INT_MAX/8 ||
+       f->comment_list_length > (int) ((f->stream_end - f->stream) / 4))
+      return error(f, VORBIS_invalid_setup);
    f->comment_list = NULL;
    if (f->comment_list_length > 0)
    {
@@ -3668,7 +3685,13 @@ static int start_decoder(vorb *f)
    for(i=0; i < f->comment_list_length; ++i) {
       len = get32_packet(f);
       f->comment_list[i] = (char*)setup_malloc(f, sizeof(char) * (len+1));
-      if (f->comment_list[i] == NULL)               return error(f, VORBIS_outofmem);
+      if (f->comment_list[i] == NULL) {
+         // fart local delta (#63): only entries [0,i) were initialized;
+         // shrink the count so deinit's error path never walks or frees the
+         // uninitialized tail.
+         f->comment_list_length = i;
+         return error(f, VORBIS_outofmem);
+      }
 
       for(j=0; j < len; ++j) {
          f->comment_list[i][j] = get8_packet(f);
@@ -4210,8 +4233,13 @@ static void vorbis_deinit(stb_vorbis *p)
    int i,j;
 
    setup_free(p, p->vendor);
-   for (i=0; i < p->comment_list_length; ++i) {
-      setup_free(p, p->comment_list[i]);
+   // fart local delta (#63): comment_list stays NULL when its slot-array
+   // allocation fails in start_decoder, but comment_list_length is already
+   // set by then, so this error path used to dereference NULL[i].
+   if (p->comment_list) {
+      for (i=0; i < p->comment_list_length; ++i) {
+         setup_free(p, p->comment_list[i]);
+      }
    }
    setup_free(p, p->comment_list);
 
