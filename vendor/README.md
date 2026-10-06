@@ -36,6 +36,32 @@ are tested without opening a device. The production miniaudio TU compiles only w
 flag asks for audio. `zig build test` also compiles a standalone null-backend
 ABI test regardless of that flag; it never opens real audio hardware.
 
+## Local deltas
+
+**`stb_vorbis.c` carries a local security delta since #63** — it no longer
+matches the zclient pin above byte-for-byte, and the `cmp stb_vorbis.c` line
+of the verify script fails until upstream reconciles. The delta (each hunk is
+marked `fart local delta (#63)` in the file) makes stb_vorbis's error paths
+safe for wire-hostile input, which is a hard requirement here: server-supplied
+interval downloads are decoded with it.
+
+1. `setup_malloc` / `setup_temp_malloc` refuse non-positive sizes. Sizes are
+   wire-driven `int` products, so a hostile stream can wrap one negative
+   (e.g. a vendor/comment length near 2^31); the malloc-backed mode happened
+   to survive that (`malloc((size_t)negative)` fails), the caller-buffer mode
+   did not.
+2. The Vorbis comment count is bounded by `INT_MAX/8` and by the remaining
+   stream bytes before the slot array is allocated, so its `sizeof(char*) *
+   count` cannot truncate below the true size.
+3. When a comment-string allocation fails mid-list, the count is shrunk to
+   the entries that were actually initialized.
+4. `vorbis_deinit` no longer dereferences `comment_list` when the slot-array
+   allocation failed (the count is already set by then).
+
+Upstream stb v1.22 (and the zclient pin) has all four bugs. The upstream move
+is to land the same guards in `drawmeanelephant/ninjam`'s `zclient/vendor` and
+re-pin here; the deltas are marked for exactly that reconciliation.
+
 ## Verify the pinned subset
 
 Use a clean upstream checkout at the exact pin (not merely the branch tip).
@@ -55,7 +81,9 @@ done
 cmp "$NINJAM_CHECKOUT/zclient/tests/audio_shim_test.c" src/audio_shim_test.c
 ```
 
-No local exceptions remain in the shared source subset. Upstream's
+Until #63 the shared source subset had no local exceptions; the stb_vorbis
+security delta in "Local deltas" below is the first, and is marked in-file for
+reconciliation. Upstream's
 `zclient/vendor/refresh-vendor.sh --check` independently regenerates and verifies
 the pinned third-party downloads and trim rule. Local README/build/test-root
 layout is intentionally separate from the vendored source contract.
