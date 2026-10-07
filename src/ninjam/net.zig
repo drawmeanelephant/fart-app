@@ -406,9 +406,12 @@ pub const sys = switch (builtin.os.tag) {
         }
         pub const PollEvents = struct { in: bool = false, out: bool = false, err: bool = false, nval: bool = false };
         pub fn pollOne(fd: Fd, want_in: bool, want_out: bool, timeout_ms: c_int) Error!PollEvents {
+            var ev: c_short = 0;
+            if (want_in) ev |= std.posix.POLL.IN;
+            if (want_out) ev |= std.posix.POLL.OUT;
             var pfd = [_]std.posix.pollfd{.{
                 .fd = fd,
-                .events = (if (want_in) std.posix.POLL.IN else 0) | (if (want_out) std.posix.POLL.OUT else 0),
+                .events = ev,
                 .revents = 0,
             }};
             _ = try std.posix.poll(&pfd, timeout_ms);
@@ -426,7 +429,7 @@ pub const sys = switch (builtin.os.tag) {
                 switch (std.posix.errno(n)) {
                     .SUCCESS => {
                         if (n == 0) return error.ConnectionClosed;
-                        return n;
+                        return @intCast(n);
                     },
                     .AGAIN => return error.WouldBlock,
                     .INTR => continue,
@@ -459,7 +462,7 @@ pub const sys = switch (builtin.os.tag) {
                 switch (std.posix.errno(n)) {
                     .SUCCESS => {
                         if (n == 0) return error.WouldBlock;
-                        return n;
+                        return @intCast(n);
                     },
                     .AGAIN => return error.WouldBlock,
                     .INTR => continue,
@@ -468,7 +471,7 @@ pub const sys = switch (builtin.os.tag) {
             }
         }
         pub fn setSockOptInt(fd: Fd, level: c_int, opt: c_int, value: i32) Error!void {
-            try std.posix.setsockopt(fd, level, @intCast(opt), &std.mem.toBytes(value));
+            std.posix.setsockopt(fd, level, @intCast(opt), &std.mem.toBytes(value)) catch return error.SocketOption;
         }
         pub fn getSockOptInt(fd: Fd, level: c_int, opt: c_int) Error!i32 {
             var v: i32 = 0;
@@ -567,7 +570,7 @@ pub const sys = switch (builtin.os.tag) {
                 return c;
             }
             pub fn deinit(self: *AddrInfo) void {
-                if (self.head) |h| std.posix.freeaddrinfo(h);
+                if (self.head) |h| std.c.freeaddrinfo(h);
                 self.head = null;
                 self.cur = null;
             }
