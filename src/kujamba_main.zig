@@ -64,7 +64,7 @@ fn stopCtrlHandler(ctrl: win.DWORD) callconv(.winapi) win.BOOL {
 /// usleep spelled as an Io-clock sleep, so it compiles where unistd.h does
 /// not exist (#25).
 fn sleepUs(io: std.Io, us: u64) void {
-    const d: std.Io.Clock.Duration = .{ .raw = .fromMicroseconds(us), .clock = .awake };
+    const d: std.Io.Clock.Duration = .{ .raw = .fromMicroseconds(@intCast(us)), .clock = .awake };
     d.sleep(io) catch {};
 }
 

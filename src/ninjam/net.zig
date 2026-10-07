@@ -428,7 +428,10 @@ pub const sys = switch (builtin.os.tag) {
                 const n = std.posix.system.read(fd, buf.ptr, buf.len);
                 switch (std.posix.errno(n)) {
                     .SUCCESS => {
-                        if (n == 0) return error.ConnectionClosed;
+                        // EOF is EndOfStream here and in the Winsock arm —
+                        // callers map it to a graceful close, unlike
+                        // ConnectionClosed (an error of the transport).
+                        if (n == 0) return error.EndOfStream;
                         return @intCast(n);
                     },
                     .AGAIN => return error.WouldBlock,
