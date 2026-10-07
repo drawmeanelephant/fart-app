@@ -30,10 +30,43 @@ const vorbis = @import("ninjam/vorbis.zig");
 const synth = @import("synth.zig");
 const kujamba_out = @import("ninjam_out.zig");
 const kujamba_config = @import("kujamba_config.zig");
-const libc = @cImport({
+const builtin = @import("builtin");
+// libc only for the posix signal install path — Windows stops through the
+// console control handler below, and both sides sleep on the Io clock now
+// that unistd.h's usleep no longer reaches Windows (#25).
+const libc = if (builtin.os.tag == .windows) struct {} else @cImport({
     @cInclude("signal.h");
-    @cInclude("unistd.h"); // usleep — the drain loops' 10 ms ticks (#20)
 });
+
+const win = std.os.windows;
+const CTRL_C_EVENT: win.DWORD = 0;
+const CTRL_BREAK_EVENT: win.DWORD = 1;
+const CTRL_CLOSE_EVENT: win.DWORD = 2;
+const CtrlHandlerRoutine = fn (ctrl_type: win.DWORD) callconv(.winapi) win.BOOL;
+extern "kernel32" fn SetConsoleCtrlHandler(
+    handler: ?*const CtrlHandlerRoutine,
+    add: win.BOOL,
+) callconv(.winapi) win.BOOL;
+
+/// Console-ctrl stand-in for the posix `handleStop` signal handler: request
+/// the same clean stop and return handled so the process lives until the
+/// session loop exits at an interval boundary.
+fn stopCtrlHandler(ctrl: win.DWORD) callconv(.winapi) win.BOOL {
+    return switch (ctrl) {
+        CTRL_C_EVENT, CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT => blk: {
+            kujamba_out.requestStop();
+            break :blk win.BOOL.TRUE;
+        },
+        else => .FALSE,
+    };
+}
+
+/// usleep spelled as an Io-clock sleep, so it compiles where unistd.h does
+/// not exist (#25).
+fn sleepUs(io: std.Io, us: u64) void {
+    const d: std.Io.Clock.Duration = .{ .raw = .fromMicroseconds(@intCast(us)), .clock = .awake };
+    d.sleep(io) catch {};
+}
 
 /// The playback device period kujamba's local path opens with (#20): 480
 /// frames at 44.1 kHz is ~10.9 ms, the same default the live session uses.
@@ -153,8 +186,12 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
 
     // Ctrl+C finishes the current interval cleanly (see session run loop).
-    _ = libc.signal(libc.SIGINT, handleStop);
-    _ = libc.signal(libc.SIGTERM, handleStop);
+    if (builtin.os.tag == .windows) {
+        _ = SetConsoleCtrlHandler(stopCtrlHandler, win.BOOL.TRUE);
+    } else {
+        _ = libc.signal(libc.SIGINT, handleStop);
+        _ = libc.signal(libc.SIGTERM, handleStop);
+    }
     const args = try std.process.Args.toSlice(init.minimal.args, arena);
 
     if (args.len < 2) {
@@ -859,10 +896,10 @@ fn cmdPlay(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: [
             tail_left -= chunk;
         }
         if (dev.queuedPlayback() == 0) break;
-        _ = libc.usleep(10 * 1000);
+        sleepUs(io, 10 * 1000);
     }
     // let the hardware pull the last queued period before the device closes
-    _ = libc.usleep(@intCast((play_period_frames * 1000 * 1000) / kujamba_out.sample_rate + 10 * 1000));
+    sleepUs(io, (play_period_frames * 1000 * 1000) / kujamba_out.sample_rate + 10 * 1000);
     const done = "done\n";
     std.Io.File.stdout().writeStreamingAll(io, done) catch {};
 }
@@ -958,7 +995,7 @@ fn cmdTrigger(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv
     // let the last note-on finish sounding, then leave
     var grace: u64 = 0;
     while (grace < 2000 and dev.queuedPlayback() > 0 and !kujamba_out.stopRequested()) : (grace += 10) {
-        _ = libc.usleep(10 * 1000);
+        sleepUs(io, 10 * 1000);
     }
 }
 

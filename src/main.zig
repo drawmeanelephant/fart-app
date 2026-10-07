@@ -1,13 +1,55 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const synth = @import("synth.zig");
+const clock = @import("ninjam/clock.zig");
+// No unistd.h here: usleep/getpid do not reach Windows (#25). The sleeps are
+// `sleepUs` on the Io clock and the RNG seeds from the same clock; the posix
+// signal() install sits behind the builtin.os.tag switch in main().
 const libc = @cImport({
     @cInclude("stdio.h");
     @cInclude("stdlib.h");
-    @cInclude("unistd.h");
     @cInclude("time.h");
     @cInclude("signal.h");
 });
+
+const win = std.os.windows;
+const CTRL_C_EVENT: win.DWORD = 0;
+const CTRL_BREAK_EVENT: win.DWORD = 1;
+const CtrlHandlerRoutine = fn (ctrl_type: win.DWORD) callconv(.winapi) win.BOOL;
+extern "kernel32" fn SetConsoleCtrlHandler(
+    handler: ?*const CtrlHandlerRoutine,
+    add: win.BOOL,
+) callconv(.winapi) win.BOOL;
+
+fn stopCtrlHandler(ctrl: win.DWORD) callconv(.winapi) win.BOOL {
+    return switch (ctrl) {
+        CTRL_C_EVENT, CTRL_BREAK_EVENT => blk: {
+            is_running.store(false, .release);
+            break :blk win.BOOL.TRUE;
+        },
+        else => .FALSE,
+    };
+}
+
+/// usleep spelled as an Io-clock sleep, so it compiles where unistd.h does
+/// not exist (#25).
+fn sleepUs(io: std.Io, us: u64) void {
+    const d: std.Io.Clock.Duration = .{ .raw = .fromMicroseconds(@intCast(us)), .clock = .awake };
+    d.sleep(io) catch {};
+}
+
+// Set once in main() before any tmpWavPath call: 0.16 exposes the
+// environment through `std.process.Init`, not a global getter.
+var process_env: *std.process.Environ.Map = undefined;
+
+/// The scratch directory the rendered WAVs land in: /tmp on posix, %TEMP%
+/// (or the cwd as last resort) on Windows.
+fn tmpWavPath(buf: []u8, name: []const u8) ?[:0]const u8 {
+    if (builtin.os.tag != .windows)
+        return std.fmt.bufPrintZ(buf, "/tmp/{s}", .{name}) catch null;
+    const temp = process_env.get("TEMP") orelse process_env.get("TMP") orelse ".";
+    return std.fmt.bufPrintZ(buf, "{s}\\{s}", .{ temp, name }) catch null;
+}
 
 const butt_frames = [_][]const u8{
     \\       _.._  _.._
@@ -93,7 +135,11 @@ var speech_available: bool = false; // probed once in main()
 
 fn haveCommand(cmd: []const u8) bool {
     var buf: [128]u8 = undefined;
-    const probe = std.fmt.bufPrintZ(&buf, "command -v {s} >/dev/null 2>&1", .{cmd}) catch return false;
+    // `command -v` is a POSIX shell builtin; `where` is the Windows answer.
+    const probe = if (builtin.os.tag == .windows)
+        std.fmt.bufPrintZ(&buf, "where {s} >NUL 2>NUL", .{cmd}) catch return false
+    else
+        std.fmt.bufPrintZ(&buf, "command -v {s} >/dev/null 2>&1", .{cmd}) catch return false;
     return libc.system(probe.ptr) == 0;
 }
 
@@ -153,7 +199,7 @@ fn writeWavFile(path: [*:0]const u8, bytes: []const u8) bool {
 
 /// kujamba mode: the butt speaks a Swahili phrase in fart.
 /// Syllable-timed animation frames while the synthesized phrase WAV plays.
-fn runKujamba(phrase: []const u8) void {
+fn runKujamba(io: std.Io, phrase: []const u8) void {
     const alloc = std.heap.page_allocator;
 
     var plan = synth.planPhrase(alloc, phrase) catch {
@@ -171,13 +217,18 @@ fn runKujamba(phrase: []const u8) void {
         return;
     };
     defer alloc.free(wav);
-    if (!writeWavFile("/tmp/fart_kujamba.wav", wav)) {
-        _ = libc.printf("kujamba: could not write /tmp/fart_kujamba.wav\n");
+    var wav_path_buf: [1024]u8 = undefined;
+    const wav_path = tmpWavPath(&wav_path_buf, "fart_kujamba.wav") orelse {
+        _ = libc.printf("kujamba: could not pick a scratch path\n");
+        return;
+    };
+    if (!writeWavFile(wav_path, wav)) {
+        _ = libc.printf("kujamba: could not write %s\n", wav_path.ptr);
         return;
     }
 
     _ = libc.printf("\x1b[?25l");
-    playSound("/tmp/fart_kujamba.wav", 1);
+    playSound(wav_path, 1);
 
     var i: usize = 0;
     while (i < plan.items.len) : (i += 1) {
@@ -216,7 +267,7 @@ fn runKujamba(phrase: []const u8) void {
         }
 
         _ = libc.fflush(null);
-        _ = libc.usleep(@intCast(item.len * 1000000 / synth.SAMPLE_RATE));
+        sleepUs(io, @intCast(item.len * 1000000 / synth.SAMPLE_RATE));
     }
 
     restoreTerminal();
@@ -251,8 +302,16 @@ fn getRandU(max: usize) usize {
 }
 
 pub fn main(init: std.process.Init) !void {
-    _ = libc.signal(libc.SIGINT, handleSigInt);
-    _ = libc.srand(@as(u32, @intCast(libc.time(null))) ^ @as(u32, @intCast(libc.getpid())));
+    const io = init.io;
+    process_env = init.environ_map;
+    // Ctrl+C restores the terminal: signal() on posix, the console control
+    // handler on Windows.
+    if (builtin.os.tag == .windows) {
+        _ = SetConsoleCtrlHandler(stopCtrlHandler, win.BOOL.TRUE);
+    } else {
+        _ = libc.signal(libc.SIGINT, handleSigInt);
+    }
+    _ = libc.srand(@as(u32, @truncate(@as(u128, @bitCast(clock.nowNs(io))))));
 
     // probe the host's sound + speech once; every playSound/speak after this
     // is a no-op when the host has nothing to offer (#25)
@@ -265,25 +324,22 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // kujamba mode: fart kujamba <swahili phrase> — the butt speaks.
-    var args_iter = init.minimal.args.iterate();
-    _ = args_iter.skip(); // program name
-    if (args_iter.next()) |first| {
-        if (std.mem.eql(u8, first, "kujamba")) {
-            var phrase_list = std.ArrayList(u8).initCapacity(std.heap.page_allocator, 64) catch unreachable;
-            defer phrase_list.deinit(std.heap.page_allocator);
-            var first_word = true;
-            while (args_iter.next()) |a| {
-                if (!first_word) try phrase_list.append(std.heap.page_allocator, ' ');
-                first_word = false;
-                try phrase_list.appendSlice(std.heap.page_allocator, a);
-            }
-            if (phrase_list.items.len == 0) {
-                _ = libc.printf("usage: fart kujamba <swahili phrase>\n");
-                return;
-            }
-            runKujamba(phrase_list.items);
+    const args = try std.process.Args.toSlice(init.minimal.args, init.arena.allocator());
+    if (args.len > 1 and std.mem.eql(u8, args[1], "kujamba")) {
+        var phrase_list = std.ArrayList(u8).initCapacity(std.heap.page_allocator, 64) catch unreachable;
+        defer phrase_list.deinit(std.heap.page_allocator);
+        var first_word = true;
+        for (args[2..]) |a| {
+            if (!first_word) try phrase_list.append(std.heap.page_allocator, ' ');
+            first_word = false;
+            try phrase_list.appendSlice(std.heap.page_allocator, a);
+        }
+        if (phrase_list.items.len == 0) {
+            _ = libc.printf("usage: fart kujamba <swahili phrase>\n");
             return;
         }
+        runKujamba(io, phrase_list.items);
+        return;
     }
 
     _ = libc.printf("\x1b[?25l");
@@ -293,11 +349,14 @@ pub fn main(init: std.process.Init) !void {
     for (shuzi_seeds, 0..) |seed, idx| {
         const wav = synth.renderShuziWav(std.heap.page_allocator, seed) catch continue;
         defer std.heap.page_allocator.free(wav);
-        var path_buf: [64]u8 = undefined;
-        const path = std.fmt.bufPrintZ(&path_buf, "/tmp/fart_shuzi_{d}.wav", .{idx}) catch continue;
+        var name_buf: [32]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buf, "fart_shuzi_{d}.wav", .{idx}) catch continue;
+        var path_buf: [1024]u8 = undefined;
+        const path = tmpWavPath(&path_buf, name) orelse continue;
         _ = writeWavFile(path, wav);
     }
-    playSound("/tmp/fart_shuzi_0.wav", 3);
+    var shuzi_path_buf: [1024]u8 = undefined;
+    if (tmpWavPath(&shuzi_path_buf, "fart_shuzi_0.wav")) |p| playSound(p, 3);
     speak("Bad News", "Pfffffft!");
 
     var frame: usize = 0;
@@ -330,9 +389,9 @@ pub fn main(init: std.process.Init) !void {
             } else {
                 // no Blow.aiff outside macOS; the loudest shuzi steps in
                 speak("Bad News", "TACTICAL NUKE INCOMING");
-                playSound("/tmp/fart_shuzi_0.wav", 5);
+                if (tmpWavPath(&shuzi_path_buf, "fart_shuzi_0.wav")) |p| playSound(p, 5);
             }
-            _ = libc.usleep(1000 * 1000);
+            sleepUs(io, 1000 * 1000);
             frame += 1;
             continue;
         }
@@ -404,9 +463,9 @@ pub fn main(init: std.process.Init) !void {
         }
 
         if (getRandU(15) == 0) {
-            var path_buf: [32]u8 = undefined;
-            const shuzi_path = std.fmt.bufPrintZ(&path_buf, "/tmp/fart_shuzi_{d}.wav", .{getRandU(shuzi_seeds.len)}) catch continue;
-            playSound(shuzi_path, 2);
+            var name_buf: [32]u8 = undefined;
+            const name = std.fmt.bufPrint(&name_buf, "fart_shuzi_{d}.wav", .{getRandU(shuzi_seeds.len)}) catch continue;
+            if (tmpWavPath(&shuzi_path_buf, name)) |p| playSound(p, 2);
         }
 
         if (getRandU(20) == 0) {
@@ -420,7 +479,7 @@ pub fn main(init: std.process.Init) !void {
         _ = libc.fflush(null);
 
         frame += 1;
-        _ = libc.usleep(80 * 1000);
+        sleepUs(io, 80 * 1000);
     }
 
     restoreTerminal();
@@ -440,7 +499,10 @@ test "sound command per player" {
     try testing.expectEqual(@as(?[:0]const u8, null), soundCommand(&buf, .none, "/tmp/fart.wav", 3));
 }
 
-test "command probe finds sh and misses nonsense" {
-    try testing.expect(haveCommand("sh"));
+test "command probe finds the shell and misses nonsense" {
+    // `sh` is the POSIX probe; `cmd` is always resolvable by `where` on
+    // Windows. Both sides must answer true for their own shell and false for
+    // a name that cannot exist.
+    try testing.expect(haveCommand(if (builtin.os.tag == .windows) "cmd" else "sh"));
     try testing.expect(!haveCommand("definitely-not-a-command-xyzzy"));
 }

@@ -1858,10 +1858,8 @@ test "mid-bar config selects the next interval once, and never past the interval
         });
         defer s.deinit();
         s.log.quiet = true;
-        var fds: [2]std.posix.socket_t = undefined;
-        const rc = std.posix.system.socketpair(@intCast(std.posix.AF.UNIX), @intCast(std.posix.SOCK.STREAM), 0, &fds);
-        if (std.posix.errno(rc) != .SUCCESS) return error.SocketPairFailed;
-        defer _ = std.c.close(fds[1]);
+        const fds = try netmod.sys.socketpair();
+        defer netmod.sys.closeFd(fds[1]);
         s.conn = .{ .io = s.io, .fd = fds[0] };
         s.state = .active;
         var config = Fixed{};

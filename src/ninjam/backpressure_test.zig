@@ -53,7 +53,7 @@ const Peer = struct {
     decode_failed: bool = false,
 
     fn run(self: *Peer) void {
-        defer _ = std.posix.system.close(self.fd);
+        defer net.sys.closeFd(self.fd);
         self.play() catch |e| {
             std.debug.print("backpressure peer failed: {s}\n", .{@errorName(e)});
             self.bad_frame = true;
@@ -61,13 +61,11 @@ const Peer = struct {
     }
 
     fn play(self: *Peer) !void {
-        var flags: std.c.O = @bitCast(@as(u32, @intCast(std.c.fcntl(self.fd, std.c.F.GETFL, @as(c_int, 0)))));
-        flags.NONBLOCK = true;
-        _ = std.c.fcntl(self.fd, std.c.F.SETFL, @as(c_int, @bitCast(flags)));
+        try net.sys.setNonblocking(self.fd);
         if (builtin.os.tag == .macos) {
-            try std.posix.setsockopt(self.fd, std.posix.SOL.SOCKET, std.posix.SO.NOSIGPIPE, &std.mem.toBytes(@as(c_int, 1)));
+            try net.sys.setSockOptInt(self.fd, std.posix.SOL.SOCKET, std.posix.SO.NOSIGPIPE, 1);
         }
-        try std.posix.setsockopt(self.fd, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, &std.mem.toBytes(@as(c_int, 4096)));
+        try net.sys.setSockOptInt(self.fd, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, 4096);
         var challenge: [16]u8 = undefined;
         @memcpy(challenge[0..8], "\x01\x23\x45\x67\x89\xab\xcd\xef");
         std.mem.writeInt(u32, challenge[8..12], 0x100, .little); // 1 s keepalive
@@ -157,16 +155,14 @@ const Peer = struct {
         var off: usize = 0;
         const deadline = clock.nowMs(self.io) + 2000;
         while (off < bytes.len and clock.nowMs(self.io) < deadline) {
-            const rc = if (builtin.os.tag == .macos)
-                std.posix.system.write(self.fd, bytes[off..].ptr, bytes.len - off)
-            else
-                std.posix.system.send(self.fd, bytes[off..].ptr, bytes.len - off, std.posix.MSG.NOSIGNAL);
-            switch (std.posix.errno(rc)) {
-                .SUCCESS => off += @intCast(rc),
-                .INTR => {},
-                .AGAIN => try sleep(self.io, 1),
+            const n = net.sys.sendFd(self.fd, bytes[off..]) catch |e| switch (e) {
+                error.WouldBlock => {
+                    try sleep(self.io, 1);
+                    continue;
+                },
                 else => return error.PeerWrite,
-            }
+            };
+            off += n;
         }
         if (off != bytes.len) return error.PeerWriteTimeout;
     }
@@ -186,14 +182,14 @@ const Peer = struct {
         var off: usize = 0;
         const deadline = clock.nowMs(self.io) + 2000;
         while (off < bytes.len and clock.nowMs(self.io) < deadline) {
-            const n = std.posix.read(self.fd, bytes[off..]) catch |e| switch (e) {
+            const n = net.sys.readFd(self.fd, bytes[off..]) catch |e| switch (e) {
                 error.WouldBlock => {
                     try sleep(self.io, 1);
                     continue;
                 },
+                error.EndOfStream => return error.EndOfStream,
                 else => return e,
             };
-            if (n == 0) return error.EndOfStream;
             off += n;
         }
         if (off != bytes.len) return error.HandshakeTimeout;
@@ -206,24 +202,17 @@ fn sleep(io: std.Io, ms: u32) !void {
 }
 
 pub fn reproduce(alloc: std.mem.Allocator, io: std.Io, check: bool) !void {
-    var fds: [2]std.posix.socket_t = undefined;
-    if (std.posix.errno(std.posix.system.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds)) != .SUCCESS) return error.SocketPairFailed;
+    const fds = try net.sys.socketpair();
     var peer_owned = true;
     defer {
-        if (peer_owned) _ = std.posix.system.close(fds[1]);
+        if (peer_owned) net.sys.closeFd(fds[1]);
     }
-    for (fds) |fd| {
-        var flags: std.c.O = @bitCast(@as(u32, @intCast(std.c.fcntl(fd, std.c.F.GETFL, @as(c_int, 0)))));
-        flags.NONBLOCK = true;
-        _ = std.c.fcntl(fd, std.c.F.SETFL, @as(c_int, @bitCast(flags)));
-    }
+    for (fds) |fd| net.sys.setNonblocking(fd) catch {};
     var conn = net.Conn{ .io = io, .fd = fds[0], .last_recv_ms = clock.nowMs(io) };
     var owned = true;
     defer if (owned) conn.close();
-    try std.posix.setsockopt(conn.fd, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, &std.mem.toBytes(@as(c_int, 8192)));
-    var actual: c_int = 0;
-    var optlen: std.c.socklen_t = @sizeOf(c_int);
-    if (std.c.getsockopt(conn.fd, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, @ptrCast(&actual), &optlen) != 0) return error.GetSendBuf;
+    try net.sys.setSockOptInt(conn.fd, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, 8192);
+    const actual = try net.sys.getSockOptInt(conn.fd, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF);
     var progress = Progress{ .io = io };
     var peer = Peer{ .io = io, .alloc = alloc, .fd = fds[1], .progress = &progress };
     var samples: [48000]f32 = undefined;
@@ -295,5 +284,12 @@ pub fn main(init: std.process.Init) !void {
 }
 
 test "#14: constrained stream uploads drop without stopping Session.run, then recover" {
+    // Windows cannot reproduce this condition: Winsock treats SO_SNDBUF as
+    // advisory, not a bound — the loopback pair absorbs the whole test window's
+    // uploads without ever returning WouldBlock, so the peer's 4 s blackout
+    // never produces the constrained-stream state this test is about. The
+    // whole-or-nothing write guarantee it exercises is covered cross-platform
+    // by the #14 socketpair tests in session_timing_test.zig.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     try reproduce(std.testing.allocator, std.testing.io, true);
 }

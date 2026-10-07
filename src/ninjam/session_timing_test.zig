@@ -76,33 +76,36 @@ pub const ServerView = struct {
 /// accept has to be interruptible (macOS does not wake a thread blocked in
 /// `accept` when the fd is closed, so the join would deadlock).
 const Listener = struct {
-    server: std.Io.net.Server,
+    lfd: net.sys.Fd,
     io: std.Io,
     closed: bool = false,
     stop: std.atomic.Value(bool) = .init(false),
 
-    fn init(server: std.Io.net.Server, io: std.Io) Listener {
-        const l = Listener{ .server = server, .io = io };
-        // Non-blocking accept: EAGAIN surfaces as error.WouldBlock and the loop
-        // can check `stop` between attempts. Note std.c.O is a packed struct,
-        // and net.zig's own setNonblocking hardcodes Linux's 0o4000 — a silent
-        // no-op on macOS — so set the named bit through the struct instead.
-        const fd = server.socket.handle;
-        var o: std.c.O = @bitCast(@as(u32, @intCast(std.c.fcntl(fd, std.c.F.GETFL, @as(c_int, 0)))));
-        o.NONBLOCK = true;
-        _ = std.c.fcntl(fd, std.c.F.SETFL, @as(c_int, @bitCast(o)));
-        return l;
+    /// A real SOCKET listener, built through the `sys` seam: a
+    /// `std.Io.net.Server`'s handle is an AFD endpoint on Windows, not a
+    /// Winsock socket, so poll/accept on it would fail WSAENOTSOCK.
+    fn init(port_wanted: u16, io: std.Io) !Listener {
+        net.sys.ensureWsa();
+        const lfd = try net.sys.socketFam(std.posix.AF.INET);
+        errdefer net.sys.closeFd(lfd);
+        const sa = net.sys.loopbackIn(std.mem.nativeToBig(u16, port_wanted));
+        try net.sys.bindFd(lfd, &sa, @sizeOf(@TypeOf(sa)));
+        try net.sys.listenFd(lfd, 4);
+        // Non-blocking accept: WouldBlock surfaces between attempts and the
+        // loop can check `stop`.
+        try net.sys.setNonblocking(lfd);
+        return .{ .lfd = lfd, .io = io };
     }
 
     fn port(self: *const Listener) u16 {
-        return self.server.socket.address.getPort();
+        return net.sys.boundPort(self.lfd);
     }
 
     fn close(self: *Listener) void {
         if (self.closed) return;
         self.closed = true;
         self.stop.store(true, .release);
-        self.server.deinit(self.io);
+        net.sys.closeFd(self.lfd);
     }
 };
 
@@ -171,7 +174,7 @@ fn readUntilType(cfd: std.posix.socket_t, view: *ServerView, want: u8, deadline_
     var len: usize = 0;
     var waited: u32 = 0;
     while (waited < deadline_ms) {
-        const n = std.posix.read(cfd, buf[len..]) catch |e| switch (e) {
+        const n = net.sys.readFd(cfd, buf[len..]) catch |e| switch (e) {
             error.WouldBlock => {
                 _ = sleepMs(1);
                 waited += 1;
@@ -179,7 +182,6 @@ fn readUntilType(cfd: std.posix.socket_t, view: *ServerView, want: u8, deadline_
             },
             else => return false,
         };
-        if (n == 0) return false;
         view.bytes_read += n;
         len += n;
         var off: usize = 0;
@@ -199,32 +201,28 @@ fn readUntilType(cfd: std.posix.socket_t, view: *ServerView, want: u8, deadline_
 }
 
 fn scriptedServer(listener: *Listener, script: ServerScript, view: *ServerView) void {
-    const lfd = listener.server.socket.handle;
+    const lfd = listener.lfd;
     // Shrink the receive window *before* accept: on both macOS and Linux the
     // accepted socket inherits it, so the client's uploads hit backpressure
     // after a predictable amount of audio rather than an unpredictable amount.
-    std.posix.setsockopt(lfd, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, &std.mem.toBytes(script.recv_buf_bytes)) catch {};
+    net.sys.setSockOptInt(lfd, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, script.recv_buf_bytes) catch {};
 
     const cfd: std.posix.socket_t = cfd: {
         var waits: u32 = 0;
         while (true) {
             if (listener.stop.load(.acquire)) return;
-            var fds = [_]std.posix.pollfd{.{ .fd = lfd, .events = std.posix.POLL.IN, .revents = 0 }};
-            const n = std.posix.poll(&fds, 1) catch return;
-            if (n == 0) {
+            const ev = net.sys.pollOne(lfd, true, false, 0) catch return;
+            if (!ev.in) {
                 waits += 1;
                 if (waits > accept_deadline_waits) return;
+                _ = sleepMs(1); // same reason as acceptOne: the budget is priced in ms
                 continue;
             }
-            const rc = std.posix.system.accept(lfd, null, null);
-            switch (std.posix.errno(rc)) {
-                .SUCCESS => break :cfd @intCast(rc),
-                .INTR, .AGAIN => continue,
-                else => return,
-            }
+            if (net.sys.acceptFd(lfd)) |a| break :cfd a;
+            continue;
         }
     };
-    defer _ = std.posix.errno(std.posix.system.close(cfd));
+    defer net.sys.closeFd(cfd);
 
     // Set O_NONBLOCK on the ACCEPTED socket, explicitly.
     //
@@ -241,20 +239,15 @@ fn scriptedServer(listener: *Listener, script: ServerScript, view: *ServerView) 
     // happily until the client writes or hangs up, so the blocking socket never
     // costs it anything. This harness has to *stop* reading for a while and
     // then start again, and only a non-blocking socket can do that.
-    {
-        var o: std.c.O = @bitCast(@as(u32, @intCast(std.c.fcntl(cfd, std.c.F.GETFL, @as(c_int, 0)))));
-        o.NONBLOCK = true;
-        _ = std.c.fcntl(cfd, std.c.F.SETFL, @as(c_int, @bitCast(o)));
-    }
+    net.sys.setNonblocking(cfd) catch {};
 
     // Abort on close (RST, not FIN): this server sends the first FIN, so a clean
     // close parks the port in TIME_WAIT for ~15-30 s and a long test run
     // exhausts the ephemeral range (that is what hung proto_fuzz's deep hunt).
-    const li = std.posix.linger{ .onoff = 1, .linger = 0 };
-    std.posix.setsockopt(cfd, std.posix.SOL.SOCKET, std.posix.SO.LINGER, &std.mem.toBytes(li)) catch {};
+    net.sys.lingerAbort(cfd);
     // Zig does not ignore SIGPIPE for us.
     if (builtin.os.tag == .macos) {
-        std.posix.setsockopt(cfd, std.posix.SOL.SOCKET, std.posix.SO.NOSIGPIPE, &std.mem.toBytes(@as(c_int, 1))) catch {};
+        net.sys.setSockOptInt(cfd, std.posix.SOL.SOCKET, std.posix.SO.NOSIGPIPE, 1) catch {};
     }
 
     // Handshake: challenge -> (read the 0x80) -> auth ok -> (read the 0x82).
@@ -279,18 +272,18 @@ fn scriptedServer(listener: *Listener, script: ServerScript, view: *ServerView) 
     const drain_ms = script.lifetime_ms;
     var scratch: [16384]u8 = undefined;
     while (waited_ms < drain_ms and !listener.stop.load(.acquire)) {
-        const n = std.posix.read(cfd, &scratch) catch |e| switch (e) {
+        const n = net.sys.readFd(cfd, &scratch) catch |e| switch (e) {
             error.WouldBlock => {
                 _ = sleepMs(1);
                 waited_ms += 1;
                 continue;
             },
+            error.EndOfStream => {
+                view.saw_eof = true;
+                return;
+            },
             else => return,
         };
-        if (n == 0) {
-            view.saw_eof = true;
-            return;
-        }
         view.bytes_read += n;
     }
 }
@@ -337,16 +330,12 @@ fn writeAllFrame(fd: std.posix.socket_t, bytes: []const u8) bool {
 
 fn rawSend(fd: std.posix.socket_t, bytes: []const u8) ?usize {
     if (bytes.len == 0) return 0;
-    const rc = switch (builtin.os.tag) {
-        .macos => std.posix.system.write(fd, bytes.ptr, bytes.len),
-        else => std.posix.system.send(fd, bytes.ptr, bytes.len, std.posix.MSG.NOSIGNAL),
-    };
-    switch (std.posix.errno(rc)) {
-        .SUCCESS => return @intCast(rc),
+    const n = net.sys.sendFd(fd, bytes) catch |e| switch (e) {
         // A non-blocking socket with a full buffer: "try again", not "dead".
-        .INTR, .AGAIN => return 0,
+        error.WouldBlock => return 0,
         else => return null,
-    }
+    };
+    return n;
 }
 
 /// Read whatever is available for up to `budget_ms`, counting bytes. Returns
@@ -355,18 +344,18 @@ fn drain(fd: std.posix.socket_t, view: *ServerView, budget_ms: u32) bool {
     var scratch: [16384]u8 = undefined;
     var waited: u32 = 0;
     while (waited <= budget_ms) {
-        const n = std.posix.read(fd, &scratch) catch |e| switch (e) {
+        const n = net.sys.readFd(fd, &scratch) catch |e| switch (e) {
             error.WouldBlock => {
                 _ = sleepMs(1);
                 waited += 1;
                 continue;
             },
+            error.EndOfStream => {
+                view.saw_eof = true;
+                return true;
+            },
             else => return false,
         };
-        if (n == 0) {
-            view.saw_eof = true;
-            return true;
-        }
         view.bytes_read += n;
     }
     return true;
@@ -392,8 +381,8 @@ test "#14: a frame bigger than the whole socket is refused, not waited on" {
     const io = harnessIo();
     const fds = try socketPair(8192);
     defer {
-        _ = std.posix.errno(std.posix.system.close(fds[0]));
-        _ = std.posix.errno(std.posix.system.close(fds[1]));
+        net.sys.closeFd(fds[0]);
+        net.sys.closeFd(fds[1]);
     }
     var conn = net.Conn{ .io = io, .fd = fds[0] };
 
@@ -491,8 +480,7 @@ fn runScriptedSession(script: ServerScript, opts: session.Options) !TimedRun {
     const alloc = std.testing.allocator;
     const io = harnessIo();
 
-    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
-    var listener = Listener.init(try std.Io.net.IpAddress.listen(&addr, io, .{}), io);
+    var listener = try Listener.init(0, io);
     defer listener.close();
 
     var view = ServerView{};
@@ -532,16 +520,10 @@ fn toneSource() session.Source {
 /// buffer, both ends non-blocking. See the #14 tests for why this and not a
 /// loopback listener.
 fn socketPair(buf_bytes: i32) ![2]std.posix.socket_t {
-    var fds: [2]std.posix.socket_t = undefined;
-    const rc = std.posix.system.socketpair(@intCast(std.posix.AF.UNIX), @intCast(std.posix.SOCK.STREAM), 0, &fds);
-    if (std.posix.errno(rc) != .SUCCESS) return error.SocketPairFailed;
-    std.posix.setsockopt(fds[0], std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, &std.mem.toBytes(buf_bytes)) catch {};
-    std.posix.setsockopt(fds[1], std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, &std.mem.toBytes(buf_bytes)) catch {};
-    for (fds) |fd| {
-        var o: std.c.O = @bitCast(@as(u32, @intCast(std.c.fcntl(fd, std.c.F.GETFL, @as(c_int, 0)))));
-        o.NONBLOCK = true;
-        _ = std.c.fcntl(fd, std.c.F.SETFL, @as(c_int, @bitCast(o)));
-    }
+    const fds = try net.sys.socketpair();
+    net.sys.setSockOptInt(fds[0], std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, buf_bytes) catch {};
+    net.sys.setSockOptInt(fds[1], std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, buf_bytes) catch {};
+    for (fds) |fd| net.sys.setNonblocking(fd) catch {};
     return fds;
 }
 
@@ -550,11 +532,8 @@ fn socketPair(buf_bytes: i32) ![2]std.posix.socket_t {
 fn fillUntilBlocked(fd: std.posix.socket_t, buf: []const u8) usize {
     var total: usize = 0;
     while (true) {
-        const rc = std.posix.system.write(fd, buf.ptr, buf.len);
-        switch (std.posix.errno(rc)) {
-            .SUCCESS => total += @intCast(rc),
-            else => return total,
-        }
+        const n = net.sys.sendFd(fd, buf) catch return total;
+        total += n;
     }
 }
 
@@ -588,8 +567,8 @@ test "#14: a half-full socket declines the frame with zero bytes on the wire" {
     const io = harnessIo();
     const fds = try socketPair(8192);
     defer {
-        _ = std.posix.errno(std.posix.system.close(fds[0]));
-        _ = std.posix.errno(std.posix.system.close(fds[1]));
+        net.sys.closeFd(fds[0]);
+        net.sys.closeFd(fds[1]);
     }
     var conn = net.Conn{ .io = io, .fd = fds[0] };
 
@@ -613,30 +592,45 @@ test "#14: a half-full socket declines the frame with zero bytes on the wire" {
 
     var payload: [16367]u8 = undefined;
     @memset(&payload, 0x5A);
-    const room = conn.sendRoom().?;
+    const room = conn.sendRoom() orelse 0;
     std.debug.print(
         \\  #14 half-full  {d} of {d} bytes queued, {d} reported free, POLLOUT={any}, {d}-byte frame
         \\
     , .{ absorbed - drained, absorbed, room, conn.writable(), payload.len + 5 });
     // room to spare, and not enough for the frame: exactly the condition in
-    // which the old code put a header on the wire and a fragment of its body
-    try std.testing.expect(room > 0);
-    try std.testing.expect(room < 5 + payload.len);
+    // which the old code put a header on the wire and a fragment of its body.
+    //
+    // Winsock has no queue-depth primitive (`SO_SNDBUF` there is advisory, not
+    // a bound — the kernel accepts megabytes past the pin) so `sendRoom` is
+    // null and the pre-check is skipped; the `.partial` backstop is what
+    // stands between the wire and a torn frame. The outcome is therefore not
+    // pinned — `.declined` and `.sent` are both correct — but what it must
+    // never be is `.partial`, and the byte count below verifies the promise
+    // that makes: the wire got the frame whole or not at all.
+    if (builtin.os.tag != .windows) {
+        try std.testing.expect(room > 0);
+        try std.testing.expect(room < 5 + payload.len);
+    }
 
     const outcome = try conn.sendMessageBounded(proto.MSG_UPLOAD_INTERVAL_WRITE, &payload, session.upload_write_budget_ms);
     std.debug.print("  -> {any}\n", .{outcome});
-    try std.testing.expectEqual(net.SendOutcome.declined, outcome);
+    if (builtin.os.tag == .windows) {
+        try std.testing.expect(outcome != .partial);
+    } else {
+        try std.testing.expectEqual(net.SendOutcome.declined, outcome);
+    }
 
-    // The assertion that was missing: not one byte of that frame crossed the
-    // wire. A lone header is already enough to do the damage, because the peer
-    // will believe the 16 KiB that follows it.
+    // The assertion that was missing: the frame crossed the wire whole or not
+    // at all. A lone header is already enough to do the damage, because the
+    // peer will believe the 16 KiB that follows it.
     //
     // Counted against the junk rather than a fixed number: everything the
-    // harness wrote, and nothing else, may be read back.
+    // harness wrote — plus the frame if it was accepted — may be read back.
+    const want = absorbed + @as(usize, if (outcome == .sent) 5 + payload.len else 0);
     var seen: usize = drained;
     var stalls: u32 = 0;
-    while (seen < absorbed and stalls < 2000) {
-        const n = std.posix.read(fds[1], sink[0..]) catch |e| switch (e) {
+    while (seen < want and stalls < 2000) {
+        const n = net.sys.readFd(fds[1], sink[0..]) catch |e| switch (e) {
             error.WouldBlock => {
                 stalls += 1;
                 _ = sleepMs(1);
@@ -644,12 +638,11 @@ test "#14: a half-full socket declines the frame with zero bytes on the wire" {
             },
             else => break,
         };
-        if (n == 0) break;
         seen += n;
         stalls = 0;
     }
-    std.debug.print("  peer received {d} bytes; the harness wrote {d}, so the frame contributed {d}\n", .{ seen, absorbed, seen -| absorbed });
-    try std.testing.expectEqual(absorbed, seen);
+    std.debug.print("  peer received {d} bytes; expected {d}, so the frame contributed {d}\n", .{ seen, want, seen -| absorbed });
+    try std.testing.expectEqual(want, seen);
 }
 
 // #14: the same claim end to end, on the socket the session actually uses, and
@@ -671,8 +664,8 @@ test "#14: a refused frame leaves the peer's byte stream still frame-aligned" {
     const io = harnessIo();
     const fds = try tcpPairBuffered(65536, 4096);
     defer {
-        _ = std.posix.errno(std.posix.system.close(fds[0]));
-        _ = std.posix.errno(std.posix.system.close(fds[1]));
+        net.sys.closeFd(fds[0]);
+        net.sys.closeFd(fds[1]);
     }
     var conn = net.Conn{ .io = io, .fd = fds[0] };
 
@@ -696,8 +689,12 @@ test "#14: a refused frame leaves the peer's byte stream still frame-aligned" {
         \\
     , .{ queued / frame.len, room, head_len, payload.len + 5, outcome });
     // The one outcome that is not allowed. `.declined` and `.sent` are both
-    // safe; only a torn frame desynchronises the peer.
+    // safe; only a torn frame desynchronises the peer. On Windows the room
+    // oracle is null (SO_SNDBUF is advisory there, not a bound), so `.sent`
+    // is the usual outcome — the expectation below accounts for the frame's
+    // bytes either way.
     try std.testing.expect(outcome != .partial);
+    const want_total = queued + @as(usize, if (outcome == .sent) 5 + payload.len else 0);
 
     // Read the peer's stream and parse it the way the server's parser does:
     // one type byte, a little-endian length, that many payload bytes, repeat.
@@ -707,18 +704,18 @@ test "#14: a refused frame leaves the peer's byte stream still frame-aligned" {
     // The two buffers are one stream: the helper above already read the first
     // `head_len` bytes off the wire, so they are put back in front before
     // parsing.
-    const sink = try std.testing.allocator.alloc(u8, 512_000);
+    const sink = try std.testing.allocator.alloc(u8, @max(512_000, want_total));
     defer std.testing.allocator.free(sink);
     var seen: usize = 0;
     var stalls: u32 = 0;
-    // Read until the peer has everything the sender wrote — exactly `queued`
-    // bytes, because the frame contributed none. A fixed stall budget is the
-    // wrong stopping rule: on a loaded runner the backlog can sit unsent for
-    // longer than any budget you pick, and stopping early truncates the stream
-    // mid-frame and reports a torn frame that never happened. Knowing the
-    // expected total removes the question.
-    while (head_len + seen < queued and head_len + seen < sink.len and stalls < 2000) {
-        const n = std.posix.read(fds[1], sink[head_len + seen ..]) catch |e| switch (e) {
+    // Read until the peer has everything the sender wrote — the junk, plus the
+    // frame if it was accepted. A fixed stall budget is the wrong stopping
+    // rule: on a loaded runner the backlog can sit unsent for longer than any
+    // budget you pick, and stopping early truncates the stream mid-frame and
+    // reports a torn frame that never happened. Knowing the expected total
+    // removes the question.
+    while (head_len + seen < want_total and head_len + seen < sink.len and stalls < 2000) {
+        const n = net.sys.readFd(fds[1], sink[head_len + seen ..]) catch |e| switch (e) {
             // Not "no more data", just "not right now": the sender still has
             // bytes in flight and will hand them over as ACKs come back.
             error.WouldBlock => {
@@ -728,7 +725,6 @@ test "#14: a refused frame leaves the peer's byte stream still frame-aligned" {
             },
             else => break,
         };
-        if (n == 0) break;
         seen += n;
         stalls = 0;
     }
@@ -744,19 +740,31 @@ test "#14: a refused frame leaves the peer's byte stream still frame-aligned" {
     // the one with a non-zero `head_len` could see it.
     @memcpy(sink[0..head_len], head[0..head_len]);
     const total = head_len + seen;
-    try std.testing.expectEqual(queued, total); // the frame contributed nothing
+    try std.testing.expectEqual(want_total, total); // the frame contributed whole bytes or nothing
 
     // The junk is whole frames plus at most one partial frame, by construction,
-    // so the frame count and the residue are both known in advance. A torn
-    // *upload* is what would break them: its declared length would run past the
-    // end of what arrived, eating the frames behind it, so the walk would
-    // report fewer frames and a larger residue than went in.
-    const residue = total % frame.len;
-    const w = walkFrames(sink[0..total]);
+    // so its frame count and residue are both known in advance. A torn
+    // *upload* is what would break them: its declared length would run past
+    // the end of what arrived, eating the frames behind it, so the walk would
+    // report fewer frames and a larger residue than went in. The walk runs on
+    // the junk prefix: when the upload was accepted, the junk's partial tail
+    // is not a stream tail any more, and mid-stream the walker would read it
+    // as a bogus header — a mis-parse the writer didn't cause.
+    const w = walkFrames(sink[0..queued]);
     std.debug.print("  {d} bytes walked as {d} whole frames, {d}-byte filler remainder\n", .{ total, w.frames, w.residue });
     try std.testing.expectEqual(queued / frame.len, w.frames);
-    try std.testing.expectEqual(residue, w.residue);
+    try std.testing.expectEqual(queued % frame.len, w.residue);
     try std.testing.expect(w.frames > 0);
+    if (outcome == .sent) {
+        // `.sent` promises whole-or-nothing: the upload frame must be the
+        // final bytes of the stream, verbatim — header intact, payload
+        // untouched.
+        const flen = 5 + payload.len;
+        const tail = sink[total - flen .. total];
+        try std.testing.expectEqual(proto.MSG_UPLOAD_INTERVAL_WRITE, tail[0]);
+        try std.testing.expectEqual(@as(u32, @intCast(payload.len)), std.mem.readInt(u32, tail[1..5], .little));
+        for (tail[5..]) |b| try std.testing.expectEqual(@as(u8, 0x5A), b);
+    }
 }
 
 /// A connected TCP pair on loopback whose client end has a pinned send buffer
@@ -779,58 +787,39 @@ fn tcpPair(snd_buf_bytes: i32) ![2]std.posix.socket_t {
 }
 
 fn tcpPairBuffered(snd_buf_bytes: i32, rcv_buf_bytes: i32) ![2]std.posix.socket_t {
-    const lfd: std.posix.socket_t = @intCast(std.posix.system.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, std.posix.IPPROTO.TCP));
-    errdefer _ = std.posix.errno(std.posix.system.close(lfd));
-    var lo: std.c.O = @bitCast(@as(u32, @intCast(std.c.fcntl(lfd, std.c.F.GETFL, @as(c_int, 0)))));
-    lo.NONBLOCK = true;
-    _ = std.c.fcntl(lfd, std.c.F.SETFL, @as(c_int, @bitCast(lo)));
+    net.sys.ensureWsa();
+    const lfd = try net.sys.socketFam(std.posix.AF.INET);
+    errdefer net.sys.closeFd(lfd);
+    net.sys.setNonblocking(lfd) catch {};
+    const sa = net.sys.loopbackIn(0); // let the kernel choose
+    try net.sys.bindFd(lfd, &sa, @sizeOf(@TypeOf(sa)));
+    try net.sys.listenFd(lfd, 1);
 
-    var sa: std.posix.sockaddr.in = std.mem.zeroes(std.posix.sockaddr.in);
-    sa.family = std.posix.AF.INET;
-    sa.port = 0; // let the kernel choose
-    sa.addr = @bitCast(@as([4]u8, .{ 127, 0, 0, 1 }));
-    if (std.posix.errno(std.posix.system.bind(lfd, @ptrCast(&sa), @sizeOf(@TypeOf(sa)))) != .SUCCESS) return error.BindFailed;
-    if (std.posix.errno(std.posix.system.listen(lfd, 1)) != .SUCCESS) return error.ListenFailed;
-    var bound: std.posix.sockaddr.in = undefined;
-    var blen: std.posix.socklen_t = @sizeOf(@TypeOf(bound));
-    _ = std.posix.system.getsockname(lfd, @ptrCast(&bound), &blen);
+    const cfd = try net.sys.socketFam(std.posix.AF.INET);
+    errdefer net.sys.closeFd(cfd);
+    net.sys.setNonblocking(cfd) catch {};
+    net.sys.setSockOptInt(cfd, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, snd_buf_bytes) catch {};
+    const bound = net.sys.loopbackIn(std.mem.nativeToBig(u16, net.sys.boundPort(lfd)));
+    net.sys.connectNow(cfd, &bound, @sizeOf(@TypeOf(bound))) catch return error.ConnectFailed;
 
-    const cfd: std.posix.socket_t = @intCast(std.posix.system.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, std.posix.IPPROTO.TCP));
-    errdefer _ = std.posix.errno(std.posix.system.close(cfd));
-    var co: std.c.O = @bitCast(@as(u32, @intCast(std.c.fcntl(cfd, std.c.F.GETFL, @as(c_int, 0)))));
-    co.NONBLOCK = true;
-    _ = std.c.fcntl(cfd, std.c.F.SETFL, @as(c_int, @bitCast(co)));
-    std.posix.setsockopt(cfd, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, &std.mem.toBytes(snd_buf_bytes)) catch {};
-    switch (std.posix.errno(std.posix.system.connect(cfd, @ptrCast(&bound), @sizeOf(@TypeOf(bound))))) {
-        .SUCCESS, .INPROGRESS, .INTR => {},
-        else => return error.ConnectFailed,
-    }
-
-    var afd: std.posix.socket_t = -1;
+    var afd: ?net.sys.Fd = null;
     var waited: u32 = 0;
-    while (afd < 0 and waited < 2000) {
-        var ca: std.posix.sockaddr.in = undefined;
-        var cl: std.posix.socklen_t = @sizeOf(@TypeOf(ca));
-        const a = std.posix.system.accept(lfd, @ptrCast(&ca), &cl);
-        switch (std.posix.errno(a)) {
-            .SUCCESS => afd = @intCast(a),
-            else => {
-                waited += 1;
-                _ = sleepMs(1);
-            },
+    while (afd == null and waited < 2000) {
+        afd = net.sys.acceptFd(lfd);
+        if (afd == null) {
+            waited += 1;
+            _ = sleepMs(1);
         }
     }
-    _ = std.posix.errno(std.posix.system.close(lfd));
-    if (afd < 0) return error.AcceptFailed;
-    var ao: std.c.O = @bitCast(@as(u32, @intCast(std.c.fcntl(afd, std.c.F.GETFL, @as(c_int, 0)))));
-    ao.NONBLOCK = true;
-    _ = std.c.fcntl(afd, std.c.F.SETFL, @as(c_int, @bitCast(ao)));
+    net.sys.closeFd(lfd);
+    const a = afd orelse return error.AcceptFailed;
+    net.sys.setNonblocking(a) catch {};
     // Pinned so the peer cannot quietly absorb the whole sender queue: see
     // `waitForPartialRoom`. Loopback has been measured ignoring SO_RCVBUF on a
     // *listening* socket, which is why the handoff accepts and this is set on the
     // accepted fd instead.
-    std.posix.setsockopt(afd, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, &std.mem.toBytes(rcv_buf_bytes)) catch {};
-    return .{ cfd, afd };
+    net.sys.setSockOptInt(a, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, rcv_buf_bytes) catch {};
+    return .{ cfd, a };
 }
 
 /// Drive a saturated connection into a *partially* full state — some room, less
@@ -986,9 +975,7 @@ test "#14: a torn frame is visible to the frame walk" {
 fn fillWithWholeFrames(fd: std.posix.socket_t, frame: []u8) usize {
     var total: usize = 0;
     while (true) {
-        const n = std.posix.system.write(fd, frame.ptr, frame.len);
-        if (std.posix.errno(n) != .SUCCESS) return total;
-        const w: usize = @intCast(n);
+        const w = net.sys.sendFd(fd, frame) catch return total;
         total += w;
         if (w < frame.len) return total; // a partial frame, and nothing after it
     }
@@ -1006,7 +993,7 @@ fn waitForPartialRoom(conn: *net.Conn, peer: std.posix.socket_t, frame_bytes: us
     // non-zero everywhere, so there is one code path and it is the hard one.
     while (spins < 400_000) : (spins += 1) {
         if (head_len.* < head.len) {
-            const n = std.posix.read(peer, head[head_len.*..][0..1]) catch 0;
+            const n = net.sys.readFd(peer, head[head_len.*..][0..1]) catch 0;
             head_len.* += n;
         }
         const room = conn.sendRoom() orelse return 0;
@@ -1018,7 +1005,7 @@ fn waitForPartialRoom(conn: *net.Conn, peer: std.posix.socket_t, frame_bytes: us
 fn drainSocket(fd: std.posix.socket_t, buf: []u8) usize {
     var total: usize = 0;
     while (total < buf.len) {
-        const n = std.posix.read(fd, buf) catch break;
+        const n = net.sys.readFd(fd, buf) catch break;
         if (n == 0) break;
         total += n;
     }
@@ -1138,8 +1125,8 @@ test "#14: a full socket fails the write immediately instead of blocking forever
     const io = harnessIo();
     const fds = try socketPair(4096);
     defer {
-        _ = std.posix.errno(std.posix.system.close(fds[0]));
-        _ = std.posix.errno(std.posix.system.close(fds[1]));
+        net.sys.closeFd(fds[0]);
+        net.sys.closeFd(fds[1]);
     }
     var conn = net.Conn{ .io = io, .fd = fds[0] };
 
@@ -1203,11 +1190,28 @@ test "#14: sendRoom is never optimistic about the room it promises" {
     const io = harnessIo();
     const fds = try tcpPair(65536);
     defer {
-        _ = std.posix.errno(std.posix.system.close(fds[0]));
-        _ = std.posix.errno(std.posix.system.close(fds[1]));
+        net.sys.closeFd(fds[0]);
+        net.sys.closeFd(fds[1]);
     }
     var conn = net.Conn{ .io = io, .fd = fds[0] };
-    const room = conn.sendRoom() orelse return error.SendRoomUnavailable;
+    const room_or_null = conn.sendRoom();
+    if (room_or_null == null) {
+        // Windows reports "unknown" here: Winsock has no queue-depth
+        // primitive, and `SO_SNDBUF` is advisory rather than a bound there —
+        // reporting the pin as the room would be exactly the optimistic guess
+        // this test exists to prevent. `null` is the honest answer, and the
+        // sendMessageBounded `.partial` backstop is the guarantee that takes
+        // over. What stays provable on a fresh socket: a maximum-size frame
+        // still goes out whole.
+        const payload = try std.testing.allocator.alloc(u8, net.max_payload);
+        defer std.testing.allocator.free(payload);
+        @memset(payload, 0x3C);
+        const outcome = try conn.sendMessageBounded(proto.MSG_UPLOAD_INTERVAL_WRITE, payload, session.upload_write_budget_ms);
+        std.debug.print("  #14 sendRoom  null (no oracle) -> a {d}-byte frame went {any}\n", .{ payload.len + 5, outcome });
+        try std.testing.expectEqual(net.SendOutcome.sent, outcome);
+        return;
+    }
+    const room = room_or_null.?;
     std.debug.print("  #14 sendRoom  fresh socket reports {d} bytes free\n", .{room});
     try std.testing.expect(room > net.max_payload);
 
@@ -1317,32 +1321,32 @@ fn prepAccepted(cfd: std.posix.socket_t) void {
     // mid-suite. The killed connections here close FIRST, though, so linger-0
     // (RST) is deliberately NOT set — the tests want the clean-FIN
     // EndOfStream the incident actually produced.
-    var o: std.c.O = @bitCast(@as(u32, @intCast(std.c.fcntl(cfd, std.c.F.GETFL, @as(c_int, 0)))));
-    o.NONBLOCK = true;
-    _ = std.c.fcntl(cfd, std.c.F.SETFL, @as(c_int, @bitCast(o)));
+    net.sys.setNonblocking(cfd) catch {};
     if (builtin.os.tag == .macos) {
-        std.posix.setsockopt(cfd, std.posix.SOL.SOCKET, std.posix.SO.NOSIGPIPE, &std.mem.toBytes(@as(c_int, 1))) catch {};
+        net.sys.setSockOptInt(cfd, std.posix.SOL.SOCKET, std.posix.SO.NOSIGPIPE, 1) catch {};
     }
 }
 
 fn acceptOne(listener: *Listener) ?std.posix.socket_t {
-    const lfd = listener.server.socket.handle;
+    const lfd = listener.lfd;
     var waits: u32 = 0;
     while (true) {
         if (listener.stop.load(.acquire)) return null;
-        var fds = [_]std.posix.pollfd{.{ .fd = lfd, .events = std.posix.POLL.IN, .revents = 0 }};
-        const n = std.posix.poll(&fds, 1) catch return null;
-        if (n == 0) {
+        const ev = net.sys.pollOne(lfd, true, false, 0) catch return null;
+        if (!ev.in) {
             waits += 1;
             if (waits > accept_deadline_waits) return null;
+            // the 1 ms the budget is priced in: without it 2000 polls is a
+            // handful of microseconds, and a reconnect dial that lands while
+            // the previous connection is still draining outlives the whole
+            // wait — the server thread then exits with the new conn sitting
+            // accepted-but-unserved in the backlog, and the client stalls
+            // out. Windows thread timing hits it every run.
+            _ = sleepMs(1);
             continue;
         }
-        const rc = std.posix.system.accept(lfd, null, null);
-        switch (std.posix.errno(rc)) {
-            .SUCCESS => return @intCast(rc),
-            .INTR, .AGAIN => continue,
-            else => return null,
-        }
+        if (net.sys.acceptFd(lfd)) |a| return a;
+        continue;
     }
 }
 
@@ -1353,7 +1357,7 @@ fn readUploadBegins(cfd: std.posix.socket_t, view: *ReconnectView, conn_idx: usi
     var len: usize = 0;
     var waited: u32 = 0;
     while (waited < deadline_ms) {
-        const n = std.posix.read(cfd, buf[len..]) catch |e| switch (e) {
+        const n = net.sys.readFd(cfd, buf[len..]) catch |e| switch (e) {
             error.WouldBlock => {
                 _ = sleepMs(1);
                 waited += 1;
@@ -1361,7 +1365,6 @@ fn readUploadBegins(cfd: std.posix.socket_t, view: *ReconnectView, conn_idx: usi
             },
             else => return false,
         };
-        if (n == 0) return false;
         view.generic.bytes_read += n;
         len += n;
         var off: usize = 0;
@@ -1409,18 +1412,18 @@ fn drainSilently(cfd: std.posix.socket_t, view: *ReconnectView, conn_idx: usize,
             if (!sendFrame(cfd, proto.MSG_KEEPALIVE, "")) return;
             last_ping_ms = now_ms;
         }
-        const n = std.posix.read(cfd, buf[len..]) catch |e| switch (e) {
+        const n = net.sys.readFd(cfd, buf[len..]) catch |e| switch (e) {
             error.WouldBlock => {
                 _ = sleepMs(1);
                 waited += 1;
                 continue;
             },
+            error.EndOfStream => {
+                view.generic.saw_eof = true;
+                return;
+            },
             else => return,
         };
-        if (n == 0) {
-            view.generic.saw_eof = true;
-            return;
-        }
         view.generic.bytes_read += n;
         len += n;
         var off: usize = 0;
@@ -1445,25 +1448,33 @@ fn reconnectServer(listener: *Listener, script: ReconnectScript, view: *Reconnec
         view.conn_count = conn_idx + 1;
 
         if (!sendFrame(cfd, proto.MSG_AUTH_CHALLENGE, &challengePayloadKeepalive(script.keepalive_s))) {
-            _ = std.posix.errno(std.posix.system.close(cfd));
+            net.sys.closeFd(cfd);
             return;
         }
         if (!readUntilType(cfd, &view.generic, 0x80, 2000)) {
-            _ = std.posix.errno(std.posix.system.close(cfd));
+            net.sys.closeFd(cfd);
             return;
         }
         if (!sendFrame(cfd, proto.MSG_AUTH_REPLY, &authReplyPayload("kujamba", 8))) {
-            _ = std.posix.errno(std.posix.system.close(cfd));
+            net.sys.closeFd(cfd);
             return;
         }
         if (!readUntilType(cfd, &view.generic, 0x82, 2000)) {
-            _ = std.posix.errno(std.posix.system.close(cfd));
+            net.sys.closeFd(cfd);
             return;
         }
         if (!sendFrame(cfd, proto.MSG_CONFIG_CHANGE_NOTIFY, &configPayload(script.bpm, script.bpi))) {
-            _ = std.posix.errno(std.posix.system.close(cfd));
+            net.sys.closeFd(cfd);
             return;
         }
+
+        // Close the listener before the scripted game begins: a dead server's
+        // port must refuse the client's reconnect dials. Waiting until the
+        // script step completes leaves the listener open through the drain
+        // windows below, and a dial that lands in its backlog completes a
+        // TCP handshake — a "rejoin" that was never accepted — on thread
+        // timing Windows hits reliably.
+        if (script.close_listener_at_end and conn_idx + 1 == script.conns.len) listener.close();
 
         switch (step) {
             // An early false from readUploadBegins means the CLIENT hung up
@@ -1472,26 +1483,38 @@ fn reconnectServer(listener: *Listener, script: ReconnectScript, view: *Reconnec
             // the client is about to dial the next connection, so move on.
             .close_after_uploads => |want| {
                 if (!readUploadBegins(cfd, view, conn_idx, want, script.lifetime_ms)) {
-                    _ = std.posix.errno(std.posix.system.close(cfd));
+                    net.sys.closeFd(cfd);
                     continue;
                 }
                 // clean FIN, deliberately: the client must read EndOfStream,
                 // the exact symptom the #28 incident logged
-                _ = std.posix.errno(std.posix.system.close(cfd));
+                net.sys.shutdownWrite(cfd);
+                // Winsock answers close-with-unread-inbound with an RST —
+                // the client would read ConnectionResetByPeer, not EOF — so
+                // drain until the client's own FIN arrives (it closes when it
+                // sees ours). Bounded: a wedged client must not hang the test.
+                drainSilently(cfd, view, conn_idx, 3000, 0);
+                net.sys.closeFd(cfd);
                 if (script.close_listener_at_end and conn_idx + 1 == script.conns.len) listener.close();
             },
             .silent_ms => |ms| {
                 if (!readUploadBegins(cfd, view, conn_idx, 1, script.lifetime_ms)) {
-                    _ = std.posix.errno(std.posix.system.close(cfd));
+                    net.sys.closeFd(cfd);
                     continue;
                 }
                 // ka_s = 0: this connection is the deliberate silence
                 drainSilently(cfd, view, conn_idx, ms, 0);
-                _ = std.posix.errno(std.posix.system.close(cfd));
+                // FIN then drain, as above: a plain close with the client's
+                // uploads still in flight is an RST on Windows.
+                net.sys.shutdownWrite(cfd);
+                drainSilently(cfd, view, conn_idx, 3000, 0);
+                net.sys.closeFd(cfd);
             },
             .drain => {
                 drainSilently(cfd, view, conn_idx, script.lifetime_ms, script.keepalive_s);
-                _ = std.posix.errno(std.posix.system.close(cfd));
+                net.sys.shutdownWrite(cfd);
+                drainSilently(cfd, view, conn_idx, 3000, 0);
+                net.sys.closeFd(cfd);
             },
         }
     }
@@ -1508,8 +1531,7 @@ fn runReconnect(script: ReconnectScript, opts_in: session.Options) !ReconnectRun
     const alloc = std.testing.allocator;
     const io = harnessIo();
 
-    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
-    var listener = Listener.init(try std.Io.net.IpAddress.listen(&addr, io, .{}), io);
+    var listener = try Listener.init(0, io);
     defer listener.close();
 
     var view = ReconnectView{};
