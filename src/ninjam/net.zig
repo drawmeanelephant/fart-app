@@ -445,7 +445,7 @@ pub const sys = switch (builtin.os.tag) {
                         // a 0-byte write accepted nothing — same handling as
                         // EAGAIN so write loops don't spin
                         if (n == 0) return error.WouldBlock;
-                        return n;
+                        return @intCast(n);
                     },
                     .AGAIN => return error.WouldBlock,
                     .INTR => continue,
