@@ -29,8 +29,11 @@
 #   zig build -Doptimize=ReleaseSafe       (the installed binaries the smoke runs)
 #   smoke: kujamba render -> check-ogg, the silence negative control must FAIL
 #
-# Windows is intentionally absent: it needs a Winsock shim + a console handler,
-# which #25 scopes as a separate job (the blocking gaps live in the issue).
+# build-test-windows covers the same steps minus the demo (the demo needs the
+# reference ninjamsrv build, which stays POSIX). The Winsock port that makes
+# it possible is #25's Windows work: `net.zig` keeps a real sys seam
+# (WSAStartup/WSAPoll/ioctlsocket on Windows, std.posix elsewhere) rather than
+# faking POSIX on top of Windows.
 name: ci
 
 on:
@@ -150,6 +153,69 @@ jobs:
             exit 1
           fi
           echo "kujamba smoke ok"
+
+  build-test-windows:
+    name: build-test-windows
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Zig (direct tarball from ziglang.org)
+        shell: bash
+        run: |
+          set -euo pipefail
+          tarball="zig-x86_64-windows-${ZIG_VERSION}.zip"
+          url="https://ziglang.org/download/${ZIG_VERSION}/${tarball}"
+          echo "downloading $url"
+          curl -fsSL "$url" -o "$tarball"
+          # checksum from https://ziglang.org/download/index.json
+          echo "68659eb5f1e4eb1437a722f1dd889c5a322c9954607f5edcf337bc3684a75a7e  ${tarball}" | sha256sum -c -
+          tar -xf "$tarball"
+          echo "${GITHUB_WORKSPACE}/zig-x86_64-windows-${ZIG_VERSION}" >> "$GITHUB_PATH"
+
+      - name: zig version
+        shell: bash
+        run: zig version
+
+      - name: zig build
+        shell: bash
+        run: zig build
+
+      - name: zig build test
+        shell: bash
+        run: zig build test
+
+      - name: zig build test (ReleaseSafe)
+        shell: bash
+        run: zig build test -Doptimize=ReleaseSafe
+
+      - name: zig build (ReleaseSafe)
+        shell: bash
+        run: zig build -Doptimize=ReleaseSafe
+
+      - name: smoke — kujamba runs on this OS (ReleaseSafe binaries)
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./zig-out/bin/kujamba render --phrase "kujamba karibu" --out /tmp/smoke.ogg --seed 1
+          ./zig-out/bin/kujamba check-ogg /tmp/smoke.ogg
+          ./zig-out/bin/kujamba encode-silence /tmp/silence.ogg
+          if ./zig-out/bin/kujamba check-ogg /tmp/silence.ogg; then
+            echo "negative control should have failed: silence passed check-ogg"
+            exit 1
+          fi
+          echo "kujamba smoke ok"
+
+      - name: smoke — the fart app runs on Windows
+        shell: bash
+        run: |
+          set -euo pipefail
+          # no afplay/say on the runner: the probe puts the butt in silent
+          # mode, which is exactly the graceful path #25 requires
+          ./zig-out/bin/fart kujamba karibu > /dev/null
+          echo "fart smoke ok"
 
   demo-e2e:
     name: demo-e2e

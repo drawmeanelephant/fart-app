@@ -60,6 +60,8 @@ const builtin = @import("builtin");
 const session = @import("ninjam/session.zig");
 const proto = @import("ninjam/proto.zig");
 const vorbis = @import("ninjam/vorbis.zig");
+const netmod = @import("ninjam/net.zig");
+const clock = @import("ninjam/clock.zig");
 
 // ---- fuzz target ------------------------------------------------------------
 
@@ -109,8 +111,7 @@ fn runSessionAgainstStream(
     const alloc = std.testing.allocator;
     const io = harnessIo();
 
-    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
-    var listener = Listener.init(try std.Io.net.IpAddress.listen(&addr, io, .{}), io);
+    var listener = try Listener.init(0, io);
     defer listener.close();
 
     const srv = try std.Thread.spawn(.{}, server_fn, .{ &listener, stream });
@@ -173,34 +174,36 @@ fn harnessIo() std.Io {
 /// macOS does NOT wake a thread blocked in `accept` when the fd is closed, so
 /// without the stop flag a session that never connects deadlocks the join.
 const Listener = struct {
-    server: std.Io.net.Server,
+    lfd: netmod.sys.Fd,
     io: std.Io,
     closed: bool = false,
     stop: std.atomic.Value(bool) = .init(false),
 
-    fn init(server: std.Io.net.Server, io: std.Io) Listener {
-        const l = Listener{ .server = server, .io = io };
+    /// A real SOCKET listener, built through the `sys` seam: a
+    /// `std.Io.net.Server`'s handle is an AFD endpoint on Windows, not a
+    /// Winsock socket, so poll/accept on it would fail WSAENOTSOCK.
+    fn init(port_wanted: u16, io: std.Io) !Listener {
+        netmod.sys.ensureWsa();
+        const lfd = try netmod.sys.socketFam(std.posix.AF.INET);
+        errdefer netmod.sys.closeFd(lfd);
+        const sa = netmod.sys.loopbackIn(std.mem.nativeToBig(u16, port_wanted));
+        try netmod.sys.bindFd(lfd, &sa, @sizeOf(@TypeOf(sa)));
+        try netmod.sys.listenFd(lfd, 4);
         // non-blocking listener: accept() then polls the stop flag instead of
-        // blocking forever (EAGAIN surfaces as error.WouldBlock). Note
-        // std.c.O is a packed struct, and net.zig's own setNonblocking helper
-        // hardcodes Linux's 0o4000 — a silent no-op on macOS — so set the
-        // named bit through the struct instead.
-        const fd = server.socket.handle;
-        var o: std.c.O = @bitCast(@as(u32, @intCast(std.c.fcntl(fd, std.c.F.GETFL, @as(c_int, 0)))));
-        o.NONBLOCK = true;
-        _ = std.c.fcntl(fd, std.c.F.SETFL, @as(c_int, @bitCast(o)));
-        return l;
+        // blocking forever (WouldBlock surfaces as error.WouldBlock).
+        try netmod.sys.setNonblocking(lfd);
+        return .{ .lfd = lfd, .io = io };
     }
 
     fn port(self: *const Listener) u16 {
-        return self.server.socket.address.getPort();
+        return netmod.sys.boundPort(self.lfd);
     }
 
     fn close(self: *Listener) void {
         if (self.closed) return;
         self.closed = true;
         self.stop.store(true, .release);
-        self.server.deinit(self.io);
+        netmod.sys.closeFd(self.lfd);
     }
 };
 
@@ -212,13 +215,18 @@ const Listener = struct {
 /// accept-EAGAIN is a zig bug ("errnoBug"), so a non-blocking listener must
 /// not accept through the io vtable. Everything here is poll-gated instead, so
 /// the stop flag and the deadline can always interrupt it.
-const accept_deadline_waits: u32 = 2000; // ~2 s of 1 ms polls; a live session connects in well under a millisecond
+/// These deadlines are wall-clock milliseconds, not poll counts: the loops
+/// below poll with timeout 0, so a "count" measures syscall cost, not time
+/// — on Windows ~4000 instant spins is ~10 ms, nowhere near the intended
+/// budget, and the fixture closed the connection before the client's first
+/// upload arrived. Wall-clock reads the same number on every platform.
+const accept_deadline_ms: u32 = 2000; // a live session connects in well under a millisecond
 /// Same idea for a full socket while writing: how long to wait for the peer to
 /// drain before giving up on the write. Generous next to the 2 s probe caps.
-const write_retry_polls: u32 = 4000;
+const write_retry_ms: u32 = 4000;
 /// Same idea for the post-write drain: how long to wait for a client that has
 /// gone quiet before giving up on it. Generous next to the 60 ms session cap.
-const read_idle_deadline_polls: u32 = 4000;
+const read_idle_deadline_ms: u32 = 4000;
 
 fn fakeServer(listener: *Listener, stream: []const u8) void {
     fakeServerInner(listener, stream, true);
@@ -233,28 +241,23 @@ fn fakeServerHold(listener: *Listener, stream: []const u8) void {
 }
 
 fn fakeServerInner(listener: *Listener, stream: []const u8, half_close: bool) void {
-    const lfd = listener.server.socket.handle;
+    const lfd = listener.lfd;
 
+    const io = harnessIo();
     const cfd: std.posix.socket_t = cfd: {
-        var waits: u32 = 0;
+        const accept_start_ms = clock.nowMs(io);
         while (true) {
             if (listener.stop.load(.acquire)) return;
-            var fds = [_]std.posix.pollfd{.{ .fd = lfd, .events = std.posix.POLL.IN, .revents = 0 }};
-            const n = std.posix.poll(&fds, 1) catch return;
-            if (n == 0) {
-                waits += 1;
-                if (waits > accept_deadline_waits) return; // no client ever came; bounded, not hung
+            const ev = netmod.sys.pollOne(lfd, true, false, 0) catch return;
+            if (!ev.in) {
+                if (clock.nowMs(io) - accept_start_ms > accept_deadline_ms) return; // no client ever came; bounded, not hung
                 continue;
             }
-            const rc = std.posix.system.accept(lfd, null, null);
-            switch (std.posix.errno(rc)) {
-                .SUCCESS => break :cfd @intCast(rc),
-                .INTR, .AGAIN => continue,
-                else => return,
-            }
+            if (netmod.sys.acceptFd(lfd)) |a| break :cfd a;
+            continue;
         }
     };
-    defer _ = std.posix.errno(std.posix.system.close(cfd));
+    defer netmod.sys.closeFd(cfd);
 
     // Set O_NONBLOCK on the ACCEPTED socket explicitly, rather than relying on
     // it coming from the listener. POSIX does not make `accept` inherit the
@@ -266,9 +269,7 @@ fn fakeServerInner(listener: *Listener, stream: []const u8, half_close: bool) vo
     // soon as the client writes or hangs up. So it works by luck and the
     // comment below used to assert something false.
     {
-        var o: std.c.O = @bitCast(@as(u32, @intCast(std.c.fcntl(cfd, std.c.F.GETFL, @as(c_int, 0)))));
-        o.NONBLOCK = true;
-        _ = std.c.fcntl(cfd, std.c.F.SETFL, @as(c_int, @bitCast(o)));
+    netmod.sys.setNonblocking(cfd) catch {};
     }
 
     // Abort the connection on close (RST instead of FIN): the server sends the
@@ -276,17 +277,16 @@ fn fakeServerInner(listener: *Listener, stream: []const u8, half_close: bool) vo
     // — a long fuzz run exhausts the ephemeral range and every later connect
     // fails (that is what the first deep-hunt hang actually was). An RST leaves
     // no TIME_WAIT state; the session has already hit EOF by then.
-    const li = std.posix.linger{ .onoff = 1, .linger = 0 };
-    std.posix.setsockopt(cfd, std.posix.SOL.SOCKET, std.posix.SO.LINGER, &std.mem.toBytes(li)) catch {};
+    netmod.sys.lingerAbort(cfd);
 
     // Zig does not ignore SIGPIPE for us; a write against a session that hit
     // its duration cap mid-drain must not kill the test binary.
     if (builtin.os.tag == .macos) {
-        std.posix.setsockopt(cfd, std.posix.SOL.SOCKET, std.posix.SO.NOSIGPIPE, &std.mem.toBytes(@as(c_int, 1))) catch {};
+        netmod.sys.setSockOptInt(cfd, std.posix.SOL.SOCKET, std.posix.SO.NOSIGPIPE, 1) catch {};
     }
 
     var off: usize = 0;
-    var full_socket_polls: u32 = 0;
+    var full_since_ms: i64 = 0;
     while (off < stream.len) {
         const n = rawSend(cfd, stream[off..]) orelse return;
         if (n == 0) {
@@ -295,25 +295,25 @@ fn fakeServerInner(listener: *Listener, stream: []const u8, half_close: bool) vo
             // connection mid-probe and fail the session under test; wait for
             // writability instead. A peer that has gone away shows up as
             // POLLERR/POLLHUP and rawSend's next call returns null.
-            full_socket_polls += 1;
-            if (full_socket_polls > write_retry_polls) return;
-            var fds = [_]std.posix.pollfd{.{ .fd = cfd, .events = std.posix.POLL.OUT, .revents = 0 }};
-            _ = std.posix.poll(&fds, 1) catch return;
+            if (full_since_ms == 0) {
+                full_since_ms = clock.nowMs(io);
+            } else if (clock.nowMs(io) - full_since_ms > write_retry_ms) return;
+            _ = netmod.sys.pollOne(cfd, false, true, 0) catch return;
             continue;
         }
-        full_socket_polls = 0;
+        full_since_ms = 0;
         off += n;
     }
     // half-close: the session drains what we wrote, then reads EOF and fails
     // the session; we keep reading so its outbound bytes never block it.
     // The #64 probes skip this — they need the session to survive to its own
     // deadline, not die of EOF mid-probe.
-    if (half_close) _ = std.posix.errno(std.posix.system.shutdown(cfd, std.posix.SHUT.WR));
+    if (half_close) netmod.sys.shutdownWrite(cfd);
 
     var scratch: [4096]u8 = undefined;
-    var idle_polls: u32 = 0;
+    var last_data_ms = clock.nowMs(io);
     while (true) {
-        const n = std.posix.read(cfd, &scratch) catch |e| switch (e) {
+        _ = netmod.sys.readFd(cfd, &scratch) catch |e| switch (e) {
             // The accepted socket is non-blocking (set explicitly above), so a
             // read before the client has said anything returns WouldBlock. That
             // is "not yet", not "gone": returning here closed the connection the
@@ -323,31 +323,25 @@ fn fakeServerInner(listener: *Listener, stream: []const u8, half_close: bool) vo
             // no-op: the session died inside the challenge handler, and
             // runDispatchStep's `catch {}` reported that as a pass.
             error.WouldBlock => {
-                var fds = [_]std.posix.pollfd{.{ .fd = cfd, .events = std.posix.POLL.IN, .revents = 0 }};
-                _ = std.posix.poll(&fds, 1) catch return;
-                idle_polls += 1;
-                if (idle_polls > read_idle_deadline_polls) return; // client never hung up; bounded, not hung
+                _ = netmod.sys.pollOne(cfd, true, false, 0) catch return;
+                if (clock.nowMs(io) - last_data_ms > read_idle_deadline_ms) return; // client never hung up; bounded, not hung
                 continue;
             },
+            error.EndOfStream => return, // real EOF: the session closed its end
             else => return,
         };
-        idle_polls = 0;
-        if (n == 0) return; // real EOF: the session closed its end
+        last_data_ms = clock.nowMs(io);
     }
 }
 
 /// One write that cannot raise SIGPIPE (macOS via the socket option set above,
 /// everything else via MSG_NOSIGNAL). Returns null on a dead connection.
 fn rawSend(fd: std.posix.socket_t, bytes: []const u8) ?usize {
-    const rc = switch (builtin.os.tag) {
-        .macos => std.posix.system.write(fd, bytes.ptr, bytes.len),
-        else => std.posix.system.send(fd, bytes.ptr, bytes.len, std.posix.MSG.NOSIGNAL),
-    };
-    switch (std.posix.errno(rc)) {
-        .SUCCESS => return @intCast(rc),
-        .INTR, .AGAIN => return 0,
+    const n = netmod.sys.sendFd(fd, bytes) catch |e| switch (e) {
+        error.WouldBlock => return 0,
         else => return null,
-    }
+    };
+    return n;
 }
 
 // ---- seeded random execs (runs in every `zig build test`) ----------------------
@@ -668,8 +662,7 @@ test "a live-path stream really goes live: the handshake is not a silent no-op" 
     const alloc = std.testing.allocator;
     const io = harnessIo();
 
-    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
-    var listener = Listener.init(try std.Io.net.IpAddress.listen(&addr, io, .{}), io);
+    var listener = try Listener.init(0, io);
     defer listener.close();
 
     // Entry 4's stream: challenge, successful auth reply, then a config change

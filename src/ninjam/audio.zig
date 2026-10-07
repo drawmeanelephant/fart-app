@@ -8,7 +8,44 @@
 //! session loop.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const build_options = @import("build_options");
+
+/// The mutex the rings share between the audio device thread and the
+/// session loop: pthread on posix, an SRW lock on Windows (RTL* is the
+/// syscall surface kernel32's SRWLock functions wrap). Both block the
+/// waiter in the kernel, which is what the real-time callback needs —
+/// a spinlock would burn its deadline.
+const RingMutex = switch (builtin.os.tag) {
+    .windows => struct {
+        l: std.os.windows.SRWLOCK = .{},
+        fn init() @This() {
+            return .{};
+        }
+        fn lock(m: *@This()) void {
+            std.os.windows.ntdll.RtlAcquireSRWLockExclusive(&m.l);
+        }
+        fn unlock(m: *@This()) void {
+            std.os.windows.ntdll.RtlReleaseSRWLockExclusive(&m.l);
+        }
+        fn destroy(_: *@This()) void {}
+    },
+    else => struct {
+        m: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
+        fn init() @This() {
+            return .{};
+        }
+        fn lock(s: *@This()) void {
+            _ = std.c.pthread_mutex_lock(&s.m);
+        }
+        fn unlock(s: *@This()) void {
+            _ = std.c.pthread_mutex_unlock(&s.m);
+        }
+        fn destroy(s: *@This()) void {
+            _ = std.c.pthread_mutex_destroy(&s.m);
+        }
+    },
+};
 
 /// Compiled in? (build option `-Dlive`, default on when targeting macOS)
 pub const enabled: bool = build_options.live;
@@ -63,9 +100,9 @@ pub const Ring = struct {
     read_pos: usize = 0,
     write_pos: usize = 0,
     count: usize = 0,
-    /// pthread mutex: the audio thread must be able to block on the session
+    /// Blocking mutex: the audio thread must be able to block on the session
     /// thread, which a spinlock cannot do without burning its deadline.
-    mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
+    mutex: RingMutex = RingMutex.init(),
     underruns: u64 = 0,
     overruns: u64 = 0,
 
@@ -74,16 +111,16 @@ pub const Ring = struct {
     }
 
     pub fn deinit(self: *Ring, alloc: std.mem.Allocator) void {
-        _ = std.c.pthread_mutex_destroy(&self.mutex);
+        self.mutex.destroy();
         alloc.free(self.buf);
     }
 
     fn lock(self: *Ring) void {
-        _ = std.c.pthread_mutex_lock(&self.mutex);
+        self.mutex.lock();
     }
 
     fn unlock(self: *Ring) void {
-        _ = std.c.pthread_mutex_unlock(&self.mutex);
+        self.mutex.unlock();
     }
 
     pub fn push(self: *Ring, data: []const f32) void {

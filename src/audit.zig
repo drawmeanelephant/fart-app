@@ -341,17 +341,20 @@ const Pool = struct {
 pub fn main(init: std.process.Init) !void {
     const allocator = std.heap.page_allocator;
 
-    var args_iter = init.minimal.args.iterate();
-    _ = args_iter.skip();
+    const args = try std.process.Args.toSlice(init.minimal.args, init.arena.allocator());
 
     var src_dir_path: ?[]const u8 = null;
     var out_file_path: ?[]const u8 = null;
 
-    while (args_iter.next()) |arg| {
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
         if (std.mem.eql(u8, arg, "--src")) {
-            src_dir_path = args_iter.next();
+            i += 1;
+            src_dir_path = if (i < args.len) args[i] else null;
         } else if (std.mem.eql(u8, arg, "--out")) {
-            out_file_path = args_iter.next();
+            i += 1;
+            out_file_path = if (i < args.len) args[i] else null;
         }
     }
 

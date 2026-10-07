@@ -432,18 +432,12 @@ fn onePhraseBank(alloc: std.mem.Allocator, samples: []const f32) !kujamba_out.Ph
 /// path testable at all — and it is the same `Conn`, the same `sendMessageBounded`
 /// and the same `finalizeInterval`, only with a smaller pipe.
 fn saturatedSocketPair() ![2]std.posix.socket_t {
-    var fds: [2]std.posix.socket_t = undefined;
-    const rc = std.posix.system.socketpair(@intCast(std.posix.AF.UNIX), @intCast(std.posix.SOCK.STREAM), 0, &fds);
-    if (std.posix.errno(rc) != .SUCCESS) return error.SocketPairFailed;
-    std.posix.setsockopt(fds[0], std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, &std.mem.toBytes(@as(i32, 4096))) catch {};
-    std.posix.setsockopt(fds[1], std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, &std.mem.toBytes(@as(i32, 4096))) catch {};
+    const fds = try netmod.sys.socketpair();
+    netmod.sys.setSockOptInt(fds[0], std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, 4096) catch {};
+    netmod.sys.setSockOptInt(fds[1], std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, 4096) catch {};
     // non-blocking on BOTH ends: the peer must be able to be drained without
     // blocking, and the client end already is on the real path
-    for (fds) |fd| {
-        var o: std.c.O = @bitCast(@as(u32, @intCast(std.c.fcntl(fd, std.c.F.GETFL, @as(c_int, 0)))));
-        o.NONBLOCK = true;
-        _ = std.c.fcntl(fd, std.c.F.SETFL, @as(c_int, @bitCast(o)));
-    }
+    for (fds) |fd| netmod.sys.setNonblocking(fd) catch {};
     return fds;
 }
 
@@ -452,19 +446,15 @@ fn saturatedSocketPair() ![2]std.posix.socket_t {
 fn fillUntilBlocked(fd: std.posix.socket_t, buf: []const u8) usize {
     var total: usize = 0;
     while (true) {
-        const rc = std.posix.system.write(fd, buf.ptr, buf.len);
-        switch (std.posix.errno(rc)) {
-            .SUCCESS => total += @intCast(rc),
-            else => return total,
-        }
+        const n = netmod.sys.sendFd(fd, buf) catch return total;
+        total += n;
     }
 }
 
 fn drainSocket(fd: std.posix.socket_t, buf: []u8) usize {
     var total: usize = 0;
     while (total < buf.len) {
-        const n = std.posix.read(fd, buf) catch break;
-        if (n == 0) break;
+        const n = netmod.sys.readFd(fd, buf) catch break;
         total += n;
     }
     return total;
@@ -492,7 +482,7 @@ test "kujamba: a blocked socket drops the bar instead of stalling the clock (#14
     var adapter = kujamba_out.PlanAdapter{ .pattern = &pattern, .bank = &bank, .fill = &fill };
 
     const fds = try saturatedSocketPair();
-    defer _ = std.posix.errno(std.posix.system.close(fds[1])); // fds[0] is s.conn's
+    defer netmod.sys.closeFd(fds[1]); // fds[0] is s.conn's
     var s = try Session.init(alloc, io, .{
         .srate = 48000,
         .channel_names = &.{"kujamba"},
@@ -590,7 +580,7 @@ test "kujamba: a mid-interval chunk that would block drops the bar and stays dro
     var adapter = kujamba_out.PlanAdapter{ .pattern = &pattern, .bank = &bank, .fill = &fill };
 
     const fds = try saturatedSocketPair();
-    defer _ = std.posix.errno(std.posix.system.close(fds[1]));
+    defer netmod.sys.closeFd(fds[1]);
     var s = try Session.init(alloc, io, .{
         .srate = 48000,
         .channel_names = &.{"kujamba"},
@@ -658,7 +648,7 @@ test "kujamba: one lost bar is counted once, however many channels were on it (#
     var adapter = kujamba_out.PlanAdapter{ .pattern = &pattern, .bank = &bank, .fill = &fill };
 
     const fds = try saturatedSocketPair();
-    defer _ = std.posix.errno(std.posix.system.close(fds[1]));
+    defer netmod.sys.closeFd(fds[1]);
     // TWO channels on one blocked socket. The point is the accounting: a bar
     // the room did not hear is one lost bar, not one per channel. Counting per
     // channel would report a two-channel client as twice as broken as it is.
@@ -707,7 +697,7 @@ test "kujamba: one lost bar is counted once, however many channels were on it (#
 test "kujamba: mid-bar and final drops count one bar and every channel's unsent bytes (#14)" {
     const io = std.testing.io;
     const fds = try saturatedSocketPair();
-    defer _ = std.posix.system.close(fds[1]);
+    defer netmod.sys.closeFd(fds[1]);
     var s = try Session.init(std.testing.allocator, io, .{
         .channel_names = &.{ "one", "two" },
     });
@@ -766,7 +756,7 @@ test "kujamba: the clock keeps walking while every bar is refused (#14)" {
     var adapter = kujamba_out.PlanAdapter{ .pattern = &pattern, .bank = &bank, .fill = &fill };
 
     const fds = try saturatedSocketPair();
-    defer _ = std.posix.errno(std.posix.system.close(fds[1]));
+    defer netmod.sys.closeFd(fds[1]);
     var s = try Session.init(alloc, io, .{
         .srate = 48000,
         .channel_names = &.{"kujamba"},
@@ -837,7 +827,7 @@ test "kujamba: the session recovers and uploads the next bar once the peer drain
     var adapter = kujamba_out.PlanAdapter{ .pattern = &pattern, .bank = &bank, .fill = &fill };
 
     const fds = try saturatedSocketPair();
-    defer _ = std.posix.errno(std.posix.system.close(fds[1])); // fds[0] is s.conn's
+    defer netmod.sys.closeFd(fds[1]); // fds[0] is s.conn's
     var s = try Session.init(alloc, io, .{
         .srate = 48000,
         .channel_names = &.{"kujamba"},

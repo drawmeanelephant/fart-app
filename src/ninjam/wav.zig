@@ -149,8 +149,9 @@ test "wav write/analyze roundtrip non-silence" {
         s.* = 0.5 * @sin(2.0 * std.math.pi * 440.0 * @as(f32, @floatFromInt(i)) / 48000.0);
     }
     try w.writeFloats(&samples);
-    var tmp: [64]u8 = undefined;
-    const path = try std.fmt.bufPrint(&tmp, "/tmp/zclient-test-{d}.wav", .{std.c.getpid()});
+    // cwd-relative: /tmp does not exist on Windows and a fixed name is fine —
+    // the suite runs these writes serially and deletes the file below.
+    const path = "zclient-test-roundtrip.wav";
     try w.open(path);
     try w.close();
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};

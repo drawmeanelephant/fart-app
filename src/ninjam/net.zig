@@ -6,6 +6,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const bufmod = @import("buf.zig");
 const clock = @import("clock.zig");
+const ws2 = std.os.windows.ws2_32;
 
 pub const max_payload: u32 = 16384;
 
@@ -46,11 +47,587 @@ pub const Error = error{
     EndOfStream,
     ConnectionClosed,
     WriteQueueFull,
+    SocketFlags,
+    SocketOption,
+    ConnectionRefused,
+    ConnectFailed,
+    BindFailed,
+    ListenFailed,
+    SocketOpen,
+    UnknownHost,
+    SocketPairFailed,
+    AcceptFailed,
 } || std.posix.ReadError || std.posix.PollError || std.posix.UnexpectedError || std.mem.Allocator.Error;
+
+/// Internal socket layer: POSIX syscalls on unix, Winsock2 on Windows.
+/// Exposes just what `Conn` and the test fixtures need — connected-stream
+/// sockets, nonblocking mode, poll, read/write/send, sockopts, getaddrinfo,
+/// and a connected-pair fixture (`socketpair`). Not a general socket
+/// abstraction; `Fd` stays `std.posix.socket_t` (a HANDLE on Windows, which
+/// is pointer-width like SOCKET) so callers keep their types.
+pub const sys = switch (builtin.os.tag) {
+    .windows => struct {
+        /// Winsock SOCKET. ws2_32.zig does not declare a socket type;
+        /// `socket_t`/`fd_t` are `HANDLE` (`*anyopaque`), same width as SOCKET.
+        pub const Fd = std.posix.socket_t;
+        /// INVALID_SOCKET ((SOCKET)~0) — distinct from a null SOCKET.
+        pub const invalid: Fd = @ptrFromInt(std.math.maxInt(usize));
+        pub fn isInvalid(fd: Fd) bool {
+            return fd == invalid;
+        }
+
+        // Winsock externs — ws2_32.zig ships types/constants only, no decls,
+        // so the handful of functions used here are declared directly.
+        const WSADATA = extern struct {
+            wVersion: c_ushort,
+            wHighVersion: c_ushort,
+            szDescription: [257]u8,
+            szSystemStatus: [129]u8,
+            iMaxSockets: c_ushort,
+            iMaxUdpDg: c_ushort,
+            lpVendorInfo: ?[*:0]u8,
+        };
+        /// Winsock error codes (winsock2.h WSAE*).
+        const WSAE = struct {
+            const WOULDBLOCK: i32 = 10035;
+            const INPROGRESS: i32 = 10036;
+            const ALREADY: i32 = 10037;
+            const NETDOWN: i32 = 10050;
+            const NETRESET: i32 = 10052;
+            const CONNABORTED: i32 = 10053;
+            const CONNRESET: i32 = 10054;
+            const ISCONN: i32 = 10056;
+            const NOTCONN: i32 = 10057;
+            const CONNREFUSED: i32 = 10061;
+        };
+        extern "ws2_32" fn WSAStartup(wVersionRequested: c_ushort, lpWSAData: *WSADATA) callconv(.winapi) c_int;
+        extern "ws2_32" fn WSAGetLastError() callconv(.winapi) i32;
+
+        /// WSAStartup is refcounted and safe to call repeatedly; calling it
+        /// on every entry point is the cheapest correct "init once".
+        pub fn ensureWsa() void {
+            var d: WSADATA = undefined;
+            _ = WSAStartup(0x0202, &d); // MAKEWORD(2,2)
+        }
+
+        // Winsock error → the errno-like members callers already handle.
+        fn sendErr() Error {
+            return switch (WSAGetLastError()) {
+                WSAE.WOULDBLOCK => error.WouldBlock,
+                WSAE.CONNRESET, WSAE.CONNABORTED => error.ConnectionResetByPeer,
+                WSAE.NOTCONN => error.SocketUnconnected,
+                else => error.ConnectionClosed,
+            };
+        }
+        fn recvErr() Error {
+            return switch (WSAGetLastError()) {
+                WSAE.WOULDBLOCK => error.WouldBlock,
+                WSAE.CONNRESET, WSAE.CONNABORTED, WSAE.NETRESET => error.ConnectionResetByPeer,
+                WSAE.NOTCONN => error.SocketUnconnected,
+                else => error.Unexpected,
+            };
+        }
+        fn pollErr() Error {
+            return switch (WSAGetLastError()) {
+                WSAE.NETDOWN => error.NetworkDown,
+                else => error.Unexpected,
+            };
+        }
+
+        // ws2_32.zig also lacks the addrinfo layout (std.c.addrinfo on
+        // Windows refers to a member this file does not declare).
+        const addrinfo = extern struct {
+            flags: c_int,
+            family: c_int,
+            socktype: c_int,
+            protocol: c_int,
+            addrlen: usize,
+            canonname: ?[*:0]u8,
+            addr: ?*ws2.sockaddr,
+            next: ?*addrinfo,
+        };
+        const POLLFD = extern struct {
+            fd: Fd,
+            events: c_short,
+            revents: c_short,
+        };
+        extern "ws2_32" fn socket(af: c_int, type_: c_int, protocol: c_int) callconv(.winapi) Fd;
+        extern "ws2_32" fn closesocket(s: Fd) callconv(.winapi) c_int;
+        extern "ws2_32" fn connect(s: Fd, name: *const ws2.sockaddr, namelen: c_int) callconv(.winapi) c_int;
+        extern "ws2_32" fn bind(s: Fd, name: *const ws2.sockaddr, namelen: c_int) callconv(.winapi) c_int;
+        extern "ws2_32" fn listen(s: Fd, backlog: c_int) callconv(.winapi) c_int;
+        extern "ws2_32" fn accept(s: Fd, addr: ?*ws2.sockaddr, addrlen: ?*c_int) callconv(.winapi) Fd;
+        extern "ws2_32" fn getsockname(s: Fd, name: *ws2.sockaddr, namelen: *c_int) callconv(.winapi) c_int;
+        extern "ws2_32" fn recv(s: Fd, buf: [*]u8, len: c_int, flags: c_int) callconv(.winapi) c_int;
+        extern "ws2_32" fn send(s: Fd, buf: [*]const u8, len: c_int, flags: c_int) callconv(.winapi) c_int;
+        extern "ws2_32" fn shutdown(s: Fd, how: c_int) callconv(.winapi) c_int;
+        extern "ws2_32" fn setsockopt(s: Fd, level: c_int, optname: c_int, optval: ?*const anyopaque, optlen: c_int) callconv(.winapi) c_int;
+        extern "ws2_32" fn getsockopt(s: Fd, level: c_int, optname: c_int, optval: ?*anyopaque, optlen: *c_int) callconv(.winapi) c_int;
+        extern "ws2_32" fn ioctlsocket(s: Fd, cmd: i32, argp: *c_ulong) callconv(.winapi) c_int;
+        extern "ws2_32" fn WSAPoll(fdArray: [*]POLLFD, fds: c_ulong, timeout: c_int) callconv(.winapi) c_int;
+        extern "ws2_32" fn getaddrinfo(pNodeName: ?[*:0]const u8, pServiceName: ?[*:0]const u8, pHints: ?*const addrinfo, ppResult: *?*addrinfo) callconv(.winapi) c_int;
+        extern "ws2_32" fn freeaddrinfo(pAddrInfo: ?*addrinfo) callconv(.winapi) void;
+
+        const FIONBIO: i32 = @bitCast(@as(u32, 0x8004667E));
+        // WSAPoll event bits (winsock2.h POLL*).
+        const POLLRDNORM: c_short = 0x0100;
+        const POLLWRNORM: c_short = 0x0010;
+        const POLLERR: c_short = 0x0001;
+        const POLLHUP: c_short = 0x0002;
+        const POLLNVAL: c_short = 0x0004;
+        const POLLIN: c_short = POLLRDNORM;
+        const POLLOUT: c_short = POLLWRNORM;
+
+        pub fn closeFd(fd: Fd) void {
+            _ = closesocket(fd);
+        }
+
+        /// Nonblocking mode via ioctlsocket(FIONBIO): Winsock has no
+        /// get/set-flags split — FIONBIO is the whole story.
+        pub fn setNonblocking(fd: Fd) Error!void {
+            var on: c_ulong = 1;
+            if (ioctlsocket(fd, FIONBIO, &on) != 0) return error.SocketFlags;
+        }
+
+        pub const PollEvents = struct { in: bool = false, out: bool = false, err: bool = false, nval: bool = false };
+        pub fn pollOne(fd: Fd, want_in: bool, want_out: bool, timeout_ms: c_int) Error!PollEvents {
+            var pfds = [1]POLLFD{.{
+                .fd = fd,
+                .events = (if (want_in) POLLIN else 0) | (if (want_out) POLLOUT else 0),
+                .revents = 0,
+            }};
+            const n = WSAPoll(&pfds, 1, timeout_ms);
+            if (n < 0) return pollErr();
+            const r = pfds[0].revents;
+            return .{
+                .in = (r & (POLLIN | POLLHUP)) != 0,
+                .out = (r & POLLOUT) != 0,
+                .err = (r & (POLLERR | POLLHUP)) != 0,
+                .nval = (r & POLLNVAL) != 0,
+            };
+        }
+
+        /// Bytes read; error.WouldBlock/ConnectionResetByPeer are preserved
+        /// for the nonblocking read loop in `fillMore`. rc==0 is EOF.
+        pub fn readFd(fd: Fd, buf: []u8) Error!usize {
+            const rc = recv(fd, buf.ptr, @intCast(buf.len), 0);
+            if (rc == 0) return error.EndOfStream;
+            if (rc < 0) return recvErr();
+            return @intCast(rc);
+        }
+
+        /// send() on a saturated nonblocking socket returns WSAEWOULDBLOCK
+        /// *or* a literal 0; both mean "accepted nothing".
+        pub fn writeFd(fd: Fd, buf: []const u8) Error!usize {
+            const rc = send(fd, buf.ptr, @intCast(buf.len), 0);
+            if (rc < 0) return sendErr();
+            if (rc == 0) return error.WouldBlock;
+            return @intCast(rc);
+        }
+
+        /// send() never raises SIGPIPE on Windows, so send == write here.
+        pub const sendFd = writeFd;
+
+        pub fn setSockOptInt(fd: Fd, level: c_int, opt: c_int, value: i32) Error!void {
+            const v: i32 = value;
+            if (setsockopt(fd, level, opt, &v, @sizeOf(i32)) != 0) return error.SocketOption;
+        }
+        pub fn getSockOptInt(fd: Fd, level: c_int, opt: c_int) Error!i32 {
+            var v: i32 = 0;
+            var n: c_int = @sizeOf(i32);
+            if (getsockopt(fd, level, opt, &v, &n) != 0) return error.SocketOption;
+            return v;
+        }
+
+        /// Abortive close is a no-op on Windows: Winsock answers an RST by
+        /// discarding bytes the peer has not read yet, so the client reads
+        /// `ConnectionResetByPeer` where the tests (and posix) show
+        /// `EndOfStream`. Loopback TIME_WAIT is not a real hazard at a test
+        /// suite's scale, and Winsock already emits RST on a plain close when
+        /// inbound data is still pending.
+        pub fn lingerAbort(fd: Fd) void {
+            _ = fd;
+        }
+
+        /// Winsock has no TIOCOUTQ/SO_NWRITE equivalent: report "unknown" so
+        /// callers fall back to their partial-send backstop.
+        pub fn sendQueueBytes(fd: Fd) ?i32 {
+            _ = fd;
+            return null;
+        }
+
+        /// Connect initiated: ok on success and on every "in flight"
+        /// answer a blocking or nonblocking socket can give.
+        pub fn connectNow(fd: Fd, name: *const anyopaque, len: u32) Error!void {
+            if (connect(fd, @ptrCast(@alignCast(name)), @intCast(len)) != 0) {
+                return switch (WSAGetLastError()) {
+                    WSAE.WOULDBLOCK, WSAE.INPROGRESS, WSAE.ALREADY, WSAE.ISCONN => {},
+                    WSAE.CONNREFUSED => error.ConnectionRefused,
+                    else => error.ConnectFailed,
+                };
+            }
+        }
+
+        pub fn bindFd(fd: Fd, name: *const anyopaque, len: u32) Error!void {
+            if (bind(fd, @ptrCast(@alignCast(name)), @intCast(len)) != 0) return error.BindFailed;
+        }
+        pub fn listenFd(fd: Fd, backlog: c_int) Error!void {
+            if (listen(fd, backlog) != 0) return error.ListenFailed;
+        }
+        /// Port actually bound, for ephemeral-port fixtures. Family-agnostic:
+        /// the buffer is sized for a v6 sockaddr so getsockname doesn't refuse
+        /// a v6 socket the way an `in`-sized one would.
+        pub fn boundPort(fd: Fd) u16 {
+            var buf: [64]u8 align(8) = undefined;
+            var n: c_int = buf.len;
+            if (getsockname(fd, @ptrCast(&buf), &n) != 0) return 0;
+            const base: *const ws2.sockaddr = @ptrCast(&buf);
+            return switch (base.family) {
+                ws2.AF.INET => std.mem.bigToNative(u16, @as(*const ws2.sockaddr.in, @ptrCast(&buf)).port),
+                ws2.AF.INET6 => std.mem.bigToNative(u16, @as(*const ws2.sockaddr.in6, @ptrCast(&buf)).port),
+                else => 0,
+            };
+        }
+        /// Accepted fd, or null on a nonblocking EAGAIN (any failure).
+        pub fn acceptFd(lfd: Fd) ?Fd {
+            var ca: ws2.sockaddr.storage = std.mem.zeroes(ws2.sockaddr.storage);
+            var cl: c_int = @sizeOf(@TypeOf(ca));
+            const a = accept(lfd, @ptrCast(&ca), &cl);
+            if (isInvalid(a)) return null;
+            return a;
+        }
+        /// Stop the send side (FIN), keep the receive side — the fixture
+        /// half-close.
+        pub fn shutdownWrite(fd: Fd) void {
+            _ = shutdown(fd, 1); // SD_SEND
+        }
+
+        pub fn socketInet() Error!Fd {
+            return socketFam(ws2.AF.INET);
+        }
+        /// Fresh TCP socket of an address family (AF.INET / AF.INET6).
+        pub fn socketFam(family: c_int) Error!Fd {
+            const s = socket(family, ws2.SOCK.STREAM, ws2.IPPROTO.TCP);
+            if (isInvalid(s)) return error.SocketOpen;
+            return s;
+        }
+
+        pub const AddrInfo = struct {
+            list: ?*addrinfo,
+            cur: ?*addrinfo,
+            pub fn next(self: *AddrInfo) ?*addrinfo {
+                const c = self.cur orelse return null;
+                self.cur = c.next;
+                return c;
+            }
+            pub fn deinit(self: *AddrInfo) void {
+                freeaddrinfo(self.list);
+                self.list = null;
+                self.cur = null;
+            }
+        };
+        /// getaddrinfo via the narrow (ANSI) Winsock API. Hostnames here are
+        /// config strings and in practice IP literals, so the ANSI entry point
+        /// is adequate.
+        pub fn getAddrInfo(host: []const u8, port: u16) Error!AddrInfo {
+            ensureWsa();
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer arena.deinit();
+            const al = arena.allocator();
+            const hostz = al.dupeZ(u8, host) catch return error.SystemResources;
+            var portbuf: [16]u8 = undefined;
+            const portz = std.fmt.bufPrintZ(&portbuf, "{d}", .{port}) catch unreachable;
+            var hints = std.mem.zeroes(addrinfo);
+            hints.family = ws2.AF.UNSPEC;
+            hints.socktype = ws2.SOCK.STREAM;
+            hints.protocol = ws2.IPPROTO.TCP;
+            var res: ?*addrinfo = null;
+            if (getaddrinfo(hostz.ptr, portz, &hints, &res) != 0) return error.UnknownHost;
+            return .{ .list = res, .cur = res };
+        }
+        /// Socket + nonblocking + connect initiated for one addrinfo node.
+        pub fn connectNode(ai: *const addrinfo) Error!Fd {
+            const sa = ai.addr orelse return error.ConnectFailed;
+            const fd = socket(ai.family, ai.socktype, ai.protocol);
+            if (isInvalid(fd)) return error.SocketOpen;
+            errdefer closeFd(fd);
+            try setNonblocking(fd);
+            try connectNow(fd, sa, @intCast(ai.addrlen));
+            return fd;
+        }
+
+        /// Loopback sockaddr for tests (`in` layout matches posix: family,
+        /// port big-endian, addr big-endian, zero pad).
+        pub fn loopbackIn(port_be: u16) ws2.sockaddr.in {
+            var sa = std.mem.zeroes(ws2.sockaddr.in);
+            sa.family = ws2.AF.INET;
+            sa.port = port_be;
+            sa.addr = std.mem.bytesToValue(u32, &[4]u8{ 127, 0, 0, 1 });
+            return sa;
+        }
+
+        /// A connected pair of loopback TCP sockets — the Winsock stand-in for
+        /// socketpair(2), which does not exist there. Test fixtures only.
+        /// Blocking connect+accept complete synchronously on loopback, so the
+        /// pair comes back blocking like the posix version does.
+        pub fn socketpair() Error![2]Fd {
+            ensureWsa();
+            const lfd = try socketInet();
+            defer closeFd(lfd);
+            var sa = loopbackIn(0); // kernel chooses the port
+            try bindFd(lfd, &sa, @sizeOf(@TypeOf(sa)));
+            try listenFd(lfd, 1);
+            sa.port = std.mem.nativeToBig(u16, boundPort(lfd));
+
+            const cfd = try socketInet();
+            errdefer closeFd(cfd);
+            try connectNow(cfd, &sa, @sizeOf(@TypeOf(sa)));
+
+            const afd = accept(lfd, null, null);
+            if (isInvalid(afd)) return error.AcceptFailed;
+            return .{ cfd, afd };
+        }
+    },
+    else => struct {
+        pub const Fd = std.posix.socket_t;
+        pub const invalid: Fd = -1;
+        pub fn isInvalid(fd: Fd) bool {
+            return fd < 0;
+        }
+        pub fn ensureWsa() void {}
+
+        pub fn closeFd(fd: Fd) void {
+            _ = std.posix.errno(std.posix.system.close(fd));
+        }
+        pub fn setNonblocking(fd: Fd) Error!void {
+            var o: std.c.O = @bitCast(@as(u32, @intCast(std.c.fcntl(fd, std.c.F.GETFL, @as(c_int, 0)))));
+            o.NONBLOCK = true;
+            _ = std.c.fcntl(fd, std.c.F.SETFL, @as(c_int, @bitCast(o)));
+        }
+        pub const PollEvents = struct { in: bool = false, out: bool = false, err: bool = false, nval: bool = false };
+        pub fn pollOne(fd: Fd, want_in: bool, want_out: bool, timeout_ms: c_int) Error!PollEvents {
+            var pfd = [_]std.posix.pollfd{.{
+                .fd = fd,
+                .events = (if (want_in) std.posix.POLL.IN else 0) | (if (want_out) std.posix.POLL.OUT else 0),
+                .revents = 0,
+            }};
+            _ = try std.posix.poll(&pfd, timeout_ms);
+            const r = pfd[0].revents;
+            return .{
+                .in = (r & (std.posix.POLL.IN | std.posix.POLL.HUP)) != 0,
+                .out = (r & std.posix.POLL.OUT) != 0,
+                .err = (r & (std.posix.POLL.ERR | std.posix.POLL.HUP)) != 0,
+                .nval = (r & std.posix.POLL.NVAL) != 0,
+            };
+        }
+        pub fn readFd(fd: Fd, buf: []u8) Error!usize {
+            while (true) {
+                const n = std.posix.system.read(fd, buf.ptr, buf.len);
+                switch (std.posix.errno(n)) {
+                    .SUCCESS => {
+                        if (n == 0) return error.ConnectionClosed;
+                        return n;
+                    },
+                    .AGAIN => return error.WouldBlock,
+                    .INTR => continue,
+                    else => return error.Unexpected,
+                }
+            }
+        }
+        pub fn writeFd(fd: Fd, buf: []const u8) Error!usize {
+            while (true) {
+                const n = std.posix.system.write(fd, buf.ptr, buf.len);
+                switch (std.posix.errno(n)) {
+                    .SUCCESS => {
+                        // a 0-byte write accepted nothing — same handling as
+                        // EAGAIN so write loops don't spin
+                        if (n == 0) return error.WouldBlock;
+                        return n;
+                    },
+                    .AGAIN => return error.WouldBlock,
+                    .INTR => continue,
+                    else => return error.ConnectionClosed,
+                }
+            }
+        }
+        /// MSG_NOSIGNAL where it exists; plain write() on macOS, which gets
+        /// SIGPIPE suppression from SO_NOSIGPIPE at connect time instead.
+        pub fn sendFd(fd: Fd, buf: []const u8) Error!usize {
+            if (builtin.os.tag == .macos) return writeFd(fd, buf);
+            while (true) {
+                const n = std.posix.system.send(fd, buf.ptr, buf.len, std.posix.MSG.NOSIGNAL);
+                switch (std.posix.errno(n)) {
+                    .SUCCESS => {
+                        if (n == 0) return error.WouldBlock;
+                        return n;
+                    },
+                    .AGAIN => return error.WouldBlock,
+                    .INTR => continue,
+                    else => return error.ConnectionClosed,
+                }
+            }
+        }
+        pub fn setSockOptInt(fd: Fd, level: c_int, opt: c_int, value: i32) Error!void {
+            try std.posix.setsockopt(fd, level, @intCast(opt), &std.mem.toBytes(value));
+        }
+        pub fn getSockOptInt(fd: Fd, level: c_int, opt: c_int) Error!i32 {
+            var v: i32 = 0;
+            var n: std.c.socklen_t = @sizeOf(i32);
+            if (std.c.getsockopt(fd, level, @intCast(opt), &v, &n) != 0) return error.SocketOption;
+            return v;
+        }
+
+        /// Abortive close (RST on close, not FIN) — test fixtures use it so a
+        /// torn-down server does not park the port in TIME_WAIT.
+        pub fn lingerAbort(fd: Fd) void {
+            const li = std.posix.linger{ .onoff = 1, .linger = 0 };
+            std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.LINGER, &std.mem.toBytes(li)) catch {};
+        }
+
+        /// Unsent bytes in the kernel send queue (Linux TIOCOUTQ / Darwin
+        /// SO_NWRITE). Null where the OS cannot answer; callers then use
+        /// their partial-send backstop, which measures the same thing.
+        extern "c" fn ioctl(fd: std.c.fd_t, request: c_ulong, ...) c_int;
+        const tiocoutq_linux = 0x5411;
+        const so_nwrite_darwin = 0x1024;
+        pub fn sendQueueBytes(fd: Fd) ?i32 {
+            if (builtin.os.tag == .linux) {
+                var v: c_int = 0;
+                if (ioctl(fd, tiocoutq_linux, &v) == 0) return v;
+                return null;
+            } else if (builtin.os.tag == .macos) {
+                var v: c_int = 0;
+                var len: std.c.socklen_t = @sizeOf(c_int);
+                if (std.c.getsockopt(fd, std.c.SOL.SOCKET, so_nwrite_darwin, &v, &len) == 0) return v;
+                return null;
+            }
+            return null;
+        }
+
+        /// Connect initiated: ok on success and on every "in flight" answer
+        /// a blocking or nonblocking socket can give (INTR means the kernel
+        /// is still connecting; ISCONN means it already did).
+        pub fn connectNow(fd: Fd, name: *const anyopaque, len: u32) Error!void {
+            switch (std.posix.errno(std.posix.system.connect(fd, @ptrCast(@alignCast(name)), len))) {
+                .SUCCESS, .INPROGRESS, .INTR, .ISCONN => {},
+                .CONNREFUSED => return error.ConnectionRefused,
+                else => return error.ConnectFailed,
+            }
+        }
+        pub fn bindFd(fd: Fd, name: *const anyopaque, len: u32) Error!void {
+            if (std.posix.errno(std.posix.system.bind(fd, @ptrCast(@alignCast(name)), len)) != .SUCCESS)
+                return error.BindFailed;
+        }
+        pub fn listenFd(fd: Fd, backlog: c_int) Error!void {
+            if (std.posix.errno(std.posix.system.listen(fd, @intCast(backlog))) != .SUCCESS)
+                return error.ListenFailed;
+        }
+        /// Port actually bound, for ephemeral-port fixtures. Family-agnostic:
+        /// the buffer is sized for a v6 sockaddr so getsockname doesn't
+        /// refuse a v6 socket the way an `in`-sized one would.
+        pub fn boundPort(fd: Fd) u16 {
+            var buf: [64]u8 align(8) = undefined;
+            var n: std.posix.socklen_t = buf.len;
+            if (std.posix.system.getsockname(fd, @ptrCast(&buf), &n) != 0) return 0;
+            const base: *const std.posix.sockaddr = @ptrCast(&buf);
+            return switch (base.family) {
+                std.posix.AF.INET => std.mem.bigToNative(u16, @as(*const std.posix.sockaddr.in, @ptrCast(&buf)).port),
+                std.posix.AF.INET6 => std.mem.bigToNative(u16, @as(*const std.posix.sockaddr.in6, @ptrCast(&buf)).port),
+                else => 0,
+            };
+        }
+        pub fn acceptFd(lfd: Fd) ?Fd {
+            var ca: std.posix.sockaddr = undefined;
+            var cl: std.posix.socklen_t = @sizeOf(@TypeOf(ca));
+            const a = std.posix.system.accept(lfd, @ptrCast(&ca), &cl);
+            if (std.posix.errno(a) != .SUCCESS) return null;
+            return @intCast(a);
+        }
+        /// Stop the send side (FIN), keep the receive side — the fixture
+        /// half-close.
+        pub fn shutdownWrite(fd: Fd) void {
+            _ = std.posix.system.shutdown(fd, std.posix.SHUT.WR);
+        }
+        pub fn socketInet() Error!Fd {
+            return socketFam(std.posix.AF.INET);
+        }
+        /// Fresh TCP socket of an address family (AF.INET / AF.INET6).
+        pub fn socketFam(family: c_int) Error!Fd {
+            const s = std.posix.system.socket(@intCast(family), std.posix.SOCK.STREAM, std.posix.IPPROTO.TCP);
+            if (std.posix.errno(s) != .SUCCESS) return error.SocketOpen;
+            return @intCast(s);
+        }
+
+        pub const AddrInfo = struct {
+            head: ?*std.posix.addrinfo,
+            cur: ?*std.posix.addrinfo,
+            pub fn next(self: *AddrInfo) ?*std.posix.addrinfo {
+                const c = self.cur orelse return null;
+                self.cur = c.next;
+                return c;
+            }
+            pub fn deinit(self: *AddrInfo) void {
+                if (self.head) |h| std.posix.freeaddrinfo(h);
+                self.head = null;
+                self.cur = null;
+            }
+        };
+        pub fn getAddrInfo(host: []const u8, port: u16) Error!AddrInfo {
+            var portbuf: [16]u8 = undefined;
+            const portz = std.fmt.bufPrintZ(&portbuf, "{d}", .{port}) catch unreachable;
+            var hostbuf: [256]u8 = undefined;
+            if (host.len >= hostbuf.len) return error.UnknownHost;
+            @memcpy(hostbuf[0..host.len], host);
+            hostbuf[host.len] = 0;
+            const hostz: [*:0]const u8 = @ptrCast(&hostbuf);
+            const hints: std.posix.addrinfo = .{
+                .flags = .{},
+                .family = std.posix.AF.UNSPEC,
+                .socktype = std.posix.SOCK.STREAM,
+                .protocol = std.posix.IPPROTO.TCP,
+                .addrlen = 0,
+                .canonname = null,
+                .addr = null,
+                .next = null,
+            };
+            var res: ?*std.posix.addrinfo = null;
+            const rc = std.posix.system.getaddrinfo(hostz, portz, &hints, &res);
+            if (@intFromEnum(rc) != 0) return error.UnknownHost;
+            return .{ .head = res, .cur = res };
+        }
+        pub fn connectNode(ai: *const std.posix.addrinfo) Error!Fd {
+            const fd = std.posix.system.socket(@intCast(ai.family), @intCast(ai.socktype), @intCast(ai.protocol));
+            if (std.posix.errno(fd) != .SUCCESS) return error.SocketOpen;
+            const sfd: Fd = @intCast(fd);
+            errdefer closeFd(sfd);
+            try setNonblocking(sfd);
+            try connectNow(sfd, ai.addr.?, ai.addrlen);
+            return sfd;
+        }
+        pub fn loopbackIn(port_be: u16) std.posix.sockaddr.in {
+            var sa = std.mem.zeroes(std.posix.sockaddr.in);
+            sa.family = std.posix.AF.INET;
+            sa.port = port_be;
+            sa.addr = std.mem.bytesToValue(u32, &[4]u8{ 127, 0, 0, 1 });
+            return sa;
+        }
+        /// AF_UNIX socketpair on unix; loopback TCP pair on Windows. The pair
+        /// shapes differ where it matters (Darwin SO_NWRITE cannot see a unix
+        /// socket's queue), so tests that measure TCP accounting use
+        /// `tcpPair`-style fixtures built on `socketInet` instead.
+        pub fn socketpair() Error![2]Fd {
+            var fds: [2]std.posix.fd_t = undefined;
+            switch (std.posix.errno(std.posix.system.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds))) {
+                .SUCCESS => return fds,
+                else => return error.SocketPairFailed,
+            }
+        }
+    },
+};
 
 pub const Conn = struct {
     io: std.Io = undefined,
-    fd: std.posix.socket_t = -1,
+    fd: sys.Fd = sys.invalid,
 
     rbuf: [65536]u8 = undefined,
     rhead: usize = 0,
@@ -67,10 +644,11 @@ pub const Conn = struct {
     last_send_ms: i64 = 0,
 
     pub fn connect(io: std.Io, host: []const u8, port: u16) !Conn {
+        sys.ensureWsa();
         // fast path: dotted-quad IPv4 literal
         if (std.Io.net.Ip4Address.parse(host, port)) |ip4| {
             const sa = sockaddrIn(ip4);
-            return connectSockaddr(io, std.posix.AF.INET, @ptrCast(&sa), @intCast(@sizeOf(std.posix.sockaddr.in)));
+            return connectSockaddr(io, std.posix.AF.INET, @ptrCast(&sa), @sizeOf(@TypeOf(sa)));
         } else |_| {}
 
         // fast path: IPv6 literal. The CLI strips the brackets of
@@ -80,34 +658,18 @@ pub const Conn = struct {
         // a second copy of one job.
         if (std.Io.net.Ip6Address.parse(host, port)) |ip6| {
             const sa = sockaddrIn6(ip6);
-            return connectSockaddr(io, std.posix.AF.INET6, @ptrCast(&sa), @intCast(@sizeOf(std.posix.sockaddr.in6)));
+            return connectSockaddr(io, std.posix.AF.INET6, @ptrCast(&sa), @sizeOf(@TypeOf(sa)));
         } else |_| {}
 
-        // hostname: getaddrinfo (libc). AF.UNSPEC, not AF.INET: the resolver
-        // returns both families in its own preference order (RFC 6724), and
-        // the loop below connects to the first entry that answers — so a
-        // v6-first resolver still reaches a v4-only server by falling through
-        // the refused v6 attempt, and vice versa. Taking only the first entry
-        // would be happy-eyeballs by luck rather than by construction.
-        const host_z = std.heap.page_allocator.dupeZ(u8, host) catch return error.SystemResources;
-        defer std.heap.page_allocator.free(host_z);
-        var port_buf: [16]u8 = undefined;
-        const port_str = std.fmt.bufPrintZ(&port_buf, "{d}", .{port}) catch return error.UnknownHost;
-
-        const hints: std.posix.addrinfo = .{
-            .flags = .{},
-            .family = std.posix.AF.UNSPEC,
-            .socktype = std.posix.SOCK.STREAM,
-            .protocol = std.posix.IPPROTO.TCP,
-            .addrlen = 0,
-            .canonname = null,
-            .addr = null,
-            .next = null,
-        };
-        var res: ?*std.posix.addrinfo = null;
-        const rc = std.posix.system.getaddrinfo(host_z.ptr, port_str.ptr, &hints, &res);
-        if (rc != @as(std.posix.system.EAI, @enumFromInt(0)) or res == null) return error.UnknownHost;
-        defer if (res) |some| std.posix.system.freeaddrinfo(some);
+        // hostname: getaddrinfo (libc / Winsock). AF.UNSPEC, not AF.INET: the
+        // resolver returns both families in its own preference order (RFC
+        // 6724), and the loop below connects to the first entry that answers —
+        // so a v6-first resolver still reaches a v4-only server by falling
+        // through the refused v6 attempt, and vice versa. Taking only the
+        // first entry would be happy-eyeballs by luck rather than by
+        // construction.
+        var infos = try sys.getAddrInfo(host, port);
+        defer infos.deinit();
 
         // getaddrinfo can return many entries; a host has at most two families
         // that matter here, and the fixed array is a deliberate bound rather
@@ -115,8 +677,7 @@ pub const Conn = struct {
         // outlives the connect loop below.
         var cands: [16]Candidate = undefined;
         var ncands: usize = 0;
-        var it: ?*std.posix.addrinfo = res;
-        while (it) |ai| : (it = ai.next) {
+        while (infos.next()) |ai| {
             if (ai.addrlen == 0 or ai.addr == null) continue;
             if (ncands == cands.len) break;
             cands[ncands] = .{ .family = ai.family, .addr = ai.addr.?, .len = @intCast(ai.addrlen) };
@@ -130,8 +691,8 @@ pub const Conn = struct {
     /// connect attempt.
     pub const Candidate = struct {
         family: c_int,
-        addr: *const std.posix.sockaddr,
-        len: std.posix.socklen_t,
+        addr: *const anyopaque,
+        len: u32,
     };
 
     /// The connect loop proper, separated from where candidates come from
@@ -152,22 +713,12 @@ pub const Conn = struct {
         return error.UnknownHost;
     }
 
-    fn openStreamSocket(family: c_int) !std.posix.socket_t {
-        const rc = std.posix.system.socket(@intCast(family), std.posix.SOCK.STREAM, std.posix.IPPROTO.TCP);
-        if (std.posix.errno(rc) != .SUCCESS) return error.SocketOpen;
-        return @intCast(rc);
+    pub fn closeFd(fd: sys.Fd) void {
+        sys.closeFd(fd);
     }
 
-    fn closeFd(fd: std.posix.socket_t) void {
-        _ = std.posix.errno(std.posix.system.close(fd));
-    }
-
-    fn setNonblocking(fd: std.posix.socket_t) !void {
-        const flags = std.c.fcntl(fd, std.c.F.GETFL, @as(c_int, 0));
-        if (flags < 0) return error.SocketFlags;
-        var o: std.c.O = @bitCast(@as(u32, @intCast(flags)));
-        o.NONBLOCK = true;
-        if (std.c.fcntl(fd, std.c.F.SETFL, @as(c_int, @bitCast(o))) < 0) return error.SocketFlags;
+    pub fn setNonblocking(fd: sys.Fd) Error!void {
+        try sys.setNonblocking(fd);
     }
 
     fn sockaddrIn(ip4: std.Io.net.Ip4Address) std.posix.sockaddr.in {
@@ -200,25 +751,21 @@ pub const Conn = struct {
     /// Open a stream socket of `family`, connect it to `sa` (a `sockaddr.in`,
     /// a `sockaddr.in6`, or an addrinfo's own sockaddr — all the same bytes to
     /// `connect`), and return the non-blocking `Conn`.
-    fn connectSockaddr(io: std.Io, family: c_int, sa: *const std.posix.sockaddr, len: std.posix.socklen_t) !Conn {
-        const fd = try openStreamSocket(family);
-        errdefer closeFd(fd);
+    fn connectSockaddr(io: std.Io, family: c_int, sa: *const anyopaque, len: u32) !Conn {
+        const fd = try sys.socketFam(family);
+        errdefer sys.closeFd(fd);
         // latency-sensitive protocol: TCP_NODELAY
-        std.posix.setsockopt(fd, std.posix.IPPROTO.TCP, 1, &std.mem.toBytes(@as(c_int, 1))) catch {};
+        sys.setSockOptInt(fd, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, 1) catch {};
         // blocking connect (like the reference client's jnetlib), then go async
-        switch (std.posix.errno(std.posix.system.connect(fd, @ptrCast(sa), len))) {
-            .SUCCESS, .INTR, .INPROGRESS => {},
-            .ISCONN => {},
-            else => return error.ConnectionRefused,
-        }
-        try setNonblocking(fd);
+        sys.connectNow(fd, sa, len) catch return error.ConnectionRefused;
+        try sys.setNonblocking(fd);
         if (builtin.os.tag == .macos) {
             try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.NOSIGPIPE, &std.mem.toBytes(@as(c_int, 1)));
         }
         return connected(io, fd);
     }
 
-    fn connected(io: std.Io, fd: std.posix.socket_t) Conn {
+    fn connected(io: std.Io, fd: sys.Fd) Conn {
         return .{
             .io = io,
             .fd = fd,
@@ -228,29 +775,24 @@ pub const Conn = struct {
     }
 
     pub fn close(self: *Conn) void {
-        closeFd(self.fd);
-        self.fd = -1;
+        sys.closeFd(self.fd);
+        self.fd = sys.invalid;
     }
 
     pub fn isConnected(self: *const Conn) bool {
-        return self.fd >= 0;
+        return !sys.isInvalid(self.fd);
     }
 
     /// Wait until the socket is readable or timeout_ms elapses. Returns true
     /// if readable.
     pub fn pollReadable(self: *Conn, timeout_ms: i32) !bool {
-        if (self.fd < 0) return error.ConnectionClosed;
-        var fds = [_]std.posix.pollfd{.{
-            .fd = self.fd,
-            .events = std.posix.POLL.IN,
-            .revents = 0,
-        }};
-        const n = try std.posix.poll(&fds, timeout_ms);
-        return n > 0 and fds[0].revents != 0;
+        if (sys.isInvalid(self.fd)) return error.ConnectionClosed;
+        const ev = try sys.pollOne(self.fd, true, false, timeout_ms);
+        return ev.in or ev.out or ev.err or ev.nval;
     }
 
     fn fillMore(self: *Conn) Error!void {
-        if (self.fd < 0) return error.ConnectionClosed;
+        if (sys.isInvalid(self.fd)) return error.ConnectionClosed;
         // compact if full
         if (self.rtail == self.rbuf.len) {
             if (self.rhead > 0) {
@@ -262,11 +804,10 @@ pub const Conn = struct {
                 return error.BadFrame; // >64KiB buffered and still no full frame
             }
         }
-        const n = std.posix.read(self.fd, self.rbuf[self.rtail..]) catch |e| switch (e) {
+        const n = sys.readFd(self.fd, self.rbuf[self.rtail..]) catch |e| switch (e) {
             error.WouldBlock => return,
             else => return e,
         };
-        if (n == 0) return error.EndOfStream;
         self.rtail += n;
         self.last_recv_ms = clock.nowMs(self.io);
     }
@@ -300,23 +841,17 @@ pub const Conn = struct {
     }
 
     fn writeAllRaw(self: *Conn, data: []const u8) Error!void {
-        if (self.fd < 0) return error.ConnectionClosed;
+        if (sys.isInvalid(self.fd)) return error.ConnectionClosed;
         var off: usize = 0;
         while (off < data.len) {
-            const rc = std.posix.system.write(self.fd, data[off..].ptr, data[off..].len);
-            switch (std.posix.errno(rc)) {
-                .SUCCESS => off += @intCast(rc),
-                .AGAIN => {
-                    var fds = [_]std.posix.pollfd{.{
-                        .fd = self.fd,
-                        .events = std.posix.POLL.OUT,
-                        .revents = 0,
-                    }};
-                    _ = try std.posix.poll(&fds, 1000);
+            const n = sys.writeFd(self.fd, data[off..]) catch |e| switch (e) {
+                error.WouldBlock => {
+                    _ = try sys.pollOne(self.fd, false, true, 1000);
+                    continue;
                 },
-                .INTR => {},
                 else => return error.ConnectionClosed,
-            }
+            };
+            off += n;
         }
         self.last_send_ms = clock.nowMs(self.io);
     }
@@ -334,22 +869,16 @@ pub const Conn = struct {
     /// path. A partial frame remains owned here until its tail is flushed.
     /// Work is bounded by the fixed queue size, even if the peer keeps reading.
     pub fn flushWrites(self: *Conn) Error!bool {
-        if (self.fd < 0) return error.ConnectionClosed;
+        if (sys.isInvalid(self.fd)) return error.ConnectionClosed;
         while (self.woff < self.wlen) {
             const bytes = self.wbuf[self.woff..self.wlen];
-            const rc = if (builtin.os.tag == .macos)
-                std.posix.system.write(self.fd, bytes.ptr, bytes.len)
-            else
-                std.posix.system.send(self.fd, bytes.ptr, bytes.len, std.posix.MSG.NOSIGNAL);
-            switch (std.posix.errno(rc)) {
-                .SUCCESS => {
-                    if (rc == 0) return error.ConnectionClosed;
-                    self.woff += @intCast(rc);
-                    self.last_send_ms = clock.nowMs(self.io);
-                },
-                .AGAIN, .INTR => return false,
+            const n = sys.sendFd(self.fd, bytes) catch |e| switch (e) {
+                error.WouldBlock => return false,
                 else => return error.ConnectionClosed,
-            }
+            };
+            if (n == 0) return error.ConnectionClosed;
+            self.woff += n;
+            self.last_send_ms = clock.nowMs(self.io);
         }
         self.woff = 0;
         self.wlen = 0;
@@ -428,32 +957,26 @@ pub const Conn = struct {
     /// Measured, before this fix: a half-full socket, a 16 KiB frame, a zero
     /// budget — `false`, and 6000 bytes on the wire.
     fn writeAllBounded(self: *Conn, data: []const u8, budget_ms: i32) Error!SendOutcome {
-        if (self.fd < 0) return error.ConnectionClosed;
+        if (sys.isInvalid(self.fd)) return error.ConnectionClosed;
         if (data.len == 0) return .sent;
         // a deadline, not a per-attempt timeout: three brief stalls inside one
         // budget must not add up to three budgets
         const deadline_ms = clock.nowMs(self.io) + budget_ms;
         var off: usize = 0;
         while (off < data.len) {
-            const rc = std.posix.system.write(self.fd, data[off..].ptr, data[off..].len);
-            switch (std.posix.errno(rc)) {
-                .SUCCESS => off += @intCast(rc),
-                .AGAIN => {
+            const n = sys.writeFd(self.fd, data[off..]) catch |e| switch (e) {
+                error.WouldBlock => {
                     // bytes already accepted are bytes the peer will read, so
                     // from here on the frame is torn no matter what we do
                     if (off > 0) return .partial;
                     const left = deadline_ms - clock.nowMs(self.io);
                     if (left <= 0) return .declined;
-                    var fds = [_]std.posix.pollfd{.{
-                        .fd = self.fd,
-                        .events = std.posix.POLL.OUT,
-                        .revents = 0,
-                    }};
-                    _ = try std.posix.poll(&fds, @intCast(left));
+                    _ = try sys.pollOne(self.fd, false, true, @intCast(left));
+                    continue;
                 },
-                .INTR => {},
                 else => return error.ConnectionClosed,
-            }
+            };
+            off += n;
         }
         self.last_send_ms = clock.nowMs(self.io);
         return .sent;
@@ -515,14 +1038,9 @@ pub const Conn = struct {
     /// `sendMessageBounded` asks the real question itself, so this is only a
     /// cheap pre-gate now, never the authority.
     pub fn writable(self: *Conn) bool {
-        if (self.fd < 0) return false;
-        var fds = [_]std.posix.pollfd{.{
-            .fd = self.fd,
-            .events = std.posix.POLL.OUT,
-            .revents = 0,
-        }};
-        const n = std.posix.poll(&fds, 0) catch return false;
-        return n > 0 and (fds[0].revents & std.posix.POLL.OUT) != 0;
+        if (sys.isInvalid(self.fd)) return false;
+        const ev = sys.pollOne(self.fd, false, true, 0) catch return false;
+        return ev.out;
     }
 
     /// Bytes the kernel can accept on this socket right now, or null if this
@@ -538,70 +1056,54 @@ pub const Conn = struct {
     /// loop and relies on `.partial` to catch a tear — a worse but still
     /// correct failure, never a silent one.
     pub fn sendRoom(self: *Conn) ?usize {
-        if (self.fd < 0) return null;
+        if (sys.isInvalid(self.fd)) return null;
         const cap = sendBufBytes(self.fd) orelse return null;
-        const queued = outqBytes(self.fd) orelse return null;
-        if (queued >= cap) return 0;
-        return cap - queued;
+        const queued = sys.sendQueueBytes(self.fd) orelse return null;
+        if (queued < 0) return 0;
+        const q: usize = @intCast(queued);
+        if (q >= cap) return 0;
+        return cap - q;
     }
 };
 
 /// `SO_SNDBUF`, i.e. the send buffer's capacity in bytes.
-fn sendBufBytes(fd: std.posix.socket_t) ?usize {
-    const v = sockoptI32(fd, @intCast(std.posix.SO.SNDBUF)) orelse return null;
-
+fn sendBufBytes(fd: sys.Fd) ?usize {
+    const v = sys.getSockOptInt(fd, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF) catch return null;
     if (v <= 0) return null;
     return @intCast(v);
 }
 
-/// Darwin's name for the send queue depth: "APPLE: Get number of bytes
-/// currently in send socket buffer". Linux does not have it.
-const so_nwrite: u32 = 0x1024;
+// Bytes queued for transmission and not yet freed by the peer — see
+// `sys.sendQueueBytes`: TIOCOUTQ on Linux, SO_NWRITE on Darwin, null
+// (→ `.partial` backstop) where the OS cannot answer, including Windows.
 
-/// `TIOCOUTQ` in the asm-generic Linux encoding, `_IOR('t', 17, int)`.
-const tiocoutq_linux: c_ulong = 0x5411;
-
-// Bound to the real libc `ioctl` symbol, and that is deliberate: Zig resolves
-// an `extern` declaration by *name*, so a plausible-looking name like
-// `ioctlTIOCOUTQ` compiles cleanly on macOS — where this branch is dead code and
-// never referenced — and then fails at link time on Linux with
-// "undefined symbol: ioctlTIOCOUTQ". The failure is build-only, and only on the
-// one platform that takes this path, which is a good way to lose an afternoon.
-extern "c" fn ioctl(fd: c_int, request: c_ulong, arg: *i32) c_int;
-
-fn sockoptI32(fd: std.posix.socket_t, optname: u32) ?i32 {
-    var v: i32 = 0;
-    var len: std.c.socklen_t = @sizeOf(i32);
-    const rc = std.c.getsockopt(fd, std.posix.SOL.SOCKET, optname, @ptrCast(&v), &len);
-    if (std.posix.errno(rc) != .SUCCESS) return null;
-    return v;
+/// Push bytes until the kernel send queue refuses; returns the byte count
+/// queued. Test fixtures use this to saturate a socket on platforms where a
+/// pinned `SO_SNDBUF` cannot — Windows buffers by internal backlog, not by
+/// the SNDBUF number, so on Windows saturation takes ~128 KiB of queued data
+/// rather than a small pinned buffer. The bytes land in the stream: callers
+/// that also read the peer must drain them first.
+pub fn fillKernelSend(fd: sys.Fd) Error!usize {
+    const junk: [16389]u8 = @splat(0xab);
+    var total: usize = 0;
+    while (true) {
+        const n = sys.sendFd(fd, &junk) catch |e| switch (e) {
+            error.WouldBlock => return total,
+            else => return e,
+        };
+        total += n;
+    }
 }
-
-/// Bytes queued for transmission and not yet freed by the peer.
-///
-/// There is no one way to ask for this, and finding that out was its own
-/// afternoon. `TIOCOUTQ` is the obvious answer and it works on Linux — but
-/// Darwin does not implement it for sockets at all: both the `'t'` spelling from
-/// its own `<sys/ttycom.h>` and the `'f'` spelling return `ENOTSUP`, measured on
-/// a socketpair and on loopback TCP alike. The same number is available on
-/// Darwin as the `SO_NWRITE` socket option instead, which is what the other
-/// branch uses. So: spelled out per target rather than guessed, with an unknown
-/// target yielding null — which disables the pre-check and falls back to the
-/// `.partial` backstop, a worse but still safe answer.
-fn outqBytes(fd: std.posix.socket_t) ?usize {
-    var q: ?i32 = switch (builtin.os.tag) {
-        .linux => blk: {
-            var v: i32 = 0;
-            if (std.posix.errno(ioctl(fd, tiocoutq_linux, &v)) != .SUCCESS) break :blk null;
-            break :blk v;
-        },
-        .macos, .ios, .tvos, .watchos => sockoptI32(fd, so_nwrite),
-        else => null,
-    };
-    q = q orelse return null;
-    if (q.? < 0) return 0;
-    return @intCast(q.?);
-}
+//
+// There is no one way to ask for this, and finding that out was its own
+// afternoon. `TIOCOUTQ` is the obvious answer and it works on Linux — but
+// Darwin does not implement it for sockets at all: both the `'t'` spelling from
+// its own `<sys/ttycom.h>` and the `'f'` spelling return `ENOTSUP`, measured on
+// a socketpair and on loopback TCP alike. The same number is available on
+// Darwin as the `SO_NWRITE` socket option instead. So: spelled out per target
+// rather than guessed, with an unknown target yielding null — which disables
+// the pre-check and falls back to the `.partial` backstop, a worse but still
+// safe answer.
 
 test "framing constants" {
     try std.testing.expectEqual(@as(u32, 16384), max_payload);
@@ -617,41 +1119,69 @@ test "framing constants" {
 // to any test that does not actually cross a socket.
 
 /// Reads exactly `buf.len` bytes off a blocking socket; EOF mid-read fails.
-fn readExact(fd: std.posix.socket_t, buf: []u8) !void {
+fn readExact(fd: sys.Fd, buf: []u8) !void {
     var got: usize = 0;
     while (got < buf.len) {
-        const n = try std.posix.read(fd, buf[got..]);
-        if (n == 0) return error.EndOfStream;
+        const n = sys.readFd(fd, buf[got..]) catch |e| switch (e) {
+            error.EndOfStream => return error.EndOfStream,
+            else => return e,
+        };
         got += n;
     }
 }
 
+/// A loopback listener built on the `sys` seam rather than `std.Io.net`:
+/// on Windows the Io.net listener's handle is a kernel AFD endpoint, not a
+/// Winsock SOCKET, so only `sys` can accept on a socket `Conn` can reach.
+/// (The fixtures exercise `Conn` end-to-end, which is Winsock on Windows.)
+fn loopbackListener(ip: std.Io.net.IpAddress) !sys.Fd {
+    sys.ensureWsa();
+    switch (ip) {
+        .ip4 => |ip4| {
+            const lfd = try sys.socketFam(std.posix.AF.INET);
+            errdefer sys.closeFd(lfd);
+            const sa = Conn.sockaddrIn(ip4);
+            try sys.bindFd(lfd, &sa, @sizeOf(@TypeOf(sa)));
+            try sys.listenFd(lfd, 4);
+            return lfd;
+        },
+        .ip6 => |ip6| {
+            const lfd = try sys.socketFam(std.posix.AF.INET6);
+            errdefer sys.closeFd(lfd);
+            const sa = Conn.sockaddrIn6(ip6);
+            try sys.bindFd(lfd, &sa, @sizeOf(@TypeOf(sa)));
+            try sys.listenFd(lfd, 4);
+            return lfd;
+        },
+    }
+}
+
 /// One framed round-trip over a freshly connected `Conn`: connect to the
-/// already-listening `server` by `host` text, then check the exchange.
-fn expectRoundTrip(io: std.Io, host: []const u8, server: *std.Io.net.Server) !void {
-    const port = server.socket.address.getPort();
+/// already-listening `lfd` by `host` text, then check the exchange.
+fn expectRoundTrip(io: std.Io, host: []const u8, lfd: sys.Fd) !void {
+    const port = sys.boundPort(lfd);
     var conn = try Conn.connect(io, host, port);
     defer conn.close();
-    try assertRoundTrip(&conn, server);
+    try assertRoundTrip(&conn, lfd);
 }
 
 /// The exchange itself: send a message from the client side and check the
 /// bytes the server-side socket receives — type byte, little-endian length,
-/// payload — the whole framing contract in one exchange. `server` must already
+/// payload — the whole framing contract in one exchange. `lfd` must already
 /// have `conn` in its backlog.
-fn assertRoundTrip(conn: *Conn, server: *std.Io.net.Server) !void {
-    const flags: std.c.O = @bitCast(@as(u32, @intCast(std.c.fcntl(conn.fd, std.c.F.GETFL, @as(c_int, 0)))));
-    try std.testing.expect(flags.NONBLOCK);
+fn assertRoundTrip(conn: *Conn, lfd: sys.Fd) !void {
+    // O_NONBLOCK is observable via fcntl on posix; on Windows nonblocking is
+    // FIONBIO state with no query back, so the flag check is posix-only.
+    if (builtin.os.tag != .windows) {
+        const flags: std.c.O = @bitCast(@as(u32, @intCast(std.c.fcntl(conn.fd, std.c.F.GETFL, @as(c_int, 0)))));
+        try std.testing.expect(flags.NONBLOCK);
+    }
     try conn.sendMessage(0x41, "hello");
 
     // Accept *after* the client has connected and sent: the connection waits
     // in the listener's backlog and the bytes in the kernel's buffers, so the
-    // whole exchange needs no second thread. Accept goes through raw posix
-    // (harness style): the listener here is blocking, and the io vtable's
-    // accept asserts its own blocking assumptions we do not need.
-    const rc = std.posix.system.accept(server.socket.handle, null, null);
-    try std.testing.expectEqual(std.posix.errno(rc), .SUCCESS);
-    const cfd: std.posix.socket_t = @intCast(rc);
+    // whole exchange needs no second thread. The listener here is blocking.
+    const cfd = sys.acceptFd(lfd) orelse return error.AcceptFailed;
     defer Conn.closeFd(cfd);
 
     var buf: [10]u8 = undefined;
@@ -661,28 +1191,24 @@ fn assertRoundTrip(conn: *Conn, server: *std.Io.net.Server) !void {
     try std.testing.expectEqualStrings("hello", buf[5..10]);
 }
 
-fn loopbackServer(family: std.Io.net.IpAddress) !std.Io.net.Server {
-    return family.listen(std.testing.io, .{});
-}
-
 test "connect: dotted-quad IPv4 literal round-trips a frame" {
-    var server = try loopbackServer(.{ .ip4 = .loopback(0) });
-    defer server.deinit(std.testing.io);
-    try expectRoundTrip(std.testing.io, "127.0.0.1", &server);
+    const lfd = try loopbackListener(.{ .ip4 = .loopback(0) });
+    defer sys.closeFd(lfd);
+    try expectRoundTrip(std.testing.io, "127.0.0.1", lfd);
 }
 
 test "connect: IPv6 literal round-trips a frame" {
     // The skip is for containers with IPv6 switched off at the kernel, where
     // binding ::1 fails and no test in the repo could exercise this path.
-    // Everywhere this suite is expected to run — macOS and Linux CI runners
-    // both answer on ::1 — this is a real assertion: `::1` must reach the
-    // AF.INET6 socket.
-    var server = loopbackServer(.{ .ip6 = .loopback(0) }) catch |e| switch (e) {
-        error.AddressUnavailable => return error.SkipZigTest,
+    // Everywhere this suite is expected to run — macOS, Linux and Windows CI
+    // runners all answer on ::1 — this is a real assertion: `::1` must reach
+    // the AF.INET6 socket.
+    const lfd = loopbackListener(.{ .ip6 = .loopback(0) }) catch |e| switch (e) {
+        error.BindFailed, error.SocketOpen => return error.SkipZigTest,
         else => return e,
     };
-    defer server.deinit(std.testing.io);
-    try expectRoundTrip(std.testing.io, "::1", &server);
+    defer sys.closeFd(lfd);
+    try expectRoundTrip(std.testing.io, "::1", lfd);
 }
 
 test "connect: hostname resolves through AF.UNSPEC and falls through families" {
@@ -691,9 +1217,9 @@ test "connect: hostname resolves through AF.UNSPEC and falls through families" {
     // the fallthrough — so this test proves the resolution path only, and the
     // fallthrough has its own seam test below that does not depend on the
     // resolver's mood.
-    var server = try loopbackServer(.{ .ip4 = .loopback(0) });
-    defer server.deinit(std.testing.io);
-    try expectRoundTrip(std.testing.io, "localhost", &server);
+    const lfd = try loopbackListener(.{ .ip4 = .loopback(0) });
+    defer sys.closeFd(lfd);
+    try expectRoundTrip(std.testing.io, "localhost", lfd);
 }
 
 test "connect: a refused candidate falls through to the next family" {
@@ -703,9 +1229,9 @@ test "connect: a refused candidate falls through to the next family" {
     // is not a failed host" is exercised no matter how this machine's
     // resolver orders localhost. Mutating `connectCandidates` to break on the
     // first refused candidate fails exactly here.
-    var server = try loopbackServer(.{ .ip4 = .loopback(0) });
-    defer server.deinit(std.testing.io);
-    const port = server.socket.address.getPort();
+    const lfd = try loopbackListener(.{ .ip4 = .loopback(0) });
+    defer sys.closeFd(lfd);
+    const port = sys.boundPort(lfd);
 
     var dead: std.posix.sockaddr.in6 = std.mem.zeroes(std.posix.sockaddr.in6);
     dead.family = std.posix.AF.INET6;
@@ -721,7 +1247,7 @@ test "connect: a refused candidate falls through to the next family" {
     };
     var conn = try Conn.connectCandidates(std.testing.io, &cands);
     defer conn.close();
-    try assertRoundTrip(&conn, &server);
+    try assertRoundTrip(&conn, lfd);
 }
 
 test "sockaddrIn6: builds the wire struct for a loopback literal" {
@@ -734,14 +1260,28 @@ test "sockaddrIn6: builds the wire struct for a loopback literal" {
     try std.testing.expectEqual(@as(u32, 0), sa.scope_id);
 }
 
-fn nonblockingTestPair() ![2]std.posix.socket_t {
-    var fds: [2]std.posix.socket_t = undefined;
-    if (std.posix.errno(std.posix.system.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds)) != .SUCCESS) return error.SocketPairFailed;
+fn nonblockingTestPair() ![2]sys.Fd {
+    const fds = try sys.socketpair();
     errdefer for (fds) |fd| Conn.closeFd(fd);
     for (fds) |fd| try Conn.setNonblocking(fd);
-    try std.posix.setsockopt(fds[0], std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, &std.mem.toBytes(@as(c_int, 4096)));
-    try std.posix.setsockopt(fds[1], std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, &std.mem.toBytes(@as(c_int, 4096)));
+    try sys.setSockOptInt(fds[0], std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, 4096);
+    try sys.setSockOptInt(fds[1], std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, 4096);
     return fds;
+}
+
+/// Read up to `want` bytes off a nonblocking socket, retrying WouldBlock,
+/// and return how many arrived.
+fn drainSome(fd: sys.Fd, want: usize) !usize {
+    var got: usize = 0;
+    var tries: u32 = 0;
+    var buf: [8192]u8 = undefined;
+    while (got < want and tries < 100000) : (tries += 1) {
+        got += sys.readFd(fd, buf[0..@min(want - got, buf.len)]) catch |e| switch (e) {
+            error.WouldBlock => continue,
+            else => return e,
+        };
+    }
+    return got;
 }
 
 test "#14: a partial frame retains its tail ahead of control messages, without waiting" {
@@ -749,12 +1289,34 @@ test "#14: a partial frame retains its tail ahead of control messages, without w
     defer for (fds) |fd| Conn.closeFd(fd);
     var conn = Conn{ .io = std.testing.io, .fd = fds[0] };
     const payload = [_]u8{0x5a} ** max_payload;
+    // Saturate the kernel send queue first: a pinned SO_SNDBUF does the job
+    // on posix, but Windows ignores that pin and only stalls on its internal
+    // backlog (~128 KiB measured) — so fill until WouldBlock either way. The
+    // filler bytes are drained from the peer below, ahead of the frames.
+    const prefill = try fillKernelSend(fds[0]);
+    var junk_left = prefill;
     const t0 = clock.nowNs(std.testing.io);
     // Control queuing uses the same writer as uploads and deliberately bypasses
     // the advisory sendRoom gate. Force a short write to test tail ownership.
     try conn.queueMessage(0x84, &payload);
-    try std.testing.expect(conn.woff > 0);
-    try std.testing.expect(conn.woff < conn.wlen);
+    if (builtin.os.tag == .windows) {
+        // Winsock's nonblocking send() never partial-copies — it takes the
+        // whole buffer or refuses it — so there is no woff>0 middle to land
+        // on. The tail sits in wbuf whole, and wlen>0 is the same ownership
+        // guarantee the posix branch measures as a consumed prefix.
+        try std.testing.expect(conn.wlen > 0);
+    } else {
+        // Where a pinned buffer makes the first write partial by itself, some
+        // posix kernels need the room opened a little at a time: drain filler
+        // 1 KiB per pass until the kernel accepts some-but-not-all.
+        var guard: u32 = 0;
+        while (conn.woff == 0 and junk_left > 0 and guard < 256) : (guard += 1) {
+            junk_left -= try drainSome(fds[1], @min(junk_left, 1024));
+            _ = try conn.flushWrites();
+        }
+        try std.testing.expect(conn.woff > 0);
+        try std.testing.expect(conn.woff < conn.wlen);
+    }
     try conn.queueMessage(0xc0, "ping");
     try std.testing.expectEqual(WriteOutcome.declined, try conn.trySendMessage(0x83, "next bar"));
     try std.testing.expect(clock.nowNs(std.testing.io) - t0 < 500 * std.time.ns_per_ms);
@@ -769,15 +1331,21 @@ test "#14: a partial frame retains its tail ahead of control messages, without w
 
     var received: [expected.len]u8 = undefined;
     var got: usize = 0;
-    const deadline = clock.nowMs(std.testing.io) + 2000;
-    while (got < received.len and clock.nowMs(std.testing.io) < deadline) {
+    var junk: [8192]u8 = undefined;
+    const deadline = clock.nowMs(std.testing.io) + 5000;
+    while ((junk_left > 0 or got < received.len) and clock.nowMs(std.testing.io) < deadline) {
         _ = try conn.flushWrites();
-        const n = std.posix.read(fds[1], received[got..]) catch |e| switch (e) {
-            error.WouldBlock => continue,
-            else => return e,
-        };
-        if (n == 0) return error.EndOfStream;
-        got += n;
+        if (junk_left > 0) {
+            junk_left -= sys.readFd(fds[1], junk[0..@min(junk_left, junk.len)]) catch |e| switch (e) {
+                error.WouldBlock => continue,
+                else => return e,
+            };
+        } else {
+            got += sys.readFd(fds[1], received[got..]) catch |e| switch (e) {
+                error.WouldBlock => continue,
+                else => return e,
+            };
+        }
     }
     try std.testing.expectEqual(expected.len, got);
     try std.testing.expectEqualSlices(u8, &expected, &received);
@@ -790,6 +1358,10 @@ test "#14: the control queue is bounded even while the peer never drains" {
     defer for (fds) |fd| Conn.closeFd(fd);
     var conn = Conn{ .io = std.testing.io, .fd = fds[0] };
     const payload = [_]u8{0x5a} ** max_payload;
+    // Saturate the kernel queue so the wbuf has to carry the frames — on
+    // Windows the SNDBUF pin above is advisory and this is the only way to
+    // get the socket to refuse bytes.
+    _ = try fillKernelSend(fds[0]);
     var full = false;
     for (0..8) |_| {
         conn.queueMessage(0xc0, &payload) catch |e| {
@@ -809,11 +1381,11 @@ test "#14: an incomplete incoming frame yields and resumes from buffered bytes" 
     var payload = bufmod.Buf.init(std.testing.allocator);
     defer payload.deinit();
     const first = "\xc0\x06\x00\x00\x00abc";
-    try std.testing.expectEqual(@as(isize, first.len), std.posix.system.write(fds[0], first.ptr, first.len));
+    try std.testing.expectEqual(first.len, try sys.writeFd(fds[0], first));
     const t0 = clock.nowNs(std.testing.io);
     try std.testing.expectError(error.WouldBlock, conn.readMessage(&payload));
     try std.testing.expect(clock.nowNs(std.testing.io) - t0 < 500 * std.time.ns_per_ms);
-    try std.testing.expectEqual(@as(isize, 3), std.posix.system.write(fds[0], "def", 3));
+    try std.testing.expectEqual(@as(usize, 3), try sys.writeFd(fds[0], "def"));
     const msg = try conn.readMessage(&payload);
     try std.testing.expectEqual(@as(u8, 0xc0), msg.mtype);
     try std.testing.expectEqualStrings("abcdef", msg.payload);
