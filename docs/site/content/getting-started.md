@@ -12,7 +12,7 @@ an audio device, a room account, or a willing audience.
 
 ## 1. Get the source
 
-Install [Zig 0.16.0](https://ziglang.org/download/) and Git on macOS or Linux.
+Install [Zig 0.17.0](https://ziglang.org/download/) and Git on macOS or Linux.
 Run these commands in a terminal:
 
 ```bash
@@ -22,7 +22,7 @@ zig version
 zig build -Doptimize=ReleaseSafe
 ```
 
-`zig version` should print `0.16.0`. The build installs three executables in
+`zig version` should print `0.17.0`. The build installs three executables in
 `zig-out/bin`: `fart`, `kujamba`, and `audit`. Ogg/Vorbis sources are vendored;
 there is no npm install step.
 

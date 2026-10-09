@@ -409,7 +409,7 @@ test "#14: a frame bigger than the whole socket is refused, not waited on" {
     // would be a worse failure than a dropped bar
     var sink: [65536]u8 = undefined;
     _ = drainSocket(fds[1], &sink);
-    const small = [_]u8{0x01} ** 256;
+    const small: [256]u8 = @splat(0x01);
     try std.testing.expectEqual(net.SendOutcome.sent, try conn.sendMessageBounded(proto.MSG_UPLOAD_INTERVAL_BEGIN, &small, 0));
 }
 
@@ -1172,7 +1172,7 @@ test "#14: a full socket fails the write immediately instead of blocking forever
     var sink: [65536]u8 = undefined;
     _ = drainSocket(fds[1], &sink);
     try std.testing.expect(conn.writable());
-    const small = [_]u8{0x01} ** 256;
+    const small: [256]u8 = @splat(0x01);
     try std.testing.expectEqual(net.SendOutcome.sent, try conn.sendMessageBounded(proto.MSG_UPLOAD_INTERVAL_BEGIN, &small, 0));
 }
 
@@ -1241,7 +1241,7 @@ test "#14: sendRoom is never optimistic about the room it promises" {
     // a live TCP connection and whatever the kernel has done with the first
     // frame's 16 KiB since — which is how this test failed once, under load,
     // with the gate behaving correctly.
-    const small = [_]u8{0x01} ** 256;
+    const small: [256]u8 = @splat(0x01);
     try std.testing.expectEqual(net.SendOutcome.sent, try conn.sendMessageBounded(proto.MSG_UPLOAD_INTERVAL_BEGIN, &small, session.upload_write_budget_ms));
 }
 
@@ -1290,11 +1290,11 @@ const ReconnectScript = struct {
 const ReconnectView = struct {
     generic: ServerView = .{},
     conn_count: usize = 0,
-    uploads_per_conn: [8]u32 = [_]u32{0} ** 8,
+    uploads_per_conn: [8]u32 = @splat(0),
     /// the guid bytes of every 0x83 upload-begin, per connection, in arrival
     /// order. 0x83 payloads start with the 16-byte guid.
     guids: [8][24][16]u8 = undefined,
-    guid_counts: [8]usize = [_]usize{0} ** 8,
+    guid_counts: [8]usize = @splat(0),
 
     fn recordBegin(self: *ReconnectView, conn_idx: usize, payload: []const u8) void {
         if (conn_idx >= self.uploads_per_conn.len or payload.len < 16) return;

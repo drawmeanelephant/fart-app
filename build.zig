@@ -28,7 +28,7 @@ pub fn build(b: *std.Build) void {
 
     const run_fart = b.addRunArtifact(fart_exe);
     run_fart.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_fart.addArgs(args);
+    run_fart.addPassthruArgs();
     const run_step = b.step("run", "Run the fart app");
     run_step.dependOn(&run_fart.step);
 
@@ -47,7 +47,7 @@ pub fn build(b: *std.Build) void {
 
     const run_audit = b.addRunArtifact(audit_exe);
     run_audit.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_audit.addArgs(args);
+    run_audit.addPassthruArgs();
     const audit_step = b.step("audit", "Run the RAG audit manifest generator");
     audit_step.dependOn(&run_audit.step);
 
@@ -67,7 +67,7 @@ pub fn build(b: *std.Build) void {
 
     const run_kujamba = b.addRunArtifact(kujamba_exe);
     run_kujamba.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_kujamba.addArgs(args);
+    run_kujamba.addPassthruArgs();
     const kujamba_run_step = b.step("run-kujamba", "Run the kujamba NINJAM instrument");
     kujamba_run_step.dependOn(&run_kujamba.step);
 
@@ -84,7 +84,7 @@ pub fn build(b: *std.Build) void {
     });
     kujambaDeps(b, backpressure_exe.root_module, live, live_option);
     const run_backpressure = b.addRunArtifact(backpressure_exe);
-    if (b.args) |args| run_backpressure.addArgs(args);
+    run_backpressure.addPassthruArgs();
     const backpressure_step = b.step("repro-backpressure", "Measure a real session on a constrained stream socket");
     backpressure_step.dependOn(&run_backpressure.step);
 
@@ -239,4 +239,8 @@ const kujamba_c_sources = [_][]const u8{
     "libvorbis/lib/vorbisenc.c",
     "libvorbis/lib/window.c",
     "stb_vorbis_impl.c",
+    // The encoder's libogg/libvorbis state structs are caller-allocated with
+    // no size query, so vorbis.zig reaches them through this shim TU — the
+    // same zc_* pattern as miniaudio_impl.c (Zig 0.17 removed @cImport).
+    "vorbis_enc_shim.c",
 };

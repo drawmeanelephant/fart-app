@@ -45,7 +45,7 @@ permissions:
   contents: read
 
 env:
-  ZIG_VERSION: "0.16.0"
+  ZIG_VERSION: "0.17.0"
 
 jobs:
   build-test:
@@ -66,7 +66,7 @@ jobs:
           echo "downloading $url"
           curl -fsSL "$url" -o "$tarball"
           # checksum from https://ziglang.org/download/index.json
-          echo "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00  ${tarball}" | sha256sum -c -
+          echo "1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026  ${tarball}" | sha256sum -c -
           tar -xJf "$tarball"
           echo "${GITHUB_WORKSPACE}/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
 
@@ -123,7 +123,7 @@ jobs:
           echo "downloading $url"
           curl -fsSL "$url" -o "$tarball"
           # checksum from https://ziglang.org/download/index.json
-          echo "b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489  ${tarball}" | shasum -a 256 -c -
+          echo "b607e9b9234790a008116ae5bdb71c6243b84b9fb42a53a9e70fde41c06c536a  ${tarball}" | shasum -a 256 -c -
           tar -xf "$tarball"
           echo "${GITHUB_WORKSPACE}/zig-aarch64-macos-${ZIG_VERSION}" >> "$GITHUB_PATH"
 
@@ -171,7 +171,7 @@ jobs:
           echo "downloading $url"
           curl -fsSL "$url" -o "$tarball"
           # checksum from https://ziglang.org/download/index.json
-          echo "68659eb5f1e4eb1437a722f1dd889c5a322c9954607f5edcf337bc3684a75a7e  ${tarball}" | sha256sum -c -
+          echo "b5663f69581dcf391293fbf16c06cb80d81d806545ce618b4d0bab7f0eb8c428  ${tarball}" | sha256sum -c -
           unzip -q -o "$tarball"
           echo "${GITHUB_WORKSPACE}/zig-x86_64-windows-${ZIG_VERSION}" >> "$GITHUB_PATH"
 
@@ -251,7 +251,7 @@ jobs:
           echo "downloading $url"
           curl -fsSL "$url" -o "$tarball"
           # checksum from https://ziglang.org/download/index.json
-          echo "b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489  ${tarball}" | shasum -a 256 -c -
+          echo "b607e9b9234790a008116ae5bdb71c6243b84b9fb42a53a9e70fde41c06c536a  ${tarball}" | shasum -a 256 -c -
           tar -xf "$tarball"
           echo "${GITHUB_WORKSPACE}/zig-aarch64-macos-${ZIG_VERSION}" >> "$GITHUB_PATH"
 

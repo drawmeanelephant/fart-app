@@ -2,15 +2,26 @@ const std = @import("std");
 const builtin = @import("builtin");
 const synth = @import("synth.zig");
 const clock = @import("ninjam/clock.zig");
-// No unistd.h here: usleep/getpid do not reach Windows (#25). The sleeps are
-// `sleepUs` on the Io clock and the RNG seeds from the same clock; the posix
-// signal() install sits behind the builtin.os.tag switch in main().
-const libc = @cImport({
-    @cInclude("stdio.h");
-    @cInclude("stdlib.h");
-    @cInclude("time.h");
-    @cInclude("signal.h");
-});
+// The whole libc surface this file needs, declared by hand: Zig 0.17 removed
+// @cImport (translate-c moved out of the compiler) and std.c keeps no
+// printf/system/signal decls. The sleeps are `sleepUs` on the Io clock, the
+// RNG seeds from the same clock, and the posix signal() install sits behind
+// the builtin.os.tag switch in main() (#25).
+const libc = struct {
+    const FILE = opaque {};
+
+    extern fn printf(format: [*:0]const u8, ...) c_int;
+    extern fn fflush(stream: ?*FILE) c_int;
+    extern fn fopen(path: [*:0]const u8, mode: [*:0]const u8) ?*FILE;
+    extern fn fwrite(ptr: [*]const u8, size: usize, nmemb: usize, stream: *FILE) usize;
+    extern fn fclose(stream: *FILE) c_int;
+    extern fn system(command: [*:0]const u8) c_int;
+    extern fn srand(seed: c_uint) void;
+    extern fn rand() c_int;
+    extern fn signal(sig: c_int, handler: ?*const fn (c_int) callconv(.c) void) ?*const fn (c_int) callconv(.c) void;
+
+    const SIGINT: c_int = 2;
+};
 
 const win = std.os.windows;
 const CTRL_C_EVENT: win.DWORD = 0;
@@ -46,9 +57,9 @@ var process_env: *std.process.Environ.Map = undefined;
 /// (or the cwd as last resort) on Windows.
 fn tmpWavPath(buf: []u8, name: []const u8) ?[:0]const u8 {
     if (builtin.os.tag != .windows)
-        return std.fmt.bufPrintZ(buf, "/tmp/{s}", .{name}) catch null;
+        return std.mem.printSentinel(buf, "/tmp/{s}", .{name}, 0) catch null;
     const temp = process_env.get("TEMP") orelse process_env.get("TMP") orelse ".";
-    return std.fmt.bufPrintZ(buf, "{s}\\{s}", .{ temp, name }) catch null;
+    return std.mem.printSentinel(buf, "{s}\\{s}", .{ temp, name }, 0) catch null;
 }
 
 const butt_frames = [_][]const u8{
@@ -137,9 +148,9 @@ fn haveCommand(cmd: []const u8) bool {
     var buf: [128]u8 = undefined;
     // `command -v` is a POSIX shell builtin; `where` is the Windows answer.
     const probe = if (builtin.os.tag == .windows)
-        std.fmt.bufPrintZ(&buf, "where {s} >NUL 2>NUL", .{cmd}) catch return false
+        std.mem.printSentinel(&buf, "where {s} >NUL 2>NUL", .{cmd}, 0) catch return false
     else
-        std.fmt.bufPrintZ(&buf, "command -v {s} >/dev/null 2>&1", .{cmd}) catch return false;
+        std.mem.printSentinel(&buf, "command -v {s} >/dev/null 2>&1", .{cmd}, 0) catch return false;
     return libc.system(probe.ptr) == 0;
 }
 
@@ -162,10 +173,10 @@ fn probeSpeech() bool {
 /// nothing to play with.
 fn soundCommand(buf: []u8, player: AudioPlayer, path: []const u8, volume: u8) ?[:0]const u8 {
     return switch (player) {
-        .afplay => std.fmt.bufPrintZ(buf, "afplay -v {d} {s} &", .{ volume, path }) catch null,
-        .paplay => std.fmt.bufPrintZ(buf, "paplay --volume={d} {s} &", .{ volume, path }) catch null,
-        .aplay => std.fmt.bufPrintZ(buf, "aplay -q {s} &", .{path}) catch null,
-        .ffplay => std.fmt.bufPrintZ(buf, "ffplay -loglevel quiet -nodisp -autoexit {s} &", .{path}) catch null,
+        .afplay => std.mem.printSentinel(buf, "afplay -v {d} {s} &", .{ volume, path }, 0) catch null,
+        .paplay => std.mem.printSentinel(buf, "paplay --volume={d} {s} &", .{ volume, path }, 0) catch null,
+        .aplay => std.mem.printSentinel(buf, "aplay -q {s} &", .{path}, 0) catch null,
+        .ffplay => std.mem.printSentinel(buf, "ffplay -loglevel quiet -nodisp -autoexit {s} &", .{path}, 0) catch null,
         .none => null,
     };
 }
@@ -182,9 +193,9 @@ fn playSound(path: [:0]const u8, volume: u8) void {
 fn speak(voice: []const u8, text: []const u8) void {
     var buf: [256]u8 = undefined;
     const cmd = if (builtin.os.tag == .macos)
-        std.fmt.bufPrintZ(&buf, "say -v '{s}' '{s}' &", .{ voice, text }) catch return
+        std.mem.printSentinel(&buf, "say -v '{s}' '{s}' &", .{ voice, text }, 0) catch return
     else if (speech_available)
-        std.fmt.bufPrintZ(&buf, "espeak '{s}' &", .{text}) catch return
+        std.mem.printSentinel(&buf, "espeak '{s}' &", .{text}, 0) catch return
     else
         return;
     _ = libc.system(cmd.ptr);

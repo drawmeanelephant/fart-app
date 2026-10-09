@@ -40,7 +40,7 @@ No room, microphone, or speaker needed to render. Your dignity is optional.
 
 ## The joke is not the specification
 
-This is source-first software for **macOS and Linux**, built with **Zig 0.16.0**.
+This is source-first software for **macOS and Linux**, built with **Zig 0.17.0**.
 The headless room instrument never opens a microphone or speaker. Local audition
 is a separate, playback-only path.
 

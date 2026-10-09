@@ -9,7 +9,7 @@ summary: Audio, command, connection, and evidence problems without magical fixes
 
 ## The build fails with unfamiliar Zig APIs
 
-Use **Zig 0.16.0**, checked by `zig version`. The project uses its current I/O
+Use **Zig 0.17.0**, checked by `zig version`. The project uses its current I/O
 and build APIs. “A recent Zig” is not a sufficient compatibility guarantee.
 
 ## The terminal animates but makes no sound

@@ -114,7 +114,7 @@ pub const Config = struct {
     knobs: synth.VoiceKnobs = .{},
     /// the [map] table (#21): note -> sound for `kujamba trigger`. Slots the
     /// file leaves alone stay `.none`. Phrase slices point into the file text.
-    map: [128]NoteSound = [_]NoteSound{.none} ** 128,
+    map: [128]NoteSound = @splat(.none),
 };
 
 /// One [map] binding: MIDI note N plays a wordless shuzi by seed, or a whole
@@ -193,7 +193,7 @@ pub fn parse(text_in: []const u8, diag: *Diag) ParseError!Config {
     var in_map = false;
     var seen_voice = false;
     var seen_map = false;
-    var seen_notes: [128]bool = [_]bool{false} ** 128;
+    var seen_notes: [128]bool = @splat(false);
     var seen_host = false;
     var seen_user = false;
     var seen_pass = false;
@@ -311,7 +311,7 @@ pub fn parse(text_in: []const u8, diag: *Diag) ParseError!Config {
 const Knob = enum(u3) { attack, noise, wobble, intensity, cents };
 
 fn knobBit(k: Knob) u8 {
-    return @as(u8, 1) << @intCast(@intFromEnum(k));
+    return @as(u8, 1) << @intCast(@backingInt(k));
 }
 
 /// One voice knob from config text, with parseKnobs' own rules for --voice:

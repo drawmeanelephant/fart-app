@@ -33,10 +33,14 @@ const kujamba_config = @import("kujamba_config.zig");
 const builtin = @import("builtin");
 // libc only for the posix signal install path — Windows stops through the
 // console control handler below, and both sides sleep on the Io clock now
-// that unistd.h's usleep no longer reaches Windows (#25).
-const libc = if (builtin.os.tag == .windows) struct {} else @cImport({
-    @cInclude("signal.h");
-});
+// that unistd.h's usleep no longer reaches Windows (#25). Zig 0.17 removed
+// @cImport, so the two constants and signal() are declared directly.
+const libc = if (builtin.os.tag == .windows) struct {} else struct {
+    const SIGINT: c_int = 2;
+    const SIGTERM: c_int = 15;
+
+    extern fn signal(sig: c_int, handler: ?*const fn (c_int) callconv(.c) void) ?*const fn (c_int) callconv(.c) void;
+};
 
 const win = std.os.windows;
 const CTRL_C_EVENT: win.DWORD = 0;
@@ -852,7 +856,7 @@ fn cmdPlay(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: [
     var probe_buf: [256]u8 = undefined;
     const probe = audio.Device.probePlayback(&probe_buf);
     const dev_id: ?[*:0]const u8 = if (device) |d|
-        (arena.dupeZ(u8, d) catch fail(io, "out of memory", .{})).ptr
+        (arena.dupeSentinel(u8, d, 0) catch fail(io, "out of memory", .{})).ptr
     else
         null;
     const dev = audio.Device.openPlayback(gpa, kujamba_out.sample_rate, play_period_frames, dev_id) catch |e| {
@@ -939,10 +943,10 @@ fn cmdTrigger(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv
         }
     }
     const cfg = loadConfigFile(io, arena, argv);
-    const map = if (cfg) |*c| c.map else [_]kujamba_config.NoteSound{.none} ** 128;
+    const map = if (cfg) |*c| c.map else @as([128]kujamba_config.NoteSound, @splat(.none));
 
     const dev_id: ?[*:0]const u8 = if (device) |d|
-        (arena.dupeZ(u8, d) catch fail(io, "out of memory", .{})).ptr
+        (arena.dupeSentinel(u8, d, 0) catch fail(io, "out of memory", .{})).ptr
     else
         null;
     const dev = audio.Device.openPlayback(gpa, kujamba_out.sample_rate, play_period_frames, dev_id) catch |e| {
@@ -1136,7 +1140,7 @@ const RecordingSink = struct {
 };
 
 test "trigger engine: note-on renders the mapped phrase into the sink" {
-    var map = [_]kujamba_config.NoteSound{.none} ** 128;
+    var map: [128]kujamba_config.NoteSound = @splat(.none);
     map[60] = .{ .phrase = "po" };
     var sink_state = RecordingSink{};
     var engine = TriggerEngine.init(testing.allocator, .{
@@ -1154,7 +1158,7 @@ test "trigger engine: note-on renders the mapped phrase into the sink" {
 }
 
 test "trigger engine: shuzi seeds render real audio via the wav decode" {
-    var map = [_]kujamba_config.NoteSound{.none} ** 128;
+    var map: [128]kujamba_config.NoteSound = @splat(.none);
     map[61] = .{ .shuzi = 3 };
     var sink_state = RecordingSink{};
     var engine = TriggerEngine.init(testing.allocator, .{
@@ -1170,7 +1174,7 @@ test "trigger engine: shuzi seeds render real audio via the wav decode" {
 }
 
 test "trigger engine: unmapped notes and bad lines are tolerated" {
-    var map = [_]kujamba_config.NoteSound{.none} ** 128;
+    var map: [128]kujamba_config.NoteSound = @splat(.none);
     var sink_state = RecordingSink{};
     var engine = TriggerEngine.init(testing.allocator, .{
         .map = &map,
@@ -1193,7 +1197,7 @@ test "trigger engine: unmapped notes and bad lines are tolerated" {
 }
 
 test "trigger engine: same seed renders the same bytes (deterministic)" {
-    var map = [_]kujamba_config.NoteSound{.none} ** 128;
+    var map: [128]kujamba_config.NoteSound = @splat(.none);
     map[61] = .{ .shuzi = 3 };
     var s1 = RecordingSink{};
     var s2 = RecordingSink{};

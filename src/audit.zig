@@ -42,7 +42,7 @@ pub fn findSurroundingFunction(content: []const u8, start_idx: usize) []const u8
 }
 
 pub fn detectAdversarial(allocator: std.mem.Allocator, content: []const u8) ![]const u8 {
-    const z_content = try allocator.dupeZ(u8, content);
+    const z_content = try allocator.dupeSentinel(u8, content, 0);
     defer allocator.free(z_content);
 
     var tokenizer = std.zig.Tokenizer.init(z_content);
@@ -154,7 +154,9 @@ const WaitGroup = struct {
     pub fn wait(self: *WaitGroup) void {
         while (self.count.load(.acquire) > 0) {
             var spin: usize = 0;
-            while (spin < 10000) : (spin += 1) { std.atomic.spinLoopHint(); }
+            while (spin < 10000) : (spin += 1) {
+                std.atomic.spinLoopHint();
+            }
         }
     }
 };
@@ -196,9 +198,11 @@ fn tuiThread() void {
         warnings_mutex.unlock();
 
         var spin: usize = 0;
-        while (spin < 1000000) : (spin += 1) { std.atomic.spinLoopHint(); }
+        while (spin < 1000000) : (spin += 1) {
+            std.atomic.spinLoopHint();
+        }
     }
-    
+
     // Final render
     std.debug.print("\x1b[2J\x1b[H", .{});
     std.debug.print("✅ Flatulence Audit Architect - Done Scanning {} files.\n", .{total_files_count});
@@ -450,7 +454,7 @@ pub fn main(init: std.process.Init) !void {
 test "chunker handles normal files" {
     const text = "hello\nworld\nthis\nis\na\ntest\nfile\n";
     var chunker = Chunker{ .content = text, .max_chunk_size = 10, .overlap = 2 };
-    
+
     const chunk1 = chunker.next().?;
     try std.testing.expect(chunk1.len > 0);
 }
@@ -459,11 +463,11 @@ test "chunker handles no newlines 10MB single line" {
     var allocator = std.testing.allocator;
     const big_str = try allocator.alloc(u8, 10 * 1024 * 1024);
     defer allocator.free(big_str);
-    
+
     @memset(big_str, 'A');
-    
+
     var chunker = Chunker{ .content = big_str, .max_chunk_size = 1024, .overlap = 150 };
-    
+
     var count: usize = 0;
     while (chunker.next()) |chunk| {
         count += 1;
@@ -477,15 +481,15 @@ test "chunker handles weird unicode boundaries" {
     // A string with a 4-byte unicode character in the middle
     // "hello 🌍 world"
     const text = "hello \xF0\x9F\x8C\x8D world";
-    
+
     // We intentionally make max_chunk_size hit exactly in the middle of the emoji
     // Emoji is at index 6, 7, 8, 9. Let's slice at 8.
     var chunker = Chunker{ .content = text, .max_chunk_size = 8, .overlap = 0 };
-    
+
     const c1 = chunker.next().?;
     // It should have truncated before the emoji or advanced past safely without crashing.
     try std.testing.expect(std.unicode.utf8ValidateSlice(c1));
-    
+
     const c2 = chunker.next().?;
     try std.testing.expect(std.unicode.utf8ValidateSlice(c2));
 }
@@ -509,7 +513,7 @@ test "detect adversarial captures ptrFromInt and system" {
     const text1 = "const ptr = @ptrFromInt(x);";
     const res1 = try detectAdversarial(allocator, text1);
     try std.testing.expectEqualStrings("@ptrFromInt", res1);
-    
+
     const text2 = "libc.system(\"rm -rf\");";
     const res2 = try detectAdversarial(allocator, text2);
     try std.testing.expectEqualStrings("system", res2);
