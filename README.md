@@ -18,7 +18,7 @@ source remains readable in this repository.
 
 ## Make your first noise
 
-Requires **Zig 0.17.0** and **macOS or Linux**:
+Requires **Zig 0.17.0** and **macOS, Linux, or Windows**:
 
 ```bash
 git clone https://github.com/drawmeanelephant/fart-app.git
@@ -39,10 +39,11 @@ That creates a real WAV without a server or audio device.
 | A stdin/script sampler | [Standalone guide](docs/site/content/guides/standalone.md) |
 
 Local `play`/`trigger` need an audio-enabled build: `-Dlive=true` defaults on
-for macOS and off for Linux. `join` is headless and never opens a microphone
+for macOS and off elsewhere. `join` is headless and never opens a microphone
 or speaker. The terminal app separately probes host sound/speech tools and
 can run silently. [Platform support](docs/site/content/reference/platforms.md)
-records the actual boundaries; Windows remains deferred under #25.
+records the actual boundaries, and the [Windows guide](docs/site/content/guides/windows.md)
+covers shell spellings and the remaining limits there.
 
 ## Build and verify
 

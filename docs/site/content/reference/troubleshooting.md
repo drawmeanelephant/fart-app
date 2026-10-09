@@ -15,8 +15,10 @@ and build APIs. “A recent Zig” is not a sufficient compatibility guarantee.
 ## The terminal animates but makes no sound
 
 The visual app needs a host player: `afplay` on macOS, or `paplay`, `aplay`,
-or `ffplay` on Linux. Speech lines use `say` or `espeak`. Missing programs
-mean silent fallback. Check your host output routing and volume separately.
+or `ffplay` on Linux. Speech lines use `say` or `espeak`. On Windows the
+probe is `where`-based, so `ffplay` or `espeak` on `PATH` answers it.
+Missing programs mean silent fallback. Check your host output routing and
+volume separately.
 
 ## Local play fails
 

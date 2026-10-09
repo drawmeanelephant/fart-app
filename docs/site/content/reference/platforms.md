@@ -2,21 +2,22 @@
 title: Platform and audio support
 parent: reference/index
 status: published
-summary: Verified macOS/Linux paths, headless builds, and honest Windows limits.
+summary: Verified macOS, Linux, and Windows paths, headless builds, and honest limits.
 ---
 
 # Know what is actually supported
 
 | Path | macOS | Linux | Windows |
 |---|---|---|---|
-| Build/test and offline render | Verified | Verified in native CI and smoke runs | Deferred |
-| Headless NINJAM join | Verified | Verified | Needs Winsock work |
-| ANSI terminal spectacle | Verified | Verified, including silent fallback | Needs console/platform work |
-| Miniaudio playback | Compiled by default | Opt-in; backend dependencies apply | Not an app support claim |
+| Build/test and offline render | Verified | Verified in native CI and smoke runs | Verified in native CI and smoke runs |
+| Headless NINJAM join | Verified | Verified | Verified; real Winsock sys seam, not POSIX emulation |
+| ANSI terminal spectacle | Verified | Verified, including silent fallback | Verified; conhost VT output and clean Ctrl+C |
+| Miniaudio playback | Compiled by default | Opt-in; backend dependencies apply | Opt-in; compiles, device playback not in CI evidence |
 
-Windows remains [#25](https://github.com/drawmeanelephant/fart-app/issues/25),
-not a hidden unchecked box under “cross-platform.” Existing upstream reference
-C++ Windows CI does not prove this Zig app runs on Windows.
+Windows support landed via
+[#25](https://github.com/drawmeanelephant/fart-app/issues/25). See the
+[[guides/windows|Windows guide]] for shell spellings, sound tooling, and what
+is not proven there.
 
 ## Headless build
 
@@ -37,9 +38,11 @@ hardware-independent and does not reintroduce real-device access.
 zig build -Doptimize=ReleaseSafe -Dlive=true
 ```
 
-macOS defaults to this with CoreAudio frameworks. Linux defaults to false;
-an enabled miniaudio backend can require ALSA development packages and an
-available device. A headless VM is not a playback test.
+macOS defaults to this with CoreAudio frameworks. Linux and Windows default
+to false; an enabled Linux backend can require ALSA development packages and
+an available device. On Windows `-Dlive=true` compiles through vendored
+miniaudio, but real-device playback is not yet covered by CI evidence.
+A headless VM is not a playback test.
 
 `fart` uses host sound/speech commands independently of `-Dlive`; that flag
 controls `kujamba`'s device path, not whether the terminal app finds `afplay`.

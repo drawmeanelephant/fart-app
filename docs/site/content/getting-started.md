@@ -12,8 +12,8 @@ an audio device, a room account, or a willing audience.
 
 ## 1. Get the source
 
-Install [Zig 0.17.0](https://ziglang.org/download/) and Git on macOS or Linux.
-Run these commands in a terminal:
+Install [Zig 0.17.0](https://ziglang.org/download/) and Git on macOS, Linux,
+or Windows. Run these commands in a terminal:
 
 ```bash
 git clone https://github.com/drawmeanelephant/fart-app.git
@@ -23,8 +23,8 @@ zig build -Doptimize=ReleaseSafe
 ```
 
 `zig version` should print `0.17.0`. The build installs three executables in
-`zig-out/bin`: `fart`, `kujamba`, and `audit`. Ogg/Vorbis sources are vendored;
-there is no npm install step.
+`zig-out/bin`: `fart`, `kujamba`, and `audit` (`.exe` on Windows). Ogg/Vorbis
+sources are vendored; there is no npm install step.
 
 ## 2. Render something unreasonable
 
@@ -42,9 +42,11 @@ usual player, or use local audition on an audio-enabled build:
 ./zig-out/bin/kujamba play "kujamba karibu"
 ```
 
-On macOS, device support is compiled by default. Linux builds default to
-headless device support; see [[reference/platforms|Platform support]] before
-using `play` or `trigger`.
+On macOS, device support is compiled by default. Linux and Windows builds
+default to headless device support; see
+[[reference/platforms|Platform support]] before using `play` or `trigger`.
+For Windows shell spellings and sound tooling, see the
+[[guides/windows|Windows guide]].
 
 ## 3. Choose your level of commitment
 

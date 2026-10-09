@@ -76,7 +76,9 @@ Coverage-guided `zig build test --fuzz` has documented Zig 0.16 runner/linking
 limitations; the ordinary corpus and seeded runs still execute in every test
 run. Do not claim a coverage-guided campaign merely because that flag exists.
 
-CI runs native Linux/macOS build and test matrices, render/energy/silence
-smokes, and the macOS reference demo. `build-test` and `demo-e2e` are required
+CI runs native Linux/macOS build and test matrices plus a Windows
+`build-test-windows` leg (Debug and ReleaseSafe build/test, render and fart
+smokes), render/energy/silence smokes, and the macOS reference demo.
+`build-test` and `demo-e2e` are required
 on main. Docs have their own validation/publishing workflow; a docs build
 does not replace runtime evidence.

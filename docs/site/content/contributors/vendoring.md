@@ -48,7 +48,7 @@ The exact subset comparison and third-party provenance live in
 
 ## Docs compiler is a separate pin
 
-This site uses Boris commit `08969742f85238443ce5cd1cd53ceab1b1f3f85a`,
+This site uses Boris commit `2eb2c915b37ff0eecd7ea0778d6e481a8aea60c7`,
 with its own content-hashed dependencies. It is a build-time tool, not a
 new dependency of the fart app executables.
 

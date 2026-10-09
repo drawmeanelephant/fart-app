@@ -7,10 +7,12 @@ and which decisions get made once instead of three times.
 The dependency edges below are also encoded as GitHub `blocked-by` relations on
 the issues themselves, so `gh issue view 12` shows them without reading this.
 
-**Current status (#29 reconciliation):** M4–M7 are complete; M8 defers only
-Windows (#25). `zig build test` → **218/218 pass**, in Debug, ReleaseSafe and
+**Current status:** M4–M8 are complete, including Windows (#25, landed via
+the Winsock port). `zig build test` → **218/218 pass** at the #29 baseline,
+in Debug, ReleaseSafe and
 `-Dlive=false`, plus the hardware-independent C audio test. CI runs native
-Linux/macOS builds and tests, with `build-test` and `demo-e2e` required on main.
+Linux/macOS builds and tests plus a Windows leg, with `build-test` and
+`demo-e2e` required on main.
 #58 provisioning hardening has landed. The #26 crash bugs (#40, #41) are fixed.
 #29 is complete: upstream ninjam#38 and downstream PR #61 have merged. The
 shared subset is byte-identical to the actual upstream merge commit.
@@ -27,11 +29,10 @@ the [field manual](docs/site/content/reference/cli.md) for current behavior.
 
 ## The short version
 
-Everything from the original Wave 0–3 plan has landed and closed (M4–M7
-complete; M8 lacks only #25). Remaining engineering work is **#25**, deferred
-Windows support. #29 is closed. This meta issue (#31) is docs bookkeeping.
-macOS/Linux builds and smoke checks are verified; #25's remaining Windows
-work is deferred and does not block #58's provisioning hardening or #29.
+Everything from the original Wave 0–3 plan has landed and closed, including
+**#25** Windows support (Winsock port, Windows CI leg). #29 is closed. This
+meta issue (#31) is docs bookkeeping.
+macOS/Linux/Windows builds and smoke checks are verified.
 The table below records how the plan played out; the one that unblocked the
 most (#11, smallest item in M4) and the rest are all done.
 
@@ -63,7 +64,7 @@ transport/platform changes still need upstream-first coordination.
         #27 ──> #28
 
         #12 #13 #14 #23 #24 #26 ──> #29   (final vendored reconciliation)
-        #25 Windows: deferred, not a blocker
+        #25 Windows: landed, was never a blocker
 ```
 
 ### The four edges that matter most
@@ -242,7 +243,7 @@ fix, the other is the harness that makes M6 verifiable without a room.
   and the required gate keeps reporting connection deaths verbatim.
 
 `#20` and `#25` share the `-Dlive` build option. Linux has landed.
-`#25`'s Windows half is a separate, deferred job (Winsock shim + console handler).
+`#25`'s Windows half landed later as the Winsock sys seam + console handler.
 
 ### Wave 3 — investigation close-out
 
