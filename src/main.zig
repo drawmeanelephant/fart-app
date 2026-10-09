@@ -5,7 +5,7 @@ const clock = @import("ninjam/clock.zig");
 // The whole libc surface this file needs, declared by hand: Zig 0.17 removed
 // @cImport (translate-c moved out of the compiler) and std.c keeps no
 // printf/system/signal decls. The sleeps are `sleepUs` on the Io clock, the
-// RNG seeds from the same clock, and the posix signal() install sits behind
+// PRNG seeds from the same clock, and the posix signal() install sits behind
 // the builtin.os.tag switch in main() (#25).
 const libc = struct {
     const FILE = opaque {};
@@ -16,8 +16,6 @@ const libc = struct {
     extern fn fwrite(ptr: [*]const u8, size: usize, nmemb: usize, stream: *FILE) usize;
     extern fn fclose(stream: *FILE) c_int;
     extern fn system(command: [*:0]const u8) c_int;
-    extern fn srand(seed: c_uint) void;
-    extern fn rand() c_int;
     extern fn signal(sig: c_int, handler: ?*const fn (c_int) callconv(.c) void) ?*const fn (c_int) callconv(.c) void;
 
     const SIGINT: c_int = 2;
@@ -31,6 +29,26 @@ extern "kernel32" fn SetConsoleCtrlHandler(
     handler: ?*const CtrlHandlerRoutine,
     add: win.BOOL,
 ) callconv(.winapi) win.BOOL;
+
+extern "kernel32" fn GetStdHandle(nStdHandle: win.DWORD) callconv(.winapi) ?win.HANDLE;
+extern "kernel32" fn GetConsoleMode(hConsoleHandle: win.HANDLE, lpMode: *win.DWORD) callconv(.winapi) win.BOOL;
+extern "kernel32" fn SetConsoleMode(hConsoleHandle: win.HANDLE, dwMode: win.DWORD) callconv(.winapi) win.BOOL;
+
+// (DWORD)-11
+const STD_OUTPUT_HANDLE: win.DWORD = @bitCast(@as(i32, -11));
+const ENABLE_VIRTUAL_TERMINAL_PROCESSING: win.DWORD = 0x0004;
+
+/// Arm ANSI escape output on Windows. The app paints the butt with VT
+/// sequences, which conhost only honours once this flag is set — without it
+/// cmd/PowerShell windows render literal "\x1b[2J" garbage. Windows Terminal
+/// and MinTTY have it on already; a redirected (non-console) stdout fails
+/// GetConsoleMode and is left alone.
+fn enableVtProcessing() void {
+    const h = GetStdHandle(STD_OUTPUT_HANDLE) orelse return;
+    var mode: win.DWORD = 0;
+    if (GetConsoleMode(h, &mode) == win.BOOL.FALSE) return;
+    _ = SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+}
 
 fn stopCtrlHandler(ctrl: win.DWORD) callconv(.winapi) win.BOOL {
     return switch (ctrl) {
@@ -242,7 +260,7 @@ fn runKujamba(io: std.Io, phrase: []const u8) void {
     playSound(wav_path, 1);
 
     var i: usize = 0;
-    while (i < plan.items.len) : (i += 1) {
+    while (i < plan.items.len and is_running.load(.acquire)) : (i += 1) {
         const item = plan.items[i];
         const shake_x = getRand(5) - 2;
         const shake_y = getRand(5) - 2;
@@ -302,14 +320,16 @@ fn clamp(val: i32) c_int {
     return if (val < 1) 1 else @intCast(val);
 }
 
+var prng: std.Random.DefaultPrng = undefined;
+
 fn getRand(max: u32) i32 {
-    const r = @as(u32, @intCast(libc.rand()));
-    return @as(i32, @intCast(r % max));
+    // intRangeLessThan over the full u32 domain: libc rand() is 15-bit on the
+    // Windows CRT, so r % max silently capped every roll at 32767 there.
+    return @intCast(prng.random().intRangeLessThan(u32, 0, max));
 }
 
 fn getRandU(max: usize) usize {
-    const r = @as(usize, @intCast(libc.rand()));
-    return r % max;
+    return prng.random().intRangeLessThan(usize, 0, max);
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -319,10 +339,11 @@ pub fn main(init: std.process.Init) !void {
     // handler on Windows.
     if (builtin.os.tag == .windows) {
         _ = SetConsoleCtrlHandler(stopCtrlHandler, win.BOOL.TRUE);
+        enableVtProcessing();
     } else {
         _ = libc.signal(libc.SIGINT, handleSigInt);
     }
-    _ = libc.srand(@as(u32, @truncate(@as(u128, @bitCast(clock.nowNs(io))))));
+    prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(clock.nowNs(io)))));
 
     // probe the host's sound + speech once; every playSound/speak after this
     // is a no-op when the host has nothing to offer (#25)
@@ -482,10 +503,6 @@ pub fn main(init: std.process.Init) !void {
         if (getRandU(20) == 0) {
             speak("Ralph", "pfffffft");
         }
-
-        var dummy_var: i32 = 42;
-        const dummy_ptr: *anyopaque = @ptrFromInt(@intFromPtr(&dummy_var));
-        _ = dummy_ptr;
 
         _ = libc.fflush(null);
 

@@ -7,6 +7,7 @@
 const std = @import("std");
 const session = @import("session.zig");
 const wavmod = @import("wav.zig");
+const kujamba_config = @import("../kujamba_config.zig");
 
 fn printUsage(io: std.Io) void {
     const usage =
@@ -76,12 +77,17 @@ fn cmdJoin(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: [
         const next: ?[]const u8 = if (i + 1 < argv.len) argv[i + 1] else null;
         if (std.mem.eql(u8, a, "--host")) {
             const v = next orelse fail(io, "--host needs a value", .{});
-            if (std.mem.indexOfScalar(u8, v, ':')) |colon| {
-                opts.host = v[0..colon];
-                opts.port = parseInto(u16, v[colon + 1 ..]) catch fail(io, "bad port in --host", .{});
-            } else {
-                opts.host = v;
-            }
+            // kujamba's --host grammar, shared so the two CLIs cannot drift:
+            // [v6]:port is the only bracketed form and a bare multi-colon
+            // IPv6 literal is rejected outright (the old first-colon split
+            // silently truncated it to "host="").
+            const p = kujamba_config.splitHostPort(v, &opts.host) catch |e| switch (e) {
+                error.MissingBracket => fail(io, "bad --host: missing ']'", .{}),
+                error.BadHostAfterBracket => fail(io, "bad --host after ']'", .{}),
+                error.BadPort => fail(io, "bad port in --host", .{}),
+                error.Ipv6NeedsBrackets => fail(io, "IPv6 host needs brackets: --host [::1]:port", .{}),
+            };
+            if (p) |pp| opts.port = pp;
             i += 1;
         } else if (std.mem.eql(u8, a, "--user")) {
             opts.user = next orelse fail(io, "--user needs a value", .{});
