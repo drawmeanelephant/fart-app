@@ -352,6 +352,17 @@ pub fn main(init: std.process.Init) !void {
         runKujamba(io, phrase_list.items);
         return;
     }
+    if (args.len > 1) {
+        const usage: [*:0]const u8 =
+            "usage: fart                          the endless butt (Ctrl+C to stop)\n" ++
+            "       fart kujamba <swahili phrase> the butt speaks a phrase\n";
+        if (std.mem.eql(u8, args[1], "--help") or std.mem.eql(u8, args[1], "help")) {
+            _ = libc.printf("%s", usage);
+            return;
+        }
+        _ = libc.printf("fart: unknown argument '%s'\n%s", args[1].ptr, usage);
+        std.process.exit(2);
+    }
 
     _ = libc.printf("\x1b[?25l");
 
