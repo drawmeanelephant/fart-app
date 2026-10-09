@@ -571,7 +571,7 @@ test "kujamba: a mid-interval chunk that would block drops the bar and stays dro
     defer threaded.deinit();
     const io = threaded.io();
 
-    var phrase = [_]f32{0.1} ** 4096;
+    var phrase: [4096]f32 = @splat(0.1);
     var bank = try onePhraseBank(alloc, &phrase);
     defer bank.deinit();
     var fill = kujamba_out.Fill{ .mode = .loop };
@@ -639,7 +639,7 @@ test "kujamba: one lost bar is counted once, however many channels were on it (#
     defer threaded.deinit();
     const io = threaded.io();
 
-    var phrase = [_]f32{0.1} ** 4096;
+    var phrase: [4096]f32 = @splat(0.1);
     var bank = try onePhraseBank(alloc, &phrase);
     defer bank.deinit();
     var fill = kujamba_out.Fill{ .mode = .loop };
@@ -713,7 +713,7 @@ test "kujamba: mid-bar and final drops count one bar and every channel's unsent 
     try s.locals[0].pending.add("first");
     try s.locals[0].dump.add("already sent, not discarded");
     try s.locals[1].pending.add("second");
-    var junk = [_]u8{0xa5} ** 4096;
+    var junk: [4096]u8 = @splat(0xa5);
     _ = fillUntilBlocked(fds[0], &junk);
 
     Session.Testing.dropInterval(&s, &s.locals[0], "mid-bar");
@@ -747,7 +747,7 @@ test "kujamba: the clock keeps walking while every bar is refused (#14)" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    var phrase = [_]f32{0.1} ** 4096;
+    var phrase: [4096]f32 = @splat(0.1);
     var bank = try onePhraseBank(alloc, &phrase);
     defer bank.deinit();
     var fill = kujamba_out.Fill{ .mode = .loop };

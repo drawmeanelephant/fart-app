@@ -6,7 +6,7 @@ published. README is the quick introduction, not a second full manual.
 
 ## Toolchain and local build
 
-- Zig **0.16.0**, Git, Bash, and `jq`.
+- Zig **0.17.0**, Git, Bash, and `jq`.
 - Boris **`08969742f85238443ce5cd1cd53ceab1b1f3f85a`**, recorded once in
   `docs/boris-pin.txt`. Its dependencies retain Boris's content-hash pins.
 - No Node, npm, bundler, or browser framework is needed.

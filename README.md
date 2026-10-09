@@ -18,7 +18,7 @@ source remains readable in this repository.
 
 ## Make your first noise
 
-Requires **Zig 0.16.0** and **macOS or Linux**:
+Requires **Zig 0.17.0** and **macOS or Linux**:
 
 ```bash
 git clone https://github.com/drawmeanelephant/fart-app.git

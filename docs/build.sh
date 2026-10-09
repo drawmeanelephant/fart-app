@@ -22,7 +22,7 @@ jq -e '.input == "content" and (.targets | length == 1) and
   .targets[0].name == "public" and .targets[0].output == "dist" and
   .targets[0].public == true' "$PROFILE" >/dev/null ||
   { echo "docs profile must own content -> public/dist" >&2; exit 1; }
-[[ "$(zig version)" = "0.16.0" ]] || { echo "Zig 0.16.0 is required" >&2; exit 1; }
+[[ "$(zig version)" = "0.17.0" ]] || { echo "Zig 0.17.0 is required" >&2; exit 1; }
 
 if [[ ! -e "$SOURCE" ]]; then
   [[ -z "${BORIS_CHECKOUT:-}" ]] || { echo "external Boris checkout is missing" >&2; exit 1; }

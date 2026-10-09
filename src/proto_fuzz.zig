@@ -269,7 +269,7 @@ fn fakeServerInner(listener: *Listener, stream: []const u8, half_close: bool) vo
     // soon as the client writes or hangs up. So it works by luck and the
     // comment below used to assert something false.
     {
-    netmod.sys.setNonblocking(cfd) catch {};
+        netmod.sys.setNonblocking(cfd) catch {};
     }
 
     // Abort the connection on close (RST instead of FIN): the server sends the
@@ -438,14 +438,14 @@ fn fillCorpus(c: *CorpusBuf) void {
     // 7. 0x04/0x05 download: begin a transfer, stream a chunk, finalize with
     //    garbage bytes -> decode fails, session tolerates it
     var dl = StreamBuf{};
-    dl.msg(proto.MSG_DOWNLOAD_INTERVAL_BEGIN, &intervalBeginPayload([_]u8{0xA1} ++ [_]u8{0} ** 15, proto.FOURCC_OGGV, 1, "carol")) catch unreachable;
-    dl.msg(proto.MSG_DOWNLOAD_INTERVAL_WRITE, &intervalWritePayload([_]u8{0xA1} ++ [_]u8{0} ** 15, 0, "not really ogg")) catch unreachable;
-    dl.msg(proto.MSG_DOWNLOAD_INTERVAL_WRITE, &intervalWritePayload([_]u8{0xA1} ++ [_]u8{0} ** 15, 1, "")) catch unreachable;
+    dl.msg(proto.MSG_DOWNLOAD_INTERVAL_BEGIN, &intervalBeginPayload([_]u8{0xA1} ++ @as([15]u8, @splat(0)), proto.FOURCC_OGGV, 1, "carol")) catch unreachable;
+    dl.msg(proto.MSG_DOWNLOAD_INTERVAL_WRITE, &intervalWritePayload([_]u8{0xA1} ++ @as([15]u8, @splat(0)), 0, "not really ogg")) catch unreachable;
+    dl.msg(proto.MSG_DOWNLOAD_INTERVAL_WRITE, &intervalWritePayload([_]u8{0xA1} ++ @as([15]u8, @splat(0)), 1, "")) catch unreachable;
     c.entry(dl.stream());
 
     // 8. 0x04 silence marker: zero guid + fourcc 0
     var marker = StreamBuf{};
-    marker.msg(proto.MSG_DOWNLOAD_INTERVAL_BEGIN, &intervalBeginPayload([_]u8{0} ** 16, 0, 0, "")) catch unreachable;
+    marker.msg(proto.MSG_DOWNLOAD_INTERVAL_BEGIN, &intervalBeginPayload(@as([16]u8, @splat(0)), 0, 0, "")) catch unreachable;
     c.entry(marker.stream());
 
     // 9. unknown types: must be ignored, not fatal
@@ -712,7 +712,7 @@ test "a live-path stream really goes live: the handshake is not a silent no-op" 
 // never set flags & 1 held its slot and its bytes until the session died.
 // These probes drive a real session against a server that does exactly that.
 
-const download_guid: [16]u8 = [_]u8{0xB1} ++ [_]u8{0} ** 15;
+const download_guid: [16]u8 = [_]u8{0xB1} ++ @as([15]u8, @splat(0));
 
 /// One framed message of any size, appended to the stream under construction.
 fn appendRawFrame(alloc: std.mem.Allocator, out: *std.ArrayList(u8), mtype: u8, payload: []const u8) !void {

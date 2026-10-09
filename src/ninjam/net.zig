@@ -334,9 +334,9 @@ pub const sys = switch (builtin.os.tag) {
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             const al = arena.allocator();
-            const hostz = al.dupeZ(u8, host) catch return error.SystemResources;
+            const hostz = al.dupeSentinel(u8, host, 0) catch return error.SystemResources;
             var portbuf: [16]u8 = undefined;
-            const portz = std.fmt.bufPrintZ(&portbuf, "{d}", .{port}) catch unreachable;
+            const portz = std.mem.printSentinel(&portbuf, "{d}", .{port}, 0) catch unreachable;
             var hints = std.mem.zeroes(addrinfo);
             hints.family = ws2.AF.UNSPEC;
             hints.socktype = ws2.SOCK.STREAM;
@@ -580,7 +580,7 @@ pub const sys = switch (builtin.os.tag) {
         };
         pub fn getAddrInfo(host: []const u8, port: u16) Error!AddrInfo {
             var portbuf: [16]u8 = undefined;
-            const portz = std.fmt.bufPrintZ(&portbuf, "{d}", .{port}) catch unreachable;
+            const portz = std.mem.printSentinel(&portbuf, "{d}", .{port}, 0) catch unreachable;
             var hostbuf: [256]u8 = undefined;
             if (host.len >= hostbuf.len) return error.UnknownHost;
             @memcpy(hostbuf[0..host.len], host);
@@ -598,7 +598,7 @@ pub const sys = switch (builtin.os.tag) {
             };
             var res: ?*std.posix.addrinfo = null;
             const rc = std.posix.system.getaddrinfo(hostz, portz, &hints, &res);
-            if (@intFromEnum(rc) != 0) return error.UnknownHost;
+            if (@backingInt(rc) != 0) return error.UnknownHost;
             return .{ .head = res, .cur = res };
         }
         pub fn connectNode(ai: *const std.posix.addrinfo) Error!Fd {
@@ -1262,7 +1262,7 @@ test "sockaddrIn6: builds the wire struct for a loopback literal" {
     try std.testing.expectEqual(@as(std.posix.sa_family_t, std.posix.AF.INET6), sa.family);
     try std.testing.expectEqual(std.mem.nativeToBig(u16, 20531), sa.port);
     try std.testing.expectEqual(@as(u8, 1), sa.addr[15]);
-    try std.testing.expectEqualSlices(u8, &[_]u8{0} ** 15, sa.addr[0..15]);
+    try std.testing.expectEqualSlices(u8, &@as([15]u8, @splat(0)), sa.addr[0..15]);
     try std.testing.expectEqual(@as(u32, 0), sa.scope_id);
 }
 
@@ -1294,7 +1294,7 @@ test "#14: a partial frame retains its tail ahead of control messages, without w
     const fds = try nonblockingTestPair();
     defer for (fds) |fd| Conn.closeFd(fd);
     var conn = Conn{ .io = std.testing.io, .fd = fds[0] };
-    const payload = [_]u8{0x5a} ** max_payload;
+    const payload: [max_payload]u8 = @splat(0x5a);
     // Saturate the kernel send queue first: a pinned SO_SNDBUF does the job
     // on posix, but Windows ignores that pin and only stalls on its internal
     // backlog (~128 KiB measured) — so fill until WouldBlock either way. The
@@ -1363,7 +1363,7 @@ test "#14: the control queue is bounded even while the peer never drains" {
     const fds = try nonblockingTestPair();
     defer for (fds) |fd| Conn.closeFd(fd);
     var conn = Conn{ .io = std.testing.io, .fd = fds[0] };
-    const payload = [_]u8{0x5a} ** max_payload;
+    const payload: [max_payload]u8 = @splat(0x5a);
     // Saturate the kernel queue so the wbuf has to carry the frames — on
     // Windows the SNDBUF pin above is advisory and this is the only way to
     // get the socket to refuse bytes.

@@ -1,7 +1,7 @@
 .{
     .name = .fart_app,
     .version = "1.0.0",
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .fingerprint = 0xb19e6de83fb7b342,
     .paths = .{
         "build.zig",
