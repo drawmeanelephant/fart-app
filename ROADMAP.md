@@ -22,10 +22,12 @@ resident-service mode, hardware MIDI support, or an untested platform.
 
 ## Remaining portability work
 
-**#25: Windows**, deferred until native validation is available. Required work
-includes Winsock integration and console handling; audio/speech behavior also
-needs a native check. Linux builds, tests, and smoke runs are already verified.
-Do not count upstream reference C++ Windows CI as evidence for this Zig app.
+**#25: Windows** has landed: a real Winsock sys seam, console control handler,
+and conhost VT output, covered by a `build-test-windows` CI leg (build, tests,
+and smokes). Remaining limits: `-Dlive` device playback is opt-in and outside
+CI evidence, and `demo/run_demo.sh` stays POSIX. See the
+[Windows guide](docs/site/content/guides/windows.md) and
+[platform support](docs/site/content/reference/platforms.md).
 
 Any future shared transport change must follow the upstream-first source
 contract in [vendor/README.md](vendor/README.md), not silently diverge.
@@ -34,7 +36,8 @@ contract in [vendor/README.md](vendor/README.md), not silently diverge.
 
 - **218/218** tests after #29, in Debug, ReleaseSafe, and `-Dlive=false`,
   plus the standalone null-backend C ABI executable.
-- Native Linux/macOS CI, with `build-test` and `demo-e2e` required on main.
+- Native Linux/macOS CI plus the Windows `build-test-windows` leg, with
+  `build-test` and `demo-e2e` required on main.
 - Real unmodified-reference demo: decoded audio energy, rest markers, silence
   rejection, and equal-input deterministic upload payloads.
 - All five #29 upload hashes matched the pre-refactor #58 baseline.

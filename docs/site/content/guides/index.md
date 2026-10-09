@@ -14,5 +14,6 @@ device or connection requirements.
 - [[guides/standalone|Standalone instrument]]: export, audition, and trigger notes.
 - [[guides/rooms|NINJAM rooms]]: join a server, switch phrases, and control bars from chat.
 - [[guides/voice|Voice and phrasing]]: tune effort, pitch, and the phrase-to-bar mapping.
+- [[guides/windows|Windows]]: native build, verified commands, and honest limits.
 
 For exact flags and defaults, use [[reference/cli|the command reference]].

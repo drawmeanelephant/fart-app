@@ -7,9 +7,15 @@ published. README is the quick introduction, not a second full manual.
 ## Toolchain and local build
 
 - Zig **0.17.0**, Git, Bash, and `jq`.
-- Boris **`08969742f85238443ce5cd1cd53ceab1b1f3f85a`**, recorded once in
+- Boris **`2eb2c915b37ff0eecd7ea0778d6e481a8aea60c7`**, recorded once in
   `docs/boris-pin.txt`. Its dependencies retain Boris's content-hash pins.
 - No Node, npm, bundler, or browser framework is needed.
+
+On Windows, run the script under Git Bash and pass `BORIS_CHECKOUT` as an
+MSYS-style absolute path (`/c/...`, not `C:\...`). A current Boris-on-Windows
+quirk: `boris build` writes the full site and proof artifacts but does not
+exit, so the script stalls at that step; run `boris proof verify
+--html-dir docs/site/dist` and the artifact script directly if needed.
 
 ```bash
 bash docs/build.sh

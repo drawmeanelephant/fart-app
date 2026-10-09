@@ -41,12 +41,14 @@ not a general speech engine or a pronunciation reference.
 
 On macOS the visual app uses `afplay` for sound and `say` for voice lines.
 On Linux it probes `paplay`, `aplay`, or `ffplay` for sound and `espeak` for voice.
+On Windows the probe is `where`-based and answers to `ffplay` or `espeak` on
+`PATH`; stock Windows has neither, so expect the silent run.
 Missing tools mean a silent spectacle, not a required install or a fake success
 claim about audio.
 
-The app writes synthesized temporary WAVs under `/tmp`, including
-`fart_kujamba.wav` and the pre-rendered shuzi files. These are runtime outputs,
-not a sample library you need to download.
+The app writes synthesized temporary WAVs under `/tmp` (`%TEMP%` on Windows),
+including `fart_kujamba.wav` and the pre-rendered shuzi files. These are
+runtime outputs, not a sample library you need to download.
 
 For device-backed playback without terminal animation, use
 [[guides/standalone|`kujamba play`]] instead.

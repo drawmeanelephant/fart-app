@@ -1,7 +1,7 @@
 # Flatlophone documentation theme
 
 Adapted from Boris's `themes/boris` at
-`08969742f85238443ce5cd1cd53ceab1b1f3f85a`.
+`2eb2c915b37ff0eecd7ea0778d6e481a8aea60c7`.
 The documentation shell, CSS primitives, and first-party inline search retain
 their MIT notice in `assets/boris-LICENSE.txt` (also copied into the published
 site). The brand layer is local: warm paper, ink, red accents, and a stamped
