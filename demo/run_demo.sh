@@ -57,7 +57,7 @@ SRV="$REFERENCE_ROOT/srv-build/bin/ninjamsrv"
 REFPEER="$REFERENCE_ROOT/refpeer"
 CURRENT_PHASE=application-build
 phase "$CURRENT_PHASE" running
-echo "== building kujamba (zig 0.16, ReleaseSafe) =="
+echo "== building kujamba (zig 0.17, ReleaseSafe) =="
 ( cd "$REPO" && zig build -Doptimize=ReleaseSafe ) || fail "zig build"
 KUJ="$REPO/zig-out/bin/kujamba"
 phase "$CURRENT_PHASE" passed
