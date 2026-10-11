@@ -644,8 +644,12 @@ const fmt_tag = [4]u8{ 'f', 'm', 't', ' ' };
 const data_tag = [4]u8{ 'd', 'a', 't', 'a' };
 
 /// Wraps mono i16 samples in a canonical 44-byte PCM WAV header.
+/// RIFF sizes are u32, so a PCM payload too large for the `data` chunk (and
+/// the RIFF size field, which is data_len + 36) fails with PcmTooLarge.
 pub fn writeWavBytes(allocator: std.mem.Allocator, samples: []const i16, sample_rate: u32) ![]u8 {
-    const data_len: u32 = @intCast(samples.len * 2);
+    const data_bytes = std.math.mul(usize, samples.len, 2) catch return error.PcmTooLarge;
+    if (data_bytes > std.math.maxInt(u32) - 36) return error.PcmTooLarge;
+    const data_len: u32 = @intCast(data_bytes);
     const wav = try allocator.alloc(u8, 44 + data_len);
     errdefer allocator.free(wav);
     @memcpy(wav[0..4], &riff_tag);
@@ -716,6 +720,17 @@ test "wav header is valid RIFF PCM and not silent" {
     try testing.expectEqual(@as(u32, @intCast(wav.len - 44)), wavDataByteLen(wav));
     try testing.expectEqual(@as(u32, @intCast(wav.len - 8)), std.mem.readInt(u32, wav[4..8], .little));
     try expectNotSilence(wav);
+}
+
+test "writeWavBytes returns PcmTooLarge instead of panicking past the RIFF limit" {
+    // Fake slices are never dereferenced: the check fires before any read.
+    const fake: [*]const i16 = @ptrFromInt(0x1000);
+    // #78: samples.len * 2 alone does not fit the u32 data chunk size.
+    const too_big = fake[0..(@as(usize, 1) << 31)];
+    try testing.expectError(error.PcmTooLarge, writeWavBytes(testing.allocator, too_big, SAMPLE_RATE));
+    // data_len fits u32 but the RIFF size field (data_len + 36) would not.
+    const riff_overflow = fake[0 .. (std.math.maxInt(u32) - 36) / 2 + 1];
+    try testing.expectError(error.PcmTooLarge, writeWavBytes(testing.allocator, riff_overflow, SAMPLE_RATE));
 }
 
 test "sample count matches expected duration within 1ms" {
