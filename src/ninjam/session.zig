@@ -1287,7 +1287,15 @@ pub const Session = struct {
                 d.buf.clear();
                 return;
             };
+            const was_truncated = out.writer.truncated;
             try out.writer.writeFloats(mono);
+            // #77: the writer caps buffered PCM at the RIFF u32 limit; warn
+            // once when a dump starts dropping audio instead of growing forever.
+            if (out.writer.truncated and !was_truncated) {
+                self.log.line("wav {s}: hit the {d}-byte RIFF limit — further decoded audio for this peer is dropped", .{
+                    out.pathSlice(), wavmod.WavWriter.max_pcm_bytes,
+                });
+            }
             self.pushPlayback(mono);
         }
         d.active = false;
