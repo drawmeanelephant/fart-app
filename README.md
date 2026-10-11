@@ -1,5 +1,9 @@
 # fart-app / Flatlophone v2
 
+<p align="center">
+  <img src="docs/assets/ronny.webp" alt="Ronny, the fart-app mascot" width="300">
+</p>
+
 **Bad manners. Good engineering.**
 
 A deterministic fart synthesizer written in Zig. An animated terminal butt.
