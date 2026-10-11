@@ -153,13 +153,16 @@ jobs:
         with:
           name: fart-app-dist-unix
 
-      # bsdtar (as `tar`) reads zip; bash keeps the assertions identical
-      # to the unix leg.
+      # Git Bash's `tar` is GNU tar and cannot read zip — bsdtar lives on
+      # the cmd/powershell PATH only. Extract with Expand-Archive into the
+      # workspace, then keep the assertions byte-identical to the unix leg.
+      - name: Extract the Windows archive
+        run: Expand-Archive -Path fart-app-windows-x86_64.zip -DestinationPath smoke
+
       - name: Smoke-test the native Windows binary
         shell: bash
         run: |
-          mkdir -p /tmp/smoke && tar -xf fart-app-windows-x86_64.zip -C /tmp/smoke
-          cd /tmp/smoke/fart-app-windows-x86_64
+          cd smoke/fart-app-windows-x86_64
           ./kujamba.exe render --phrase "kujamba karibu" --out smoke.ogg --seed 42
           ./kujamba.exe check-ogg smoke.ogg --min-rms 0.02
           ./kujamba.exe encode-silence silence.ogg --seconds 2
