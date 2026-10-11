@@ -12,6 +12,16 @@ pub const WavWriter = struct {
     srate: u32,
     channels: u16,
     frames: u64 = 0,
+    /// #77: hard ceiling on buffered PCM bytes. RIFF stores the data chunk
+    /// size in a u32 and the header itself spends 36 bytes of that range, so
+    /// nothing past this limit can ever be written out. `writeFloats` stops
+    /// appending at the cap and marks the dump `truncated`.
+    cap: usize = max_pcm_bytes,
+    truncated: bool = false,
+
+    /// Largest data chunk a RIFF file can represent: the u32 size field minus
+    /// the 36 header bytes it must also account for.
+    pub const max_pcm_bytes: usize = std.math.maxInt(u32) - 36;
 
     pub fn init(alloc: std.mem.Allocator, io: std.Io, srate: u32, channels: u16) WavWriter {
         return .{ .alloc = alloc, .io = io, .pcm = bufmod.Buf.init(alloc), .srate = srate, .channels = channels };
@@ -29,22 +39,33 @@ pub const WavWriter = struct {
     }
 
     /// Append interleaved f32 samples (frames * channels), converting to s16.
+    /// Stops at `cap` bytes of buffered PCM — the RIFF limit — and sets
+    /// `truncated`; samples past the cap are dropped, not buffered.
     pub fn writeFloats(self: *WavWriter, interleaved: []const f32) !void {
-        try self.pcm.ensureCapacity(interleaved.len * 2);
-        for (interleaved) |s| {
+        const room = @min(self.cap, max_pcm_bytes) -| self.pcm.len;
+        const n = @min(interleaved.len, room / 2);
+        if (n < interleaved.len) self.truncated = true;
+        if (n == 0) return;
+        const samples = interleaved[0..n];
+        try self.pcm.ensureCapacity(samples.len * 2);
+        for (samples) |s| {
             const clamped = std.math.clamp(s, -1.0, 1.0);
             const v: i16 = @intFromFloat(clamped * 32767.0);
             var tmp: [2]u8 = undefined;
             std.mem.writeInt(i16, &tmp, v, .little);
             try self.pcm.add(&tmp);
         }
-        self.frames += interleaved.len / self.channels;
+        self.frames += n / self.channels;
     }
 
     pub fn close(self: *WavWriter) !void {
         const f = self.file orelse return error.NotOpen;
         self.file = null;
         defer f.close(self.io);
+        // writeFloats keeps pcm.len <= cap <= max_pcm_bytes, so this can only
+        // trip on a buffer grown behind the writer's back — refuse rather
+        // than panic the cast.
+        if (self.pcm.len > max_pcm_bytes) return error.PcmTooLarge;
         const data_len: u32 = @intCast(self.pcm.len);
         var hdr: [44]u8 = undefined;
         writeHeader(&hdr, self.srate, self.channels, data_len);
@@ -137,6 +158,47 @@ pub fn analyzeWavBytes(data: []const u8) !Analysis {
         .rms = rms,
         .peak = peak,
     };
+}
+
+// #77: a buffer that somehow grew past the u32 RIFF limit must fail close
+// cleanly — the file still gets closed — not panic the intCast.
+test "close refuses an over-limit PCM buffer instead of panicking" {
+    const io = std.testing.io;
+    var w = WavWriter.init(std.testing.allocator, io, 44100, 1);
+    defer w.deinit();
+    try w.pcm.ensureCapacity(8);
+    w.pcm.len = std.math.maxInt(u32) + 1; // pretend 4 GiB+1 of PCM is buffered
+    const path = "zclient-test-toolarge.wav";
+    try w.open(path);
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    try std.testing.expectError(error.PcmTooLarge, w.close());
+    try std.testing.expect(w.file == null); // the file handle is still closed
+}
+
+// #77: the append path enforces the cap, so a real dump can never reach the
+// over-limit state — it truncates at the RIFF limit and stays a valid WAV.
+test "writeFloats caps buffered PCM at the RIFF limit" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var w = WavWriter.init(alloc, io, 48000, 1);
+    defer w.deinit();
+    w.cap = 10; // room for 5 s16 samples
+    const samples: [8]f32 = @splat(0.5);
+    try w.writeFloats(&samples);
+    try std.testing.expect(w.truncated);
+    try std.testing.expectEqual(@as(usize, 10), w.pcm.len);
+    try std.testing.expectEqual(@as(u64, 5), w.frames);
+    // further writes are dropped entirely, not buffered
+    try w.writeFloats(&samples);
+    try std.testing.expectEqual(@as(usize, 10), w.pcm.len);
+    // and close still produces a valid, analyzable WAV
+    const path = "zclient-test-capped.wav";
+    try w.open(path);
+    try w.close();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    const a = try analyzeWavFile(io, path);
+    try std.testing.expectEqual(@as(u64, 5), a.frames);
+    try std.testing.expect(a.peak > 0.45);
 }
 
 test "wav write/analyze roundtrip non-silence" {
