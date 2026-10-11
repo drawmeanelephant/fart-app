@@ -48,7 +48,8 @@ most (#11, smallest item in M4) and the rest are all done.
 | **#13** Server-clock discipline | ✅ **done** — `ServerClock`, bounded slew, encode lead | M5 complete |
 | **#14** Upload backpressure | ✅ **done** — measured, then bounded write + drop-and-continue | M5 complete |
 
-Wave 4 (#29) has landed. #25's Windows work is deferred; future shared
+Wave 4 (#29) has landed. #25's Windows work has landed too — a real
+Winsock sys seam, covered by the `build-test-windows` CI leg; future shared
 transport/platform changes still need upstream-first coordination.
 
 ---

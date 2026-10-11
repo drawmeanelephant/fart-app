@@ -50,9 +50,19 @@ controls `kujamba`'s device path, not whether the terminal app finds `afplay`.
 ## Cross-build without claiming execution
 
 ```bash
+# From any host — e.g. macOS cross-compiling for a headless Linux server.
 zig build -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseSafe \
   -Dlive=false --prefix zig-out-linux
+
+# Windows, likewise. Produces fart.exe / kujamba.exe / audit.exe
+# (plus .pdb debug files) without a Windows toolchain installed.
+zig build -Dtarget=x86_64-windows -Doptimize=ReleaseSafe \
+  -Dlive=false --prefix zig-out-windows
 ```
 
-This proves compilation and linking, not a native run. Native Linux CI
-performs the separate tests and render/energy/silence smoke checks.
+Both prove compilation and linking, not a native run. The native CI legs
+(`build-test` on Linux, `build-test-macos`, `build-test-windows`) perform the
+separate tests and render/energy/silence smoke checks that stand as the
+cross-platform evidence. Cross-build outputs land under `zig-out-*/`, which
+is gitignored; a `-Dlive=true` cross-build still only proves compilation —
+device playback is a native, hardware-dependent claim.
