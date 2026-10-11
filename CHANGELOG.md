@@ -50,6 +50,7 @@ found in the CLI and WAV/RIFF paths before the tag.
   conhost VT output, and a native `build-test-windows` CI leg (#25).
 - The Boris-built field manual, published to GitHub Pages by the docs
   workflow; Markdown source lives in `docs/site/`.
+- Ronny, the project mascot (`docs/assets/ronny.webp`).
 
 ### Fixed
 
