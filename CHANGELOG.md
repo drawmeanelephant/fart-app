@@ -51,6 +51,8 @@ found in the CLI and WAV/RIFF paths before the tag.
 - The Boris-built field manual, published to GitHub Pages by the docs
   workflow; Markdown source lives in `docs/site/`.
 - Ronny, the project mascot (`docs/assets/ronny.webp`).
+- MIT license at the root (`LICENSE`) with vendored-component attribution
+  in `NOTICE`; release archives carry both files.
 
 ### Fixed
 

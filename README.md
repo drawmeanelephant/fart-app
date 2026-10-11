@@ -83,3 +83,8 @@ Generated HTML and raw audit/demo evidence are not committed as documentation.
 
 [ROADMAP.md](ROADMAP.md) and [ISSUES.md](ISSUES.md) preserve engineering
 status/history. User instructions live in the field manual.
+
+## License
+
+MIT — see [LICENSE](LICENSE). Vendored-component attribution lives in
+[NOTICE](NOTICE) and [vendor/README.md](vendor/README.md).
