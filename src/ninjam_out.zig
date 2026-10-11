@@ -527,8 +527,12 @@ pub fn renderOfflineF32(
 
     const bar: u64 = if (opts.bar_samples != 0) opts.bar_samples else @max(1, samples.len);
     const bars: u64 = @max(1, opts.bars);
-    const bar_usize: usize = @intCast(bar);
-    const out = try alloc.alloc(f32, @intCast(bar * bars));
+    // bar and bars are caller-controlled u64s: their product (and bar itself,
+    // on a 32-bit usize) can exceed what a buffer index can hold. Checked math
+    // turns that into an error instead of an integer-overflow panic (#80).
+    const bar_usize: usize = std.math.cast(usize, bar) orelse return error.RenderTooLarge;
+    const total = std.math.mul(u64, bar, bars) catch return error.RenderTooLarge;
+    const out = try alloc.alloc(f32, std.math.cast(usize, total) orelse return error.RenderTooLarge);
     errdefer alloc.free(out);
     @memset(out, 0); // rest bars stay exactly zero
 
@@ -982,6 +986,22 @@ test "offline shaping is deterministic and rest bars carry no energy" {
     try testing.expect(rmsOf(a) > 0.01);
     const last_bar = a[44100 * 3 / 2 ..][0 .. 44100 / 2];
     for (last_bar) |s| try testing.expectEqual(0.0, s);
+}
+
+test "renderOfflineF32 errors instead of overflowing on absurd bar math" {
+    // #80: bar_samples * bars is caller-controlled — it must fail cleanly,
+    // not panic, for any caller of this pub API.
+    const alloc = testing.allocator;
+    try testing.expectError(error.RenderTooLarge, renderOfflineF32(alloc, "kujamba karibu", .{
+        .bar_samples = std.math.maxInt(u64) / 2,
+        .bars = 4,
+    }));
+    // each factor alone in range, the product still overflowing
+    // (--bar-ms 100000000 --bars 4294967295 at the CLI)
+    try testing.expectError(error.RenderTooLarge, renderOfflineF32(alloc, "kujamba karibu", .{
+        .bar_samples = 44100 * 100000000 / 1000,
+        .bars = std.math.maxInt(u32),
+    }));
 }
 
 test "offline WAV is a valid non-silent PCM file with a correct data length" {

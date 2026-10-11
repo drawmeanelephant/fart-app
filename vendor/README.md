@@ -39,9 +39,10 @@ tree), and this repository's kujamba integration keeps evolving shared files
   `session.zig` (#24, plus the upstreamed #64 bounds),
   `instrument.zig`, `backpressure_test.zig`, `session_timing_test.zig`
   (fart-app-side files), and `vorbis.zig` (#63, pending ninjam#43)
-* downstream-only fix, pending an upstream PR — `main.zig` (#83: `check-wav`
-  no longer panics on a path longer than the result buffer; in-file mark
-  `fart local delta (#83)`)
+* downstream-only fixes, pending upstream PRs — `main.zig` (#82:
+  `--duration`/`--chat-delay` `@intFromFloat` guards; #83: `check-wav`
+  no longer panics on a path longer than the result buffer; in-file marks
+  `fart local delta`)
 
 The shared shim resolves playback and capture IDs separately from one
 enumeration snapshot, retains its context until close, supports playback-only
@@ -95,9 +96,9 @@ for file in buf.zig clock.zig log.zig wav.zig auth.zig; do
 done
 ```
 
-`miniaudio_impl.c`, `src/ninjam/main.zig` (#83), and the kujamba-integrated
+`miniaudio_impl.c`, `src/ninjam/main.zig` (#82/#83), and the kujamba-integrated
 Zig files listed above are checked by review, not by `cmp` — their
-divergence is the kujamba feature work (and the pending #83 fix), described
+divergence is the kujamba feature work (and the pending #82/#83 fixes), described
 in the provenance section. Upstream's
 `zclient/vendor/refresh-vendor.sh --check` independently regenerates the
 pinned third-party downloads, applies its documented local patches, and
