@@ -648,6 +648,19 @@ fn cmdCheckOgg(io: std.Io, argv: []const []const u8) !void {
     }
 }
 
+/// `--bar-ms` to samples, checked. `bar_ms` is an unbounded u64 flag, so both
+/// `sample_rate * bar_ms` and the buffer size `bar_samples * bars` can overflow
+/// u64 — an overflow there panics instead of reporting a bad flag (#80).
+fn offlineBarSamples(io: std.Io, bar_ms: u64, bars: u32) u64 {
+    if (bar_ms == 0) return 0;
+    const scaled = std.math.mul(u64, kujamba_out.sample_rate, bar_ms) catch
+        fail(io, "--bar-ms too large", .{});
+    const bar_samples = scaled / 1000;
+    _ = std.math.mul(u64, bar_samples, bars) catch
+        fail(io, "--bar-ms x --bars too large", .{});
+    return bar_samples;
+}
+
 /// Offline render: a phrase to a WAV or OGG file, shaped exactly as `join`
 /// would have played it, with no server and no room in the way.
 fn cmdRender(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: []const []const u8) !void {
@@ -719,10 +732,7 @@ fn cmdRender(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv:
         .mode = play_mode,
         .pattern = pattern,
         .bars = bars,
-        .bar_samples = if (bar_ms == 0)
-            0
-        else
-            @as(u64, kujamba_out.sample_rate) * bar_ms / 1000,
+        .bar_samples = offlineBarSamples(io, bar_ms, bars),
         .knobs = knobs,
     };
 
@@ -843,10 +853,7 @@ fn cmdPlay(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: [
         .mode = play_mode,
         .pattern = pattern,
         .bars = bars,
-        .bar_samples = if (bar_ms == 0)
-            0
-        else
-            @as(u64, kujamba_out.sample_rate) * bar_ms / 1000,
+        .bar_samples = offlineBarSamples(io, bar_ms, bars),
         .knobs = knobs,
     };
     const pcm = kujamba_out.renderOfflineF32(gpa, phrase, opts) catch |e|
