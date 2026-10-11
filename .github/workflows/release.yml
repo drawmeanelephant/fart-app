@@ -61,7 +61,8 @@ jobs:
           zig build -Doptimize=ReleaseSafe --prefix /tmp/fa
           stage="fart-app-macos-${{ matrix.arch }}"
           mkdir -p "/tmp/pkg/$stage"
-          cp /tmp/fa/bin/fart /tmp/fa/bin/kujamba /tmp/fa/bin/audit "/tmp/pkg/$stage/"
+          cp /tmp/fa/bin/fart /tmp/fa/bin/kujamba /tmp/fa/bin/audit \
+             LICENSE NOTICE "/tmp/pkg/$stage/"
           tar -C /tmp/pkg -czf "dist/$stage.tar.gz" "$stage"
 
       # Every macOS archive runs on its own architecture — the bytes that
@@ -112,7 +113,7 @@ jobs:
             [ "$os" = "windows" ] && exe=".exe"
             mkdir -p "/tmp/pkg/$stage"
             cp "/tmp/fa/$target/bin/fart$exe" "/tmp/fa/$target/bin/kujamba$exe" \
-               "/tmp/fa/$target/bin/audit$exe" "/tmp/pkg/$stage/"
+               "/tmp/fa/$target/bin/audit$exe" LICENSE NOTICE "/tmp/pkg/$stage/"
             if [ "$os" = "windows" ]; then
               (cd /tmp/pkg && zip -qr "$GITHUB_WORKSPACE/dist/$stage.zip" "$stage")
             else
