@@ -192,10 +192,15 @@ fn cmdCheckWav(io: std.Io, argv: []const []const u8) !void {
     }
     const p = path orelse fail(io, "check-wav needs a file path", .{});
     const a = wavmod.analyzeWavFile(io, p) catch fail(io, "cannot analyze '{s}'", .{p});
-    var buf: [512]u8 = undefined;
+    // fart local delta (#83): upstream had a [512]u8 buffer here and
+    // `catch unreachable`, so a path longer than the buffer panicked with
+    // NoSpaceLeft. A larger buffer plus `catch return` — the same shape as
+    // kujamba's cmdCheckOgg — prints the result for any realistic path and
+    // never panics on the rest.
+    var buf: [4096]u8 = undefined;
     const line = std.fmt.bufPrint(&buf, "WAV {s} frames={d} srate={d} ch={d} rms={d:.6} peak={d:.6} pass={}\n", .{
         p, a.frames, a.srate, a.channels, a.rms, a.peak, a.rms >= min_rms,
-    }) catch unreachable;
+    }) catch return;
     std.Io.File.stdout().writeStreamingAll(io, line) catch {};
     if (a.rms < min_rms) {
         var ebuf: [128]u8 = undefined;

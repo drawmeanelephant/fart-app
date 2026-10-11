@@ -33,13 +33,15 @@ previous pin (its `zclient/tests/` and the kujamba adapter files left that
 tree), and this repository's kujamba integration keeps evolving shared files
 (#13/#14/#20/#24). The split, per file, as of this pin:
 
-* byte-identical — `buf.zig`, `clock.zig`, `log.zig`, `wav.zig`, `auth.zig`,
-  `main.zig`
+* byte-identical — `buf.zig`, `clock.zig`, `log.zig`, `wav.zig`, `auth.zig`
 * kujamba-integrated divergence (upstream does not carry the kujamba
   features) — `audio.zig` (#20), `net.zig` (#13/#14), `proto.zig`,
   `session.zig` (#24, plus the upstreamed #64 bounds),
   `instrument.zig`, `backpressure_test.zig`, `session_timing_test.zig`
   (fart-app-side files), and `vorbis.zig` (#63, pending ninjam#43)
+* downstream-only fix, pending an upstream PR — `main.zig` (#83: `check-wav`
+  no longer panics on a path longer than the result buffer; in-file mark
+  `fart local delta (#83)`)
 
 The shared shim resolves playback and capture IDs separately from one
 enumeration snapshot, retains its context until close, supports playback-only
@@ -88,14 +90,15 @@ for file in miniaudio.h stb_vorbis.c stb_vorbis_impl.c; do
 done
 
 # mirrored Zig core: byte-identical (no kujamba integration, no pending deltas)
-for file in buf.zig clock.zig log.zig wav.zig auth.zig main.zig; do
+for file in buf.zig clock.zig log.zig wav.zig auth.zig; do
   cmp "$NINJAM_CHECKOUT/zclient/src/$file" "src/ninjam/$file" || exit 1
 done
 ```
 
-`miniaudio_impl.c` and the kujamba-integrated Zig files listed above are
-checked by review, not by `cmp` — their divergence is the kujamba feature
-work, described in the provenance section. Upstream's
+`miniaudio_impl.c`, `src/ninjam/main.zig` (#83), and the kujamba-integrated
+Zig files listed above are checked by review, not by `cmp` — their
+divergence is the kujamba feature work (and the pending #83 fix), described
+in the provenance section. Upstream's
 `zclient/vendor/refresh-vendor.sh --check` independently regenerates the
 pinned third-party downloads, applies its documented local patches, and
 verifies the result. Local README/build/test-root layout is intentionally
