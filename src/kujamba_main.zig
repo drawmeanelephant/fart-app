@@ -1234,7 +1234,11 @@ fn cmdEncodeSilence(io: std.Io, gpa: std.mem.Allocator, argv: []const []const u8
         if (std.mem.eql(u8, a, "--seconds")) {
             i += 1;
             if (i >= argv.len) fail(io, "--seconds needs a value", .{});
-            seconds = std.fmt.parseFloat(f64, argv[i]) catch fail(io, "bad --seconds", .{});
+            const secs = std.fmt.parseFloat(f64, argv[i]) catch fail(io, "bad --seconds", .{});
+            // NaN/negative would panic in @intFromFloat
+            if (!(secs > 0.0) or secs > 86400.0)
+                fail(io, "--seconds must be in (0, 86400] seconds", .{});
+            seconds = secs;
         } else {
             path = a;
         }
