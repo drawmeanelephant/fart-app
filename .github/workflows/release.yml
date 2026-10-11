@@ -1,0 +1,190 @@
+# Release binaries.
+#
+# Fires when a v* tag is pushed. Builds the ship matrix, smoke-tests the
+# artifacts that can run natively, and attaches one archive per platform
+# plus sha256sums.txt to the GitHub release for that tag.
+#
+# Matrix rationale: kujamba's live-audio path (`play`/`trigger`, vendored
+# miniaudio) is macOS-only by default and needs Apple frameworks, so the
+# macOS pair builds on a macOS runner with live audio on. Linux/Windows
+# build cross-compiled on ubuntu with -Dlive=false — render/join/check-ogg
+# all work headless there, matching each platform's build.zig defaults.
+#
+# Smoke contract (same as CI's): `kujamba render` a phrase to Ogg, prove
+# `check-ogg` decodes real energy, and prove the `encode-silence` negative
+# control is rejected. The publish job is gated on every smoke leg — the
+# release never ships an archive CI has not executed where it can run.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # attach assets to the tag's GitHub release
+
+env:
+  ZIG_VERSION: "0.17.0"
+
+jobs:
+  build-macos:
+    name: Build the macOS pair (live audio on)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Install Zig 0.17.0
+        uses: drawmeanelephant/zig-zouave@2d8510d62b517fa786279562cf8b1bdcf0c47b9f
+        with:
+          version: 0.17.0
+
+      - name: Build the macOS matrix
+        run: |
+          mkdir -p dist
+          for target in aarch64-macos x86_64-macos; do
+            arch="${target%-*}"
+            echo "==> $target"
+            zig build -Dtarget="$target" -Doptimize=ReleaseSafe \
+              --prefix "/tmp/fa/$target"
+            stage="fart-app-macos-$arch"
+            mkdir -p "/tmp/pkg/$stage"
+            cp "/tmp/fa/$target/bin/fart" "/tmp/fa/$target/bin/kujamba" \
+               "/tmp/fa/$target/bin/audit" "/tmp/pkg/$stage/"
+            tar -C /tmp/pkg -czf "dist/$stage.tar.gz" "$stage"
+          done
+
+      # The runner is aarch64, so only that archive can be executed here;
+      # the x86_64 build ships from the same tested source.
+      - name: Smoke-test the native aarch64 archive
+        run: |
+          mkdir -p /tmp/smoke && tar -xzf dist/fart-app-macos-aarch64.tar.gz -C /tmp/smoke
+          cd /tmp/smoke/fart-app-macos-aarch64
+          ./kujamba render --phrase "kujamba karibu" --out smoke.ogg --seed 42
+          ./kujamba check-ogg smoke.ogg --min-rms 0.02
+          ./kujamba encode-silence silence.ogg --seconds 2
+          if ./kujamba check-ogg silence.ogg --min-rms 0.02; then
+            echo "silence negative control passed check-ogg — broken" >&2
+            exit 1
+          fi
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fart-app-dist-macos
+          path: dist/
+          if-no-files-found: error
+
+  build-unix:
+    name: Build and cross-compile linux/windows
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Install Zig 0.17.0
+        uses: drawmeanelephant/zig-zouave@2d8510d62b517fa786279562cf8b1bdcf0c47b9f
+        with:
+          version: 0.17.0
+
+      - name: Cross-compile the unix matrix
+        run: |
+          mkdir -p dist
+          for target in x86_64-linux aarch64-linux x86_64-windows; do
+            arch="${target%-*}"
+            os="${target#*-}"
+            echo "==> $target"
+            zig build -Dtarget="$target" -Dlive=false -Doptimize=ReleaseSafe \
+              --prefix "/tmp/fa/$target"
+            stage="fart-app-$os-$arch"
+            exe=""
+            [ "$os" = "windows" ] && exe=".exe"
+            mkdir -p "/tmp/pkg/$stage"
+            cp "/tmp/fa/$target/bin/fart$exe" "/tmp/fa/$target/bin/kujamba$exe" \
+               "/tmp/fa/$target/bin/audit$exe" "/tmp/pkg/$stage/"
+            if [ "$os" = "windows" ]; then
+              (cd /tmp/pkg && zip -qr "$GITHUB_WORKSPACE/dist/$stage.zip" "$stage")
+            else
+              tar -C /tmp/pkg -czf "dist/$stage.tar.gz" "$stage"
+            fi
+          done
+
+      - name: Smoke-test the native linux archive
+        run: |
+          mkdir -p /tmp/smoke && tar -xzf dist/fart-app-linux-x86_64.tar.gz -C /tmp/smoke
+          cd /tmp/smoke/fart-app-linux-x86_64
+          ./kujamba render --phrase "kujamba karibu" --out smoke.ogg --seed 42
+          ./kujamba check-ogg smoke.ogg --min-rms 0.02
+          ./kujamba encode-silence silence.ogg --seconds 2
+          if ./kujamba check-ogg silence.ogg --min-rms 0.02; then
+            echo "silence negative control passed check-ogg — broken" >&2
+            exit 1
+          fi
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fart-app-dist-unix
+          path: dist/
+          if-no-files-found: error
+
+  # The Windows build is cross-compiled, so the only honest question is
+  # whether it runs. A windows runner executes the same render/check-ogg
+  # assertions against the exact archive that will be published.
+  smoke-windows:
+    name: Smoke-test the native Windows binary
+    runs-on: windows-latest
+    timeout-minutes: 15
+    needs: build-unix
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: fart-app-dist-unix
+
+      # bsdtar (as `tar`) reads zip; bash keeps the assertions identical
+      # to the unix leg.
+      - name: Smoke-test the native Windows binary
+        shell: bash
+        run: |
+          mkdir -p /tmp/smoke && tar -xf fart-app-windows-x86_64.zip -C /tmp/smoke
+          cd /tmp/smoke/fart-app-windows-x86_64
+          ./kujamba.exe render --phrase "kujamba karibu" --out smoke.ogg --seed 42
+          ./kujamba.exe check-ogg smoke.ogg --min-rms 0.02
+          ./kujamba.exe encode-silence silence.ogg --seconds 2
+          if ./kujamba.exe check-ogg silence.ogg --min-rms 0.02; then
+            echo "silence negative control passed check-ogg — broken" >&2
+            exit 1
+          fi
+
+  publish:
+    name: Attach assets to the tag's release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [build-macos, build-unix, smoke-windows]
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: fart-app-dist-*
+          path: dist
+          merge-multiple: true
+
+      # The tag is GITHUB_REF_NAME. The release may already exist (created
+      # by hand with full notes); create a placeholder only if missing.
+      # --clobber keeps re-runs idempotent. No checkout in this job, so -R
+      # is passed explicitly (the gh repo-discovery trap from oliver#117).
+      - name: Publish assets to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          (cd dist && sha256sum *) > sha256sums.txt
+          if ! gh release view "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" \
+              --title "$GITHUB_REF_NAME" \
+              --notes "Flatlophone release $GITHUB_REF_NAME — binaries attached by CI; see the release notes and CHANGELOG.md."
+          fi
+          gh release upload "$GITHUB_REF_NAME" dist/* sha256sums.txt --clobber -R "$GITHUB_REPOSITORY"
