@@ -344,11 +344,23 @@ pub const Device = struct {
     fn pushCapture(self: *Device, frames: []const f32) void {
         if (self.tx_rs) |*rs| {
             var scratch: [512]f32 = undefined;
+            // Cap the source chunk so the resampled chunk always fits scratch:
+            // take <= scratch.len * step  =>  ceil((take - pos) / step) <= scratch.len
+            const src_cap = @max(1, @as(usize, @intFromFloat(@floor(@as(f64, @floatFromInt(scratch.len)) * rs.step))));
             var done: usize = 0;
             while (done < frames.len) {
-                const take = @min(scratch.len, frames.len - done);
-                rs.process(frames[done..][0..take], scratch[0..take]);
-                self.tx.push(scratch[0..take]);
+                const take = @min(src_cap, frames.len - done);
+                const take_f: f64 = @floatFromInt(take);
+                if (rs.pos >= take_f) {
+                    // the phase carry already sits past this whole chunk
+                    rs.pos -= take_f;
+                } else {
+                    // the outputs whose sample position lands inside this
+                    // chunk; the fractional remainder stays in rs.pos
+                    const out_n: usize = @intFromFloat(@ceil((take_f - rs.pos) / rs.step));
+                    rs.process(frames[done..][0..take], scratch[0..out_n]);
+                    self.tx.push(scratch[0..out_n]);
+                }
                 done += take;
             }
             return;
@@ -361,9 +373,13 @@ pub const Device = struct {
             var scratch: [512]f32 = undefined;
             var done: usize = 0;
             while (done < out.len) {
-                const take = @min(scratch.len, out.len - done);
-                rs.process(out[done..][0..take], scratch[0..take]);
-                _ = self.rx.pull(out[done..][0..take]);
+                // Cap the dst chunk so the source it consumes fits scratch:
+                // take <= (scratch.len - pos) / step  =>  src_take <= scratch.len
+                const dst_cap = @max(1, @as(usize, @intFromFloat(@floor((@as(f64, @floatFromInt(scratch.len)) - rs.pos) / rs.step))));
+                const take = @min(out.len - done, dst_cap);
+                const src_take = @min(scratch.len, @max(1, @as(usize, @intFromFloat(@floor(rs.pos + @as(f64, @floatFromInt(take)) * rs.step)))));
+                _ = self.rx.pull(scratch[0..src_take]);
+                rs.process(scratch[0..src_take], out[done..][0..take]);
                 done += take;
             }
             return;
@@ -489,6 +505,42 @@ test "resampler: length scales with the rate ratio, signal survives" {
     var dst2: [3]f32 = undefined;
     down.process(&src2, &dst2);
     for (dst2) |v| try std.testing.expectEqual(@as(f32, 1), v);
+}
+
+test "playback: device-rate pull delivers resampled ring audio (#76)" {
+    var dev = try Device.allocate(std.testing.allocator, 48000, true);
+    defer dev.release(std.testing.allocator);
+    dev.rx_rs = Resampler.init(44100, 48000);
+    var ramp: [512]f32 = undefined;
+    for (&ramp, 0..) |*f, i| f.* = @as(f32, @floatFromInt(i)) / 512.0;
+    dev.rx.push(&ramp);
+    var out: [512]f32 = std.mem.zeroes([512]f32);
+    dev.pullPlayback(&out);
+    // not the raw session-rate ramp, but its 44.1k -> 48k resample of the
+    // 470 source frames the 512 device frames consume
+    try std.testing.expect(!std.mem.eql(f32, &out, &ramp));
+    try std.testing.expectEqual(@as(usize, 42), dev.rx.queued());
+    var expected: [512]f32 = undefined;
+    var check = Resampler.init(44100, 48000);
+    check.process(ramp[0..470], &expected);
+    try std.testing.expectEqualSlices(f32, &expected, &out);
+}
+
+test "capture: device-rate frames land in the tx ring at the session rate (#76)" {
+    var dev = try Device.allocate(std.testing.allocator, 48000, false);
+    defer dev.release(std.testing.allocator);
+    dev.tx_rs = Resampler.init(48000, 44100);
+    var frames: [512]f32 = undefined;
+    for (&frames, 0..) |*f, i| f.* = @floatFromInt(i % 97);
+    var pushed: usize = 0;
+    while (pushed < 48000) {
+        const n = @min(frames.len, 48000 - pushed);
+        dev.pushCapture(frames[0..n]);
+        pushed += n;
+    }
+    // 48000 device frames at 48 kHz = 1.0 s -> 44100 session frames (+-2 for phase)
+    const queued = dev.tx.queued();
+    try std.testing.expect(queued >= 44098 and queued <= 44102);
 }
 
 test "resampler: 2x downsample of a 1 kHz tone keeps 1 kHz energy" {
