@@ -5,10 +5,14 @@
 # plus sha256sums.txt to the GitHub release for that tag.
 #
 # Matrix rationale: kujamba's live-audio path (`play`/`trigger`, vendored
-# miniaudio) is macOS-only by default and needs Apple frameworks, so the
-# macOS pair builds on a macOS runner with live audio on. Linux/Windows
-# build cross-compiled on ubuntu with -Dlive=false — render/join/check-ogg
-# all work headless there, matching each platform's build.zig defaults.
+# miniaudio) is macOS-only by default and needs Apple frameworks, so each
+# macOS archive builds natively on a matching runner with live audio on.
+# An explicit -Dtarget is a cross-compile to zig even when it spells the
+# host triple (baseline CPU, no xcrun SDK detection), so frameworks go
+# missing — "unable to find system framework" — hence no -Dtarget here.
+# Linux/Windows build cross-compiled on ubuntu with -Dlive=false —
+# render/join/check-ogg all work headless there, matching each platform's
+# build.zig defaults.
 #
 # Smoke contract (same as CI's): `kujamba render` a phrase to Ogg, prove
 # `check-ogg` decodes real energy, and prove the `encode-silence` negative
@@ -28,10 +32,20 @@ env:
   ZIG_VERSION: "0.17.0"
 
 jobs:
+  # macos-latest is aarch64, macos-15-intel is the last x86_64 image
+  # (retired August 2027 — the x86_64 archive goes away or the build moves
+  # to cross-compile-with-SDK when it does). Native builds keep live audio
+  # on and let zig find the Apple frameworks through the host SDK.
   build-macos:
-    name: Build the macOS pair (live audio on)
-    runs-on: macos-latest
+    name: Build macos-${{ matrix.arch }} (live audio on)
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: macos-latest, arch: aarch64 }
+          - { runner: macos-15-intel, arch: x86_64 }
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -41,27 +55,21 @@ jobs:
         with:
           version: 0.17.0
 
-      - name: Build the macOS matrix
+      - name: Build the native archive
         run: |
           mkdir -p dist
-          for target in aarch64-macos x86_64-macos; do
-            arch="${target%-*}"
-            echo "==> $target"
-            zig build -Dtarget="$target" -Doptimize=ReleaseSafe \
-              --prefix "/tmp/fa/$target"
-            stage="fart-app-macos-$arch"
-            mkdir -p "/tmp/pkg/$stage"
-            cp "/tmp/fa/$target/bin/fart" "/tmp/fa/$target/bin/kujamba" \
-               "/tmp/fa/$target/bin/audit" "/tmp/pkg/$stage/"
-            tar -C /tmp/pkg -czf "dist/$stage.tar.gz" "$stage"
-          done
+          zig build -Doptimize=ReleaseSafe --prefix /tmp/fa
+          stage="fart-app-macos-${{ matrix.arch }}"
+          mkdir -p "/tmp/pkg/$stage"
+          cp /tmp/fa/bin/fart /tmp/fa/bin/kujamba /tmp/fa/bin/audit "/tmp/pkg/$stage/"
+          tar -C /tmp/pkg -czf "dist/$stage.tar.gz" "$stage"
 
-      # The runner is aarch64, so only that archive can be executed here;
-      # the x86_64 build ships from the same tested source.
-      - name: Smoke-test the native aarch64 archive
+      # Every macOS archive runs on its own architecture — the bytes that
+      # get tested are the bytes that get published.
+      - name: Smoke-test the archive
         run: |
-          mkdir -p /tmp/smoke && tar -xzf dist/fart-app-macos-aarch64.tar.gz -C /tmp/smoke
-          cd /tmp/smoke/fart-app-macos-aarch64
+          mkdir -p /tmp/smoke && tar -xzf "dist/fart-app-macos-${{ matrix.arch }}.tar.gz" -C /tmp/smoke
+          cd "/tmp/smoke/fart-app-macos-${{ matrix.arch }}"
           ./kujamba render --phrase "kujamba karibu" --out smoke.ogg --seed 42
           ./kujamba check-ogg smoke.ogg --min-rms 0.02
           ./kujamba encode-silence silence.ogg --seconds 2
@@ -73,7 +81,7 @@ jobs:
       - name: Upload build artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: fart-app-dist-macos
+          name: fart-app-dist-macos-${{ matrix.arch }}
           path: dist/
           if-no-files-found: error
 
