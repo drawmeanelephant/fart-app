@@ -33,13 +33,14 @@ previous pin (its `zclient/tests/` and the kujamba adapter files left that
 tree), and this repository's kujamba integration keeps evolving shared files
 (#13/#14/#20/#24). The split, per file, as of this pin:
 
-* byte-identical — `buf.zig`, `clock.zig`, `log.zig`, `wav.zig`, `auth.zig`,
-  `main.zig`
+* byte-identical — `buf.zig`, `clock.zig`, `log.zig`, `wav.zig`, `auth.zig`
 * kujamba-integrated divergence (upstream does not carry the kujamba
   features) — `audio.zig` (#20), `net.zig` (#13/#14), `proto.zig`,
   `session.zig` (#24, plus the upstreamed #64 bounds),
   `instrument.zig`, `backpressure_test.zig`, `session_timing_test.zig`
-  (fart-app-side files), and `vorbis.zig` (#63, pending ninjam#43)
+  (fart-app-side files), `vorbis.zig` (#63, pending ninjam#43), and
+  `main.zig` (#82, downstream-only until upstreamed: the
+  `--duration`/`--chat-delay` `@intFromFloat` guards)
 
 The shared shim resolves playback and capture IDs separately from one
 enumeration snapshot, retains its context until close, supports playback-only
@@ -88,7 +89,7 @@ for file in miniaudio.h stb_vorbis.c stb_vorbis_impl.c; do
 done
 
 # mirrored Zig core: byte-identical (no kujamba integration, no pending deltas)
-for file in buf.zig clock.zig log.zig wav.zig auth.zig main.zig; do
+for file in buf.zig clock.zig log.zig wav.zig auth.zig; do
   cmp "$NINJAM_CHECKOUT/zclient/src/$file" "src/ninjam/$file" || exit 1
 done
 ```

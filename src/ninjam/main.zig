@@ -117,6 +117,10 @@ fn cmdJoin(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: [
             i += 1;
         } else if (std.mem.eql(u8, a, "--duration")) {
             const secs = std.fmt.parseFloat(f64, next orelse fail(io, "--duration needs a value", .{})) catch fail(io, "bad --duration", .{});
+            // fart local delta (#82): NaN/negative/non-finite would panic in
+            // @intFromFloat; same bounds as kujamba's cmdJoin.
+            if (!(secs > 0.0) or secs > 86400.0)
+                fail(io, "--duration must be in (0, 86400] seconds", .{});
             opts.duration_ms = @intFromFloat(secs * 1000.0);
             i += 1;
         } else if (std.mem.eql(u8, a, "--out-dir")) {
@@ -132,6 +136,10 @@ fn cmdJoin(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: [
             i += 1;
         } else if (std.mem.eql(u8, a, "--chat-delay")) {
             const secs = std.fmt.parseFloat(f64, next orelse fail(io, "--chat-delay needs a value", .{})) catch fail(io, "bad --chat-delay", .{});
+            // fart local delta (#82): same @intFromFloat guard as --duration,
+            // but 0 is a valid delay (send the MSG at join).
+            if (!(secs >= 0.0) or secs > 86400.0)
+                fail(io, "--chat-delay must be in [0, 86400] seconds", .{});
             opts.chat_delay_ms = @intFromFloat(secs * 1000.0);
             i += 1;
         } else if (std.mem.eql(u8, a, "--live-period")) {
