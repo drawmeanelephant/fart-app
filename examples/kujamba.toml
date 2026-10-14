@@ -25,3 +25,17 @@ noise = 1.0                           # e.g. 0    = clean, no attack splat
 wobble = 1.0                          # e.g. 2    = twice the flutter depth
 intensity = 1.0                       # #15: 0.25..4 — whisper to shout
 cents = 0                             # #16: ±1200 — shift every vowel pitch
+
+# The physical model, also multipliers (1 = stock). Some recipes:
+#   wet:        tension = 0.6, turbulence = 1.6
+#   dry/raspy:  tension = 1.8, turbulence = 0.4, resonance = 0.6
+#   thunderous: pressure = 2.5, resonance = 2.5, tension = 0.8, cents = -500
+#   squeaker:   tension = 3, pressure = 0.6, resonance = 0.5
+pressure = 1.0                        # 0.25..4: gas behind the sphincter — louder,
+                                      # higher, sprays more, lasts longer
+tension = 1.0                         # 0.25..4: tight = high, bright, raspy and
+                                      # regular; loose = low, wet, flabby, sputtering
+resonance = 1.0                       # 0.25..4: tract size — big = low formants that
+                                      # ring (thunderous); small = thin and dry
+turbulence = 1.0                      # 0..4: noise sprayed with every flap; 0 = dry buzz
+glide = 1.0                           # 0..2: how far the pitch sags as pressure drains
