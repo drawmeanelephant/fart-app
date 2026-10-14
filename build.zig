@@ -126,6 +126,19 @@ pub fn build(b: *std.Build) void {
     const run_golden_tests = b.addRunArtifact(golden_tests);
     test_step.dependOn(&run_golden_tests.step);
 
+    // The fart-off registry (M9, #95): engine selection and dispatch, plus
+    // every contestant engine's own test module — they are imported by the
+    // registry, so their suites ride along here. libc-free, like synth.
+    const engine_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/engine_registry.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_engine_tests = b.addRunArtifact(engine_tests);
+    test_step.dependOn(&run_engine_tests.step);
+
     // kujamba: the instrument + every unit test in the vendored NINJAM subset
     // (framing, protocol, auth, vorbis encode/decode, WAV, session engine).
     const kujamba_tests = b.addTest(.{

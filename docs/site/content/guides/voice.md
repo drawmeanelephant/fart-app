@@ -39,6 +39,24 @@ not transpose the randomly pitched, wordless shuzi rumble.
 Defaults are an identity. A preset spelling out every default reproduces the
 untuned voice in the same build.
 
+## Pick a different engine entirely
+
+The knobs above belong to `stock`, the shipped engine. The M9 fart-off (#95)
+landed nine more engines, each with its own knob vocabulary — intestinal
+`pressure`, sphincter `tension`, tract `resonance`, `turbulence`, and
+engine-specific extras like swe2's `wet`/`drop` or opus's `droop`:
+
+```bash
+./zig-out/bin/kujamba render --engine swe2 \
+  --voice "wet=1.3,drop=1.6" --phrase "kujamba karibu" --out swe2.wav
+```
+
+`engine=<slug>` inside `--voice` selects the engine too; an explicit
+`--engine` flag wins over that, and both win over a config file's
+`engine = "<slug>"`. A knob the engine doesn't know is rejected with that
+engine's knob list. `stock` stays the default until the
+[[contributors/fart-off|fart-off]] judging picks a winner.
+
 ## Map a phrase onto bars
 
 | Mode | On a play bar |

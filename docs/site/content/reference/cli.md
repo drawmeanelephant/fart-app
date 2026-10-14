@@ -43,7 +43,8 @@ Run from the repository root after `zig build`. Use `kujamba --help` or
 | `--phrases FILE` | Optional phrase bank; mutually exclusive with `--phrase` |
 | `--pattern N` or `N+M` | `3+1` |
 | `--play repeat\|loop\|once` | `repeat` |
-| `--voice SPEC` | Default multipliers and zero pitch offset |
+| `--voice SPEC` | Default multipliers and zero pitch offset; knob names are per-engine, and `engine=<slug>` may appear inside the spec |
+| `--engine SLUG` | `stock`; one of `stock argon4 astra fable gemini38 mistral4 opus sol61 sonnet swe2` — the fart-off engines (#95). Beats `engine=` inside `--voice` |
 | `--seed N` | Deterministic upload GUID/serial seed |
 | `--intervals N` | 8 completed intervals; tempo changes do not reset the count |
 | `--duration S` | 120-second hard safety cap |
@@ -55,13 +56,19 @@ Run from the repository root after `zig build`. Use `kujamba --help` or
 
 ## Offline and local flags
 
-Render/play share `--phrase`, `--play`, `--voice`, `--pattern`, `--bars`,
-`--bar-ms`, and config defaults. They default to one bar, pattern `1`,
-and phrase-length bars. `--seed` selects render's Ogg stream serial.
+Render/play share `--phrase`, `--play`, `--voice`, `--engine`, `--pattern`,
+`--bars`, `--bar-ms`, and config defaults. They default to one bar, pattern
+`1`, and phrase-length bars. `--seed` selects render's Ogg stream serial.
 `play` also accepts `--device NAME|INDEX`.
 
-`trigger` accepts `--config`, `--device`, and `--script`. It accepts `on N`,
-`off N`, and `q`; it is not a hardware MIDI driver.
+`trigger` accepts `--config`, `--device`, `--script`, `--voice`, and
+`--engine`. It accepts `on N`, `off N`, and `q`; it is not a hardware MIDI
+driver.
+
+The config file's `engine = "<slug>"` key (top level, `[voice]`, or dotted
+`voice.engine`) picks the engine everywhere a command would; `[voice]`
+knobs are validated against the resolved engine, so an engine's own keys
+like `wet` or `droop` are legal there.
 
 `check-ogg FILE --min-rms R` chooses the energy threshold.
 `encode-silence FILE --seconds S` chooses negative-control duration.

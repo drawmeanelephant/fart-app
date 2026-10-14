@@ -9,6 +9,18 @@ tagged `v<version>` and published on GitHub with CI-built binaries via
 
 ## [Unreleased]
 
+### Added
+
+- Fart-off engine selector (#95, M9) — all nine Great Fart-Off entries ship
+  as `src/engines/<slug>.zig` modules behind one registry. `--engine SLUG`
+  on `join`/`render`/`play`/`trigger`, `engine=<slug>` inside `--voice`, and
+  a config `engine` key (top-level, `[voice]`, or `voice.engine`) all
+  resolve through the same precedence: flag > in-spec > config > `stock`.
+  Each engine parses its own `--voice` spec — foreign knob names fail with
+  that engine's vocabulary — and carries its own `src/golden.zig`
+  fingerprints. `stock` remains the default until judging closes; no winner
+  has been picked.
+
 ## [1.0.0] - 2026-10-11
 
 The first tagged release of Flatlophone v2: a deterministic fart synthesizer

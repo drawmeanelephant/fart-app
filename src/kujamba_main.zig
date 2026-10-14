@@ -28,6 +28,7 @@ const session = @import("ninjam/session.zig");
 const audio = @import("ninjam/audio.zig");
 const vorbis = @import("ninjam/vorbis.zig");
 const synth = @import("synth.zig");
+const registry = @import("engine_registry.zig");
 const kujamba_out = @import("ninjam_out.zig");
 const kujamba_config = @import("kujamba_config.zig");
 const builtin = @import("builtin");
@@ -108,6 +109,12 @@ fn printUsage(io: std.Io) void {
         \\    --voice SPEC       synth voice knobs (#18), e.g. "noise=0,wobble=2".
         \\                       Multipliers on each onset class's attack, noise mix
         \\                       and wobble depth; 1 is today's sound exactly.
+        \\                       The knob names are per-engine (M9): every fart-off
+        \\                       entry parses its own spec, and "engine=<slug>" may
+        \\                       appear inside the spec itself.
+        \\    --engine SLUG      fart-off engine (M9, #95) — one of:
+        \\                       stock argon4 astra fable gemini38 mistral4
+        \\                       opus sol61 sonnet swe2. Absent = stock.
         \\    --play MODE        how the phrase maps onto bars:
         \\                       repeat  restart at every fart bar (default)
         \\                       loop    play continuously, wrapping at the end
@@ -128,18 +135,19 @@ fn printUsage(io: std.Io) void {
         \\    --out-dir DIR      directory for decoded peer WAVs (default dump)
         \\    --transcript FILE  transcript log (default <out-dir>/transcript.log)
         \\  kujamba render --phrase "..." --out FILE.wav|.ogg [--config FILE]
-        \\                       [--play MODE] [--voice SPEC]
+        \\                       [--play MODE] [--voice SPEC] [--engine SLUG]
         \\                       [--pattern P] [--bars N] [--bar-ms MS] [--seed N]
         \\      render a phrase offline, shaped as join would play it. A rest bar
         \\      is exact silence and freezes the phrase cursor, matching the room.
         \\  kujamba play [<phrase>|--phrase TEXT] [--config FILE] [--play MODE]
         \\                       [--pattern P] [--bars N] [--bar-ms MS] [--seed N]
-        \\                       [--voice SPEC] [--device NAME|INDEX]
+        \\                       [--voice SPEC] [--engine SLUG] [--device NAME|INDEX]
         \\      render like `render` and play it on the local output device
         \\      (#20, vendored miniaudio — no afplay shell-out). A bare phrase
         \\      is shorthand for --phrase; give one, not both. Exits 1 with a
         \\      clear message when no output device is available.
         \\  kujamba trigger [--config FILE] [--device NAME|INDEX] [--script FILE]
+        \\                       [--voice SPEC] [--engine SLUG]
         \\      the #21 sampler: stdin lines drive it — `on <N>` plays the sound
         \\      [map] binds to note N (phrase or shuzi:<seed>), `off <N>` is
         \\      accepted and ignored, `q` or EOF exits. With --script FILE the
@@ -164,11 +172,14 @@ fn printUsage(io: std.Io) void {
         \\CONFIG (#22): a TOML-style file of defaults for join, render, play
         \\and trigger —
         \\  host (same syntax as --host, so "name:port" / "[::1]:port"), user,
-        \\  pass, phrase, pattern, a [voice] table with attack/noise/wobble
-        \\  multipliers, and a [map] table binding `noteN = phrase|shuzi:seed`
-        \\  for `trigger` (#21). Values apply defaults <- config <- flags, so a flag
-        \\  always wins over the file; a --voice flag replaces the whole
-        \\  [voice] table. Example: examples/kujamba.toml in the repo.
+        \\  pass, phrase, pattern, `engine = "<slug>"` for the fart-off engine
+        \\  (#95), a [voice] table with that engine's knob names (engine is
+        \\  resolved first, so engine-scoped keys like `wet` or `droop` work),
+        \\  and a [map] table binding `noteN = phrase|shuzi:seed` for `trigger`
+        \\  (#21). Values apply defaults <- config <- flags, so a flag always
+        \\  wins over the file; a --voice flag replaces the whole [voice] table
+        \\  and --engine beats `engine=` inside it. Example:
+        \\  examples/kujamba.toml in the repo.
         \\
         \\join exits 0 only if at least one interval was uploaded; Ctrl+C finishes
         \\the current interval cleanly and reports the same way.
@@ -182,6 +193,15 @@ fn fail(io: std.Io, comptime fmt: []const u8, args: anytype) noreturn {
     const msg = std.fmt.bufPrint(&buf, "error: " ++ fmt ++ "\n", args) catch "error\n";
     std.Io.File.stderr().writeStreamingAll(io, msg) catch {};
     std.process.exit(1);
+}
+
+/// The shared "voice spec did not parse" exit for --voice / [voice] (#95).
+/// Names the engine that judged it and lists *that* engine's knob names —
+/// the legal vocabulary is per-engine, so "want attack=N,noise=N" would lie
+/// for every contestant.
+fn voiceFail(io: std.Io, spec: ?[]const u8, engine_flag: ?registry.Id, engine: registry.Id, e: anyerror) noreturn {
+    const id = registry.resolveId(spec orelse "", engine_flag, engine) catch engine;
+    fail(io, "bad voice spec '{s}': {s} (engine '{s}' takes: {s})", .{ spec orelse "", @errorName(e), registry.name(id), registry.knobNamesFor(id) });
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -314,7 +334,17 @@ const JoinSettings = struct {
     /// "3+1"
     pattern: kujamba_out.Pattern = .{ .play = 3, .rest = 1 },
     play_mode: kujamba_out.Mode = .repeat,
-    knobs: synth.VoiceKnobs = .{},
+    /// the fart-off engine (M9, #95): the config file's `engine` key lands
+    /// here; `--engine` lands in `engine_flag`; `engine=` inside `--voice`
+    /// sits between them. `stock` until the judging picks a winner.
+    engine: registry.Id = registry.default_id,
+    /// a --engine flag value: beats engine= inside the voice spec.
+    engine_flag: ?registry.Id = null,
+    /// the --voice / [voice] spec text, parsed once after the flag loop so
+    /// engine resolution is order-independent: `--voice "p=2" --engine swe2`
+    /// and `--engine swe2 --voice "p=2"` select the same engine and parse the
+    /// same knobs.
+    voice_spec: ?[]const u8 = null,
     intervals: u64 = 8,
     duration_ms: i64 = 120_000,
     /// --reconnect [#24]: reconnect dial budget on a lost connection. 0 = off
@@ -331,14 +361,21 @@ const JoinSettings = struct {
     /// loop, which overwrites the same fields — that ordering *is* the
     /// "flags win" rule. Absent keys are null/identity, so an untouched
     /// setting keeps its default.
-    fn applyConfig(self: *JoinSettings, cfg: *const kujamba_config.Config) void {
+    fn applyConfig(self: *JoinSettings, cfg: *const kujamba_config.Config, arena: std.mem.Allocator) !void {
         if (cfg.host) |h| self.host = h;
         if (cfg.port) |p| self.port = p;
         if (cfg.user) |v| self.user = v;
         if (cfg.pass) |v| self.pass = v;
         if (cfg.phrase) |v| self.phrase = v;
         if (cfg.pattern) |p| self.pattern = p;
-        self.knobs = cfg.knobs;
+        if (cfg.engine) |e| self.engine = e;
+        if (try cfg.voiceSpec(arena)) |spec| self.voice_spec = spec;
+    }
+
+    /// Resolve (engine, knobs) once the flag loop has run: --engine beats
+    /// engine= inside the voice spec, both beat the config file's engine key.
+    fn resolveVoice(self: *const JoinSettings) registry.ParseError!registry.Parsed {
+        return registry.parseKnobs(self.voice_spec orelse "", self.engine_flag, self.engine);
     }
 };
 
@@ -372,7 +409,7 @@ fn cmdJoin(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: [
     // config file first, flags second: the loop below overwrites, so a flag
     // always wins over the file wherever it appears (#22)
     const cfg = loadConfigFile(io, arena, argv);
-    if (cfg) |*c| s.applyConfig(c);
+    if (cfg) |*c| s.applyConfig(c, arena) catch fail(io, "out of memory", .{});
 
     // --phrase and --phrases are two ways to fill the same slot (which phrases
     // the instrument can play), so giving both on one command line is a mistake
@@ -404,8 +441,14 @@ fn cmdJoin(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: [
                 fail(io, "bad --play '{s}' (want repeat, loop or once)", .{next.?});
             i += 1;
         } else if (std.mem.eql(u8, a, "--voice")) {
-            s.knobs = synth.parseKnobs(next orelse fail(io, "--voice needs a value", .{})) catch |e|
-                fail(io, "bad --voice '{s}': {s} (want attack=N,noise=N,wobble=N)", .{ next.?, @errorName(e) });
+            // parsed after the flag loop: which engine validates the keys is
+            // decided by --engine / engine=, wherever they appear (#95)
+            s.voice_spec = next orelse fail(io, "--voice needs a value", .{});
+            i += 1;
+        } else if (std.mem.eql(u8, a, "--engine")) {
+            const v = next orelse fail(io, "--engine needs a value", .{});
+            s.engine_flag = registry.fromName(v) orelse
+                fail(io, "bad --engine '{s}' (want one of: {s})", .{ v, registry.names_csv });
             i += 1;
         } else if (std.mem.eql(u8, a, "--user")) {
             s.user = next orelse fail(io, "--user needs a value", .{});
@@ -472,6 +515,9 @@ fn cmdJoin(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: [
     if (s.phrases_file != null and phrase_flag)
         fail(io, "--phrase and --phrases both given: pick one", .{});
 
+    const voice = s.resolveVoice() catch |e|
+        voiceFail(io, s.voice_spec, s.engine_flag, s.engine, e);
+
     var bank = kujamba_out.PhraseBank.init(gpa);
     defer bank.deinit();
     if (s.phrases_file) |path| {
@@ -480,7 +526,7 @@ fn cmdJoin(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: [
             error.Rejected => fail(io, "refusing to read {s} as a phrase bank", .{path}),
             error.ReadFailed => fail(io, "cannot read phrases file '{s}'", .{path}),
         };
-        bank.parse(text, s.knobs) catch |e| switch (e) {
+        bank.parse(text, voice.knobs) catch |e| switch (e) {
             // The budget is on rendered audio, not file size, so this is the
             // one failure a user reaches by having *too many good phrases* —
             // worth saying what to do about it rather than naming an error set.
@@ -501,7 +547,7 @@ fn cmdJoin(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: [
         if (bank.entries.items.len == 0)
             fail(io, "phrases file '{s}' has no phrases (only comments or blank lines?)", .{path});
     } else {
-        bank.add(s.phrase, s.knobs) catch |e| fail(io, "phrase render failed: {s}", .{@errorName(e)});
+        bank.add(s.phrase, voice.knobs) catch |e| fail(io, "phrase render failed: {s}", .{@errorName(e)});
     }
 
     // The first phrase is live before the first bar; bind it into the fill so
@@ -672,11 +718,13 @@ fn cmdRender(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv:
     var bars: u32 = 1;
     var bar_ms: u64 = 0;
     var seed: u64 = 0;
-    var knobs: synth.VoiceKnobs = .{};
+    var engine: registry.Id = registry.default_id;
+    var engine_flag: ?registry.Id = null;
+    var voice_spec: ?[]const u8 = null;
 
     // config first, flags second — the same rule join follows. Render takes
-    // the instrument keys (phrase, pattern, [voice]); the connection keys are
-    // simply not read here.
+    // the instrument keys (phrase, pattern, engine, [voice]); the connection
+    // keys are simply not read here.
     const cfg = loadConfigFile(io, arena, argv);
     if (cfg) |*c| {
         if (c.phrase) |v| phrase = v;
@@ -684,7 +732,8 @@ fn cmdRender(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv:
             pattern = p;
             pattern_label = try formatPattern(arena, p);
         }
-        knobs = c.knobs;
+        if (c.engine) |e| engine = e;
+        voice_spec = c.voiceSpec(arena) catch fail(io, "out of memory", .{});
     }
 
     var i: usize = 0;
@@ -701,8 +750,12 @@ fn cmdRender(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv:
                 fail(io, "bad --play '{s}' (want repeat, loop or once)", .{next.?});
             i += 1;
         } else if (std.mem.eql(u8, a, "--voice")) {
-            knobs = synth.parseKnobs(next orelse fail(io, "--voice needs a value", .{})) catch |e|
-                fail(io, "bad --voice '{s}': {s} (want attack=N,noise=N,wobble=N)", .{ next.?, @errorName(e) });
+            voice_spec = next orelse fail(io, "--voice needs a value", .{});
+            i += 1;
+        } else if (std.mem.eql(u8, a, "--engine")) {
+            const v = next orelse fail(io, "--engine needs a value", .{});
+            engine_flag = registry.fromName(v) orelse
+                fail(io, "bad --engine '{s}' (want one of: {s})", .{ v, registry.names_csv });
             i += 1;
         } else if (std.mem.eql(u8, a, "--pattern")) {
             const v = next orelse fail(io, "--pattern needs a value", .{});
@@ -728,12 +781,15 @@ fn cmdRender(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv:
     }
     const p = out_path orelse fail(io, "render needs --out FILE", .{});
 
+    const voice = registry.parseKnobs(voice_spec orelse "", engine_flag, engine) catch |e|
+        voiceFail(io, voice_spec, engine_flag, engine, e);
+
     const opts = kujamba_out.OfflineOpts{
         .mode = play_mode,
         .pattern = pattern,
         .bars = bars,
         .bar_samples = offlineBarSamples(io, bar_ms, bars),
-        .knobs = knobs,
+        .knobs = voice.knobs,
     };
 
     const pcm = kujamba_out.renderOfflineF32(gpa, phrase, opts) catch |e|
@@ -784,7 +840,9 @@ fn cmdPlay(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: [
     var play_mode = kujamba_out.Mode.repeat;
     var bars: u32 = 1;
     var bar_ms: u64 = 0;
-    var knobs: synth.VoiceKnobs = .{};
+    var engine: registry.Id = registry.default_id;
+    var engine_flag: ?registry.Id = null;
+    var voice_spec: ?[]const u8 = null;
     var device: ?[]const u8 = null;
 
     const cfg = loadConfigFile(io, arena, argv);
@@ -794,7 +852,8 @@ fn cmdPlay(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: [
             pattern = pat;
             pattern_label = try formatPattern(arena, pat);
         }
-        knobs = c.knobs;
+        if (c.engine) |e| engine = e;
+        voice_spec = c.voiceSpec(arena) catch fail(io, "out of memory", .{});
     }
 
     var i: usize = 0;
@@ -812,8 +871,12 @@ fn cmdPlay(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: [
                 fail(io, "bad --play '{s}' (want repeat, loop or once)", .{next.?});
             i += 1;
         } else if (std.mem.eql(u8, a, "--voice")) {
-            knobs = synth.parseKnobs(next orelse fail(io, "--voice needs a value", .{})) catch |e|
-                fail(io, "bad --voice '{s}': {s} (want attack=N,noise=N,wobble=N)", .{ next.?, @errorName(e) });
+            voice_spec = next orelse fail(io, "--voice needs a value", .{});
+            i += 1;
+        } else if (std.mem.eql(u8, a, "--engine")) {
+            const v = next orelse fail(io, "--engine needs a value", .{});
+            engine_flag = registry.fromName(v) orelse
+                fail(io, "bad --engine '{s}' (want one of: {s})", .{ v, registry.names_csv });
             i += 1;
         } else if (std.mem.eql(u8, a, "--pattern")) {
             const v = next orelse fail(io, "--pattern needs a value", .{});
@@ -849,12 +912,15 @@ fn cmdPlay(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: [
         phrase = p;
     }
 
+    const voice = registry.parseKnobs(voice_spec orelse "", engine_flag, engine) catch |e|
+        voiceFail(io, voice_spec, engine_flag, engine, e);
+
     const opts = kujamba_out.OfflineOpts{
         .mode = play_mode,
         .pattern = pattern,
         .bars = bars,
         .bar_samples = offlineBarSamples(io, bar_ms, bars),
-        .knobs = knobs,
+        .knobs = voice.knobs,
     };
     const pcm = kujamba_out.renderOfflineF32(gpa, phrase, opts) catch |e|
         fail(io, "phrase render failed: {s}", .{@errorName(e)});
@@ -932,6 +998,9 @@ fn cmdTrigger(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv
     }
     var device: ?[]const u8 = null;
     var script: ?[]const u8 = null;
+    var engine_id: registry.Id = registry.default_id;
+    var engine_flag: ?registry.Id = null;
+    var voice_spec: ?[]const u8 = null;
 
     var i: usize = 0;
     while (i < argv.len) : (i += 1) {
@@ -945,12 +1014,27 @@ fn cmdTrigger(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv
         } else if (std.mem.eql(u8, a, "--script")) {
             script = next orelse fail(io, "--script needs a file path", .{});
             i += 1;
+        } else if (std.mem.eql(u8, a, "--voice")) {
+            voice_spec = next orelse fail(io, "--voice needs a value", .{});
+            i += 1;
+        } else if (std.mem.eql(u8, a, "--engine")) {
+            const v = next orelse fail(io, "--engine needs a value", .{});
+            engine_flag = registry.fromName(v) orelse
+                fail(io, "bad --engine '{s}' (want one of: {s})", .{ v, registry.names_csv });
+            i += 1;
         } else {
             fail(io, "trigger: unexpected argument '{s}'", .{a});
         }
     }
     const cfg = loadConfigFile(io, arena, argv);
     const map = if (cfg) |*c| c.map else @as([128]kujamba_config.NoteSound, @splat(.none));
+    if (cfg) |*c| {
+        if (c.engine) |e| engine_id = e;
+        voice_spec = c.voiceSpec(arena) catch fail(io, "out of memory", .{});
+    }
+
+    const voice = registry.parseKnobs(voice_spec orelse "", engine_flag, engine_id) catch |e|
+        voiceFail(io, voice_spec, engine_flag, engine_id, e);
 
     const dev_id: ?[*:0]const u8 = if (device) |d|
         (arena.dupeSentinel(u8, d, 0) catch fail(io, "out of memory", .{})).ptr
@@ -972,6 +1056,7 @@ fn cmdTrigger(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv
 
     var engine = TriggerEngine.init(gpa, .{
         .map = &map,
+        .knobs = voice.knobs,
         .sink = &sinkWritePlayback,
         .sink_ctx = dev,
     });
@@ -1018,6 +1103,8 @@ const TriggerEngine = struct {
 
     gpa: std.mem.Allocator,
     map: []const kujamba_config.NoteSound,
+    /// the resolved fart-off engine + voice (#95); note-ons render through it
+    knobs: registry.Knobs,
     sink: Sink,
     sink_ctx: *anyopaque,
     /// notes played since start (stats / tests)
@@ -1026,10 +1113,11 @@ const TriggerEngine = struct {
 
     fn init(gpa: std.mem.Allocator, opts: struct {
         map: []const kujamba_config.NoteSound,
+        knobs: registry.Knobs,
         sink: Sink,
         sink_ctx: *anyopaque,
     }) TriggerEngine {
-        return .{ .gpa = gpa, .map = opts.map, .sink = opts.sink, .sink_ctx = opts.sink_ctx };
+        return .{ .gpa = gpa, .map = opts.map, .knobs = opts.knobs, .sink = opts.sink, .sink_ctx = opts.sink_ctx };
     }
 
     fn mappedCount(self: *const TriggerEngine) usize {
@@ -1077,7 +1165,7 @@ const TriggerEngine = struct {
                 warnLine("trigger: note {d} has no mapping", .{note});
             },
             .shuzi => |seed| {
-                const wav = synth.renderShuziWavWith(self.gpa, seed, .{}) catch return;
+                const wav = registry.renderShuziWavWith(self.gpa, seed, self.knobs) catch return;
                 defer self.gpa.free(wav);
                 self.queueWav(wav);
                 self.triggered += 1;
@@ -1087,6 +1175,7 @@ const TriggerEngine = struct {
                     .mode = .once,
                     .pattern = .{ .play = 1, .rest = 0 },
                     .bars = 1,
+                    .knobs = self.knobs,
                 }) catch {
                     warnLine("trigger: phrase render failed for note {d}", .{note});
                     return;
@@ -1152,6 +1241,7 @@ test "trigger engine: note-on renders the mapped phrase into the sink" {
     var sink_state = RecordingSink{};
     var engine = TriggerEngine.init(testing.allocator, .{
         .map = &map,
+        .knobs = registry.defaultKnobs(.stock),
         .sink = RecordingSink.sink(),
         .sink_ctx = &sink_state,
     });
@@ -1170,6 +1260,7 @@ test "trigger engine: shuzi seeds render real audio via the wav decode" {
     var sink_state = RecordingSink{};
     var engine = TriggerEngine.init(testing.allocator, .{
         .map = &map,
+        .knobs = registry.defaultKnobs(.stock),
         .sink = RecordingSink.sink(),
         .sink_ctx = &sink_state,
     });
@@ -1185,6 +1276,7 @@ test "trigger engine: unmapped notes and bad lines are tolerated" {
     var sink_state = RecordingSink{};
     var engine = TriggerEngine.init(testing.allocator, .{
         .map = &map,
+        .knobs = registry.defaultKnobs(.stock),
         .sink = RecordingSink.sink(),
         .sink_ctx = &sink_state,
     });
@@ -1208,8 +1300,8 @@ test "trigger engine: same seed renders the same bytes (deterministic)" {
     map[61] = .{ .shuzi = 3 };
     var s1 = RecordingSink{};
     var s2 = RecordingSink{};
-    var e1 = TriggerEngine.init(testing.allocator, .{ .map = &map, .sink = RecordingSink.sink(), .sink_ctx = &s1 });
-    var e2 = TriggerEngine.init(testing.allocator, .{ .map = &map, .sink = RecordingSink.sink(), .sink_ctx = &s2 });
+    var e1 = TriggerEngine.init(testing.allocator, .{ .map = &map, .knobs = registry.defaultKnobs(.stock), .sink = RecordingSink.sink(), .sink_ctx = &s1 });
+    var e2 = TriggerEngine.init(testing.allocator, .{ .map = &map, .knobs = registry.defaultKnobs(.stock), .sink = RecordingSink.sink(), .sink_ctx = &s2 });
     _ = e1.handleLine("on 61");
     _ = e2.handleLine("on 61");
     try testing.expectEqual(s1.total_samples, s2.total_samples);
@@ -1302,7 +1394,13 @@ test "join settings keep the flag defaults when no config file applies" {
     try std.testing.expectEqual(@as(u64, 1), s.seed);
     try std.testing.expectEqual(kujamba_out.Pattern{ .play = 3, .rest = 1 }, s.pattern);
     try std.testing.expectEqual(kujamba_out.Mode.repeat, s.play_mode);
-    try std.testing.expectEqual(synth.VoiceKnobs{}, s.knobs);
+    try std.testing.expectEqual(registry.Id.stock, s.engine);
+    try std.testing.expectEqual(@as(?registry.Id, null), s.engine_flag);
+    try std.testing.expectEqual(@as(?[]const u8, null), s.voice_spec);
+    // with no spec, the resolved voice is the default engine's identity
+    const v = try s.resolveVoice();
+    try std.testing.expectEqual(registry.Id.stock, v.engine);
+    try std.testing.expectEqual(registry.Id.stock, registry.engineOf(v.knobs));
     try std.testing.expectEqual(@as(u64, 8), s.intervals);
     try std.testing.expectEqual(@as(i64, 120_000), s.duration_ms);
     try std.testing.expectEqualStrings("dump", s.out_dir);
@@ -1326,49 +1424,88 @@ test "config supplies join defaults; flags overwrite them (#22)" {
     );
 
     var s = JoinSettings{};
-    s.applyConfig(&cfg);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    try s.applyConfig(&cfg, arena_state.allocator());
     try std.testing.expectEqualStrings("nas.example.com", s.host);
     try std.testing.expectEqual(@as(u16, 20531), s.port);
     try std.testing.expectEqualStrings("dj", s.user);
     try std.testing.expectEqualStrings("pw", s.pass);
     try std.testing.expectEqualStrings("habari yako", s.phrase);
     try std.testing.expectEqual(kujamba_out.Pattern{ .play = 2, .rest = 2 }, s.pattern);
-    try std.testing.expectEqual(@as(f32, 2.0), s.knobs.attack);
-    try std.testing.expectEqual(@as(f32, 0.5), s.knobs.noise);
-    try std.testing.expectEqual(@as(f32, 3.0), s.knobs.wobble);
+    var voice = try s.resolveVoice();
+    try std.testing.expectEqual(@as(f32, 2.0), voice.knobs.stock.attack);
+    try std.testing.expectEqual(@as(f32, 0.5), voice.knobs.stock.noise);
+    try std.testing.expectEqual(@as(f32, 3.0), voice.knobs.stock.wobble);
 
     // The flag loop assigns the very same fields through the very same
     // helpers, so "flags win over the config file" is literally this:
     const p = try kujamba_config.splitHostPort("127.0.0.1:9", &s.host);
     s.port = p.?;
-    s.knobs = try synth.parseKnobs("noise=0");
+    s.voice_spec = "noise=0"; // a --voice flag replaces the whole [voice] table
     s.pattern = try kujamba_out.parsePattern("1");
     try std.testing.expectEqualStrings("127.0.0.1", s.host);
     try std.testing.expectEqual(@as(u16, 9), s.port);
     try std.testing.expectEqual(kujamba_out.Pattern{ .play = 1, .rest = 0 }, s.pattern);
     // --voice replaces the whole table, not just the axes it names
-    try std.testing.expectEqual(@as(f32, 1.0), s.knobs.attack);
-    try std.testing.expectEqual(@as(f32, 0.0), s.knobs.noise);
-    try std.testing.expectEqual(@as(f32, 1.0), s.knobs.wobble);
+    voice = try s.resolveVoice();
+    try std.testing.expectEqual(@as(f32, 1.0), voice.knobs.stock.attack);
+    try std.testing.expectEqual(@as(f32, 0.0), voice.knobs.stock.noise);
+    try std.testing.expectEqual(@as(f32, 1.0), voice.knobs.stock.wobble);
+}
+
+test "the fart-off engine resolves flags > voice spec > config (#95)" {
+    // config picks the engine and its knob vocabulary
+    const cfg = parseConfigForTest("engine = \"swe2\"\n[voice]\nwet = 2\n");
+    var s = JoinSettings{};
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    try s.applyConfig(&cfg, arena_state.allocator());
+    var voice = try s.resolveVoice();
+    try std.testing.expectEqual(registry.Id.swe2, voice.engine);
+    try std.testing.expectEqual(@as(f32, 2.0), voice.knobs.swe2.wet);
+
+    // engine= inside --voice overrides the config engine, and the knobs are
+    // judged by that engine (glide is fable-only)
+    s.voice_spec = "engine=fable,glide=0.5";
+    voice = try s.resolveVoice();
+    try std.testing.expectEqual(registry.Id.fable, voice.engine);
+    try std.testing.expectEqual(@as(f32, 0.5), voice.knobs.fable.glide);
+
+    // --engine beats engine= inside the spec — and the rest of the spec is
+    // then parsed by the forced engine, so a foreign knob name is an error
+    s.voice_spec = "engine=fable,attack=2";
+    s.engine_flag = .opus;
+    voice = try s.resolveVoice();
+    try std.testing.expectEqual(registry.Id.opus, voice.engine);
+    try std.testing.expectEqual(registry.Id.opus, registry.engineOf(voice.knobs));
+    try std.testing.expectEqual(@as(f32, 2.0), voice.knobs.opus.attack);
+    try std.testing.expectError(error.UnknownKnob, blk: {
+        var bad = s;
+        bad.voice_spec = "engine=fable,glide=2";
+        break :blk bad.resolveVoice();
+    });
 }
 
 test "config sets only the keys it names" {
     const cfg = parseConfigForTest("user = \"dj\"\n");
 
     var s = JoinSettings{};
-    s.applyConfig(&cfg);
+    try s.applyConfig(&cfg, testing.allocator);
     try std.testing.expectEqualStrings("dj", s.user);
     // everything else keeps its built-in default
     try std.testing.expectEqualStrings("127.0.0.1", s.host);
     try std.testing.expectEqual(@as(u16, 20531), s.port);
-    try std.testing.expectEqual(synth.VoiceKnobs{}, s.knobs);
+    const voice = try s.resolveVoice();
+    try std.testing.expectEqual(registry.Id.stock, voice.engine);
+    try std.testing.expectEqual(registry.Id.stock, registry.engineOf(voice.knobs));
 }
 
 test "a config host without a port keeps the default port" {
     const cfg = parseConfigForTest("host = \"nas.example.com\"\n");
 
     var s = JoinSettings{};
-    s.applyConfig(&cfg);
+    try s.applyConfig(&cfg, testing.allocator);
     try std.testing.expectEqualStrings("nas.example.com", s.host);
     try std.testing.expectEqual(@as(u16, 20531), s.port);
 }
@@ -1377,7 +1514,7 @@ test "a config host port survives a flag that names a bare host" {
     const cfg = parseConfigForTest("host = \"nas.example.com:20531\"\n");
 
     var s = JoinSettings{};
-    s.applyConfig(&cfg);
+    try s.applyConfig(&cfg, testing.allocator);
     // --host without its own port replaces the host name, not the configured port
     const p = try kujamba_config.splitHostPort("127.0.0.1", &s.host);
     try std.testing.expectEqual(@as(?u16, null), p);
