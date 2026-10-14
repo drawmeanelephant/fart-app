@@ -44,7 +44,7 @@ Run from the repository root after `zig build`. Use `kujamba --help` or
 | `--pattern N` or `N+M` | `3+1` |
 | `--play repeat\|loop\|once` | `repeat` |
 | `--voice SPEC` | Default multipliers and zero pitch offset; knob names are per-engine, and `engine=<slug>` may appear inside the spec |
-| `--engine SLUG` | `stock`; one of `stock argon4 astra fable gemini38 mistral4 opus sol61 sonnet swe2` — the fart-off engines (#95). Beats `engine=` inside `--voice` |
+| `--engine SLUG` | `stock`; one of `stock argon4 astra fable gemini38 gutphysics mistral4 opus sol61 sonnet swe2` — the fart-off engines (#95). Beats `engine=` inside `--voice` |
 | `--seed N` | Deterministic upload GUID/serial seed |
 | `--intervals N` | 8 completed intervals; tempo changes do not reset the count |
 | `--duration S` | 120-second hard safety cap |

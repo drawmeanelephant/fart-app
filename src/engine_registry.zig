@@ -3,8 +3,9 @@
 //! Nine frontier models each rewrote `synth.zig` on a `fartoff/*` branch with
 //! the same brief: physical pressure/tension/resonance/turbulence parameters,
 //! exponential pitch sag, formant vowels, plosive bursts — deterministic,
-//! headless-safe, pure Zig. A tenth, Codebuff's `gutphysics`, arrived as PR
-//! #99 on a branch too stale to merge and was absorbed the same way. All ten
+//! headless-safe, pure Zig. A tenth, `gutphysics` (MiMo Pro 2.6 under the
+//! Codebuff agent), arrived as PR #99 on a branch too stale to merge and was
+//! absorbed the same way. All ten
 //! are keepers, so their DSP lives here as `src/engines/<slug>.zig` (each
 //! file is that branch's `synth.zig` verbatim) and this module dispatches
 //! between them.
@@ -59,8 +60,9 @@ pub const Id = enum {
     fable,
     /// Gemini 3.8 Flash — + decay, wetness, seed
     gemini38,
-    /// Codebuff (PR #99, #23) — gut physics; + tract. Absorbed from an
-    /// unmergeable stale-branch PR: same brief, different contestant.
+    /// MiMo Pro 2.6 via Codebuff (PR #99, #23) — gut physics; + tract.
+    /// Absorbed from an unmergeable stale-branch PR: same brief, different
+    /// contestant.
     gutphysics,
     /// Mistral Large 4 — + decay; bit-identical across build modes
     mistral4,
