@@ -23,6 +23,10 @@
 //!     wobble = 2
 //!     intensity = 1.5               # #15: whisper 0.25 .. shout 4
 //!     cents = -700                  # #16: shift the vowel pitches a fifth down
+//!     pressure = 2.5                # v3: intestinal pressure (0.25 .. 4)
+//!     tension = 0.6                 # v3: sphincter tension (0.25 .. 4)
+//!     wetness = 1.5                 # v3: also tract, turbulence, droop (0 .. 4)
+//!     classic = 0                   # 1 = the v2 engine, bit for bit
 //!     [map]                         # the #21 sampler: note -> sound
 //!     note60 = "kujamba karibu"     # a phrase (quotes required for spaces)
 //!     note64 = shuzi:3              # a single wordless fart by seed
@@ -199,7 +203,7 @@ pub fn parse(text_in: []const u8, diag: *Diag) ParseError!Config {
     var seen_pass = false;
     var seen_phrase = false;
     var seen_pattern = false;
-    var seen_knobs: u8 = 0; // one bit per knob, for duplicate detection
+    var seen_knobs: u16 = 0; // one bit per knob, for duplicate detection
 
     var lines = std.mem.splitScalar(u8, text, '\n');
     var line_no: usize = 0;
@@ -295,23 +299,26 @@ pub fn parse(text_in: []const u8, diag: *Diag) ParseError!Config {
             cfg.pattern = kujamba_out.parsePattern(value) catch
                 return diag.fail(line_no, error.BadPattern, "bad pattern '{s}' (want N or N+M)", .{value});
         } else if (std.mem.eql(u8, key, "voice")) {
-            return diag.fail(line_no, error.UnknownKey, "unknown key 'voice' (set [voice] attack/noise/wobble/intensity/cents)", .{});
+            return diag.fail(line_no, error.UnknownKey, "unknown key 'voice' (set [voice] " ++ knob_list ++ ")", .{});
         } else if (std.mem.startsWith(u8, key, "voice.")) {
             const knob = key["voice.".len..];
             if (knob.len == 0 or std.mem.indexOfScalar(u8, knob, '.') != null)
                 return diag.fail(line_no, error.UnknownKey, "unknown key '{s}'", .{key});
             try setKnob(&cfg, knob, value, line_no, &seen_knobs, diag);
         } else {
-            return diag.fail(line_no, error.UnknownKey, "unknown key '{s}' (want host, user, pass, phrase, pattern or voice.attack/noise/wobble/intensity/cents)", .{key});
+            return diag.fail(line_no, error.UnknownKey, "unknown key '{s}' (want host, user, pass, phrase, pattern or voice.<knob>)", .{key});
         }
     }
     return cfg;
 }
 
-const Knob = enum(u3) { attack, noise, wobble, intensity, cents };
+/// Every [voice] key. Each tag is also the `synth.VoiceKnobs` field it sets.
+const Knob = enum(u4) { attack, noise, wobble, intensity, cents, pressure, tension, tract, turbulence, wetness, droop, classic };
 
-fn knobBit(k: Knob) u8 {
-    return @as(u8, 1) << @intCast(@backingInt(k));
+const knob_list = "attack, noise, wobble, intensity, cents, pressure, tension, tract, turbulence, wetness, droop or classic";
+
+fn knobBit(k: Knob) u16 {
+    return @as(u16, 1) << @intCast(@backingInt(k));
 }
 
 /// One voice knob from config text, with parseKnobs' own rules for --voice:
@@ -319,19 +326,9 @@ fn knobBit(k: Knob) u8 {
 /// offset in cents and the one knob a negative value is meaningful for. The
 /// synth clamps to the spec bounds when the knobs are applied, so no range
 /// check is needed here.
-fn setKnob(cfg: *Config, key: []const u8, value: []const u8, line_no: usize, seen: *u8, diag: *Diag) ParseError!void {
-    const k: Knob = if (std.mem.eql(u8, key, "attack"))
-        .attack
-    else if (std.mem.eql(u8, key, "noise"))
-        .noise
-    else if (std.mem.eql(u8, key, "wobble"))
-        .wobble
-    else if (std.mem.eql(u8, key, "intensity"))
-        .intensity
-    else if (std.mem.eql(u8, key, "cents"))
-        .cents
-    else
-        return diag.fail(line_no, error.UnknownKey, "unknown [voice] key '{s}' (want attack, noise, wobble, intensity or cents)", .{key});
+fn setKnob(cfg: *Config, key: []const u8, value: []const u8, line_no: usize, seen: *u16, diag: *Diag) ParseError!void {
+    const k = std.meta.stringToEnum(Knob, key) orelse
+        return diag.fail(line_no, error.UnknownKey, "unknown [voice] key '{s}' (want " ++ knob_list ++ ")", .{key});
 
     const bit = knobBit(k);
     if (seen.* & bit != 0) return diag.dup(line_no, key);
@@ -345,11 +342,7 @@ fn setKnob(cfg: *Config, key: []const u8, value: []const u8, line_no: usize, see
         return diag.fail(line_no, error.BadVoiceValue, "voice.{s} must be >= 0 (got '{s}'; knobs are multipliers)", .{ key, value });
 
     switch (k) {
-        .attack => cfg.knobs.attack = v,
-        .noise => cfg.knobs.noise = v,
-        .wobble => cfg.knobs.wobble = v,
-        .intensity => cfg.knobs.intensity = v,
-        .cents => cfg.knobs.cents = v,
+        inline else => |tag| @field(cfg.knobs, @tagName(tag)) = v,
     }
 }
 
@@ -477,6 +470,39 @@ test "intensity and cents ride the same [voice] table (#15, #16)" {
     try expectParseError(error.BadVoiceValue, "[voice]\ncents = nan\n", 2, "voice.cents must be finite");
     try expectParseError(error.BadVoiceValue, "[voice]\ncents = quiet\n", 2, "voice.cents must be a number (got 'quiet')");
     try expectParseError(error.DuplicateKey, "[voice]\ncents = 1\ncents = 2\n", 3, "'cents' appears twice");
+}
+
+test "the v3 physical knobs and classic ride the same [voice] table" {
+    const cfg = parseOk(
+        \\[voice]
+        \\pressure = 2.5
+        \\tension = 0.6
+        \\tract = 1.8
+        \\turbulence = 0
+        \\wetness = 1.5
+        \\droop = 2
+        \\classic = 1
+        \\
+    );
+    try testing.expectEqual(@as(f32, 2.5), cfg.knobs.pressure);
+    try testing.expectEqual(@as(f32, 0.6), cfg.knobs.tension);
+    try testing.expectEqual(@as(f32, 1.8), cfg.knobs.tract);
+    try testing.expectEqual(@as(f32, 0.0), cfg.knobs.turbulence);
+    try testing.expectEqual(@as(f32, 1.5), cfg.knobs.wetness);
+    try testing.expectEqual(@as(f32, 2.0), cfg.knobs.droop);
+    try testing.expectEqual(@as(f32, 1.0), cfg.knobs.classic);
+    // the v2 axes are untouched by the v3 ones
+    try testing.expectEqual(@as(f32, 1.0), cfg.knobs.attack);
+
+    // the config table and the --voice flag agree knob for knob
+    const flag = try synth.parseKnobs("pressure=2.5,tension=0.6,tract=1.8,turbulence=0,wetness=1.5,droop=2,classic=1");
+    try testing.expectEqual(flag, cfg.knobs);
+
+    const dotted = parseOk("voice.wetness = 3\n");
+    try testing.expectEqual(@as(f32, 3.0), dotted.knobs.wetness);
+    try expectParseError(error.BadVoiceValue, "[voice]\npressure = -1\n", 2, "voice.pressure must be >= 0");
+    try expectParseError(error.DuplicateKey, "voice.droop = 1\n[voice]\ndroop = 2\n", 3, "'droop' appears twice");
+    try expectParseError(error.UnknownKey, "[voice]\nsquelch = 1\n", 2, "unknown [voice] key 'squelch'");
 }
 
 test "comments, blank lines and CRLF line endings are ignored" {

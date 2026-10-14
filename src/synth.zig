@@ -5,16 +5,25 @@
 //! is seeded from a hash of the input text with fixed constants everywhere
 //! else, so the same phrase always produces byte-identical WAV bytes. Always.
 //!
-//! One fart "phoneme" (one Swahili syllable) is:
-//!   * a low-frequency buzzy oscillator whose pitch falls 20% across the syllable
-//!   * a filtered noise burst at the attack (the "splat") plus a quiet
-//!     low-passed body hiss
-//!   * an amplitude envelope with a fast attack and a ~24-34 Hz flutter wobble
+//! One fart "phoneme" (one Swahili syllable) is a small physical model (v3):
+//!   * an intestinal pressure reservoir that bursts open and then decays
+//!     exponentially; the sphincter's pitch rides on that pressure, so pitch
+//!     falls exponentially as the gas runs out
+//!   * a sphincter that opens and slaps shut once per cycle (a pulse-train
+//!     valve, not a sine): its tension sets the pitch, how long it stays open,
+//!     and the pressure below which it stops buzzing and sputters
+//!   * flow-gated turbulence and random noise bursts, wet stick-slip splats
+//!     and bubbles, and plosive pressure spikes
+//!   * the terminal tract: vowel formants, a buttock "body" resonance, and
+//!     the trousers' low-pass
+//! The previous engine (v2: buzzy additive oscillator, attack splat, flutter)
+//! is kept byte for byte behind `--voice classic=1`.
 //!
 //! Swahili is nearly pure CV. `Scanner` splits a word into syllables: each
-//! vowel picks the base pitch, the consonant onset picks the attack/decay
-//! character, and the syllable count sets the total duration.
-//! The full mapping tables live in README.md.
+//! vowel picks the base pitch and the formants, the consonant onset picks the
+//! attack character and how the valve opens (burst, hiss, hum, trill, glide),
+//! and the syllable count sets the total duration. The mapping tables live in
+//! docs/site/content/contributors/synth.md.
 //!
 //! Vocabulary note: kujamba = to fart, shuzi = a fart. Use them proudly.
 
@@ -97,9 +106,9 @@ pub fn voiceSpec(cls: VoiceClass) VoiceSpec {
 ///
 /// The default is 1.0 on every multiplier and 0 on `cents`, and `x * 1.0` is
 /// exact in IEEE-754, so an untouched `VoiceKnobs` reproduces the class table
-/// bit for bit. That is load-bearing, not decorative: the golden fingerprints
-/// in `src/golden.zig` assert it, and all seven of them have to keep passing
-/// unchanged.
+/// bit for bit. That is load-bearing, not decorative: with `classic = 1` the
+/// v2 golden fingerprints in `src/golden.zig` still assert the old sound
+/// unchanged, and the v3 fingerprints pin the default physical model.
 pub const VoiceKnobs = struct {
     /// scales `attack_s`
     attack: f32 = 1.0,
@@ -117,6 +126,42 @@ pub const VoiceKnobs = struct {
     /// up, -1200 down), so a preset can pick a different "instrument". An
     /// offset, not a multiplier — negative is meaningful, not an error.
     cents: f32 = 0.0,
+
+    // The v3 physical axes. Each multiplies what the phrase already asks for
+    // (a "b" is looser and wetter than an "s" at any setting), so 1 is the
+    // phrase's own sound and the knob moves the whole phrase in one direction.
+
+    /// Intestinal pressure: how hard the gas pushes. Up: louder, slightly
+    /// higher, longer before it runs out, harder plosive bursts, and past ~2
+    /// (with low tension) thunderous. Down: weak, breathy, and it drops below
+    /// the sphincter's threshold early, so the syllables sputter out.
+    pressure: f32 = 1.0,
+    /// Sphincter tension. Pitch follows sqrt(tension) like a string. Up: tight,
+    /// squeaky, reedy, short open phase, dry, and a higher threshold pressure
+    /// (tight + low pressure = a squeaker that sputters). Down: loose, flabby,
+    /// low and wide open — wetter, slappier, and with pressure, thunder.
+    tension: f32 = 1.0,
+    /// Terminal tract resonance: how strongly the rectum/buttock cavity rings.
+    /// 0 is the raw valve buzz with no vowel colour or body (dry, thin, raspy);
+    /// 1 is stock; up to 4 sharpens the formants into a honking, boomy,
+    /// trumpet-like fart.
+    tract: f32 = 1.0,
+    /// Noise-burst turbulence. 0 is a clean, perfectly periodic toy buzz. Up:
+    /// more flow-gated rasp in every pulse, random spitting noise bursts, and
+    /// more cycle-to-cycle jitter — raspy, crackly, ragged.
+    turbulence: f32 = 1.0,
+    /// Wetness, on top of what the phonemes bring ("b", "j", "ny", "u" are
+    /// juicy; "s", "t", "i" are dry). Drives stick-slip (the valve sticks
+    /// shut, then lets go with a splat), gurgling bubbles, and sloppy
+    /// cycle-to-cycle irregularity. 0 is bone dry.
+    wetness: f32 = 1.0,
+    /// Depth of the exponential pitch decay (pitch ~ pressure^(0.3*droop)).
+    /// 0 holds the pitch flat while the pressure still drains; 2 sags hard,
+    /// like a deflating balloon.
+    droop: f32 = 1.0,
+    /// 1 selects the previous (v2) engine, bit for bit; the v3 axes above are
+    /// ignored there. 0 (the default) is the physical model.
+    classic: f32 = 0.0,
 
     /// Bounds on the *resulting* spec, not on the multipliers. Each one exists
     /// because the value feeds arithmetic that breaks outside its range.
@@ -139,6 +184,34 @@ pub const VoiceKnobs = struct {
     /// #16: one octave either way. Beyond that the buzzy oscillator leaves the
     /// instrument's register (at -1200 the lowest vowel is a 37 Hz rumble).
     pub const max_abs_cents: f32 = 1200.0;
+    /// v3: two octaves of physical range either way. Below 1/4 pressure the
+    /// valve never reaches its threshold; past 4 tension the pitch leaves the
+    /// register and the open phase is a click.
+    pub const min_pressure: f32 = 0.25;
+    pub const max_pressure: f32 = 4.0;
+    pub const min_tension: f32 = 0.25;
+    pub const max_tension: f32 = 4.0;
+    /// tract, turbulence, wetness and droop go to 0 (the effect is off) and
+    /// up to 4x stock; past that the resonators whistle and the noise drowns
+    /// the valve.
+    pub const max_physical: f32 = 4.0;
+
+    /// The physical axes, clamped into their useful ranges.
+    pub fn physical(self: VoiceKnobs) struct { pressure: f32, tension: f32, tract: f32, turbulence: f32, wetness: f32, droop: f32 } {
+        return .{
+            .pressure = std.math.clamp(self.pressure, min_pressure, max_pressure),
+            .tension = std.math.clamp(self.tension, min_tension, max_tension),
+            .tract = std.math.clamp(self.tract, 0.0, max_physical),
+            .turbulence = std.math.clamp(self.turbulence, 0.0, max_physical),
+            .wetness = std.math.clamp(self.wetness, 0.0, max_physical),
+            .droop = std.math.clamp(self.droop, 0.0, max_physical),
+        };
+    }
+
+    /// `classic >= 0.5` selects the v2 engine.
+    pub fn isClassic(self: VoiceKnobs) bool {
+        return self.classic >= 0.5;
+    }
 
     /// `2^(cents/1200)` — the factor every base frequency is multiplied by,
     /// with `cents` clamped to one octave either way. The `cents == 0` branch
@@ -179,7 +252,9 @@ pub const KnobsError = error{ UnknownKnob, MalformedKnob, NotFinite, Negative };
 /// identity, which is what `--voice ""` and an omitted flag both mean.
 /// `intensity` and `cents` (#15, #16) take the same spelling: `intensity` is
 /// a multiplier (>= 0), `cents` an offset in cents and the one key a negative
-/// value is meaningful for.
+/// value is meaningful for. The v3 axes (`pressure`, `tension`, `tract`,
+/// `turbulence`, `wetness`, `droop`) are multipliers too, and `classic=1`
+/// selects the v2 engine.
 pub fn parseKnobs(s: []const u8) KnobsError!VoiceKnobs {
     var knobs = VoiceKnobs{};
     var it = std.mem.splitScalar(u8, s, ',');
@@ -202,6 +277,20 @@ pub fn parseKnobs(s: []const u8) KnobsError!VoiceKnobs {
             knobs.intensity = v;
         } else if (std.mem.eql(u8, key, "cents")) {
             knobs.cents = v;
+        } else if (std.mem.eql(u8, key, "pressure")) {
+            knobs.pressure = v;
+        } else if (std.mem.eql(u8, key, "tension")) {
+            knobs.tension = v;
+        } else if (std.mem.eql(u8, key, "tract")) {
+            knobs.tract = v;
+        } else if (std.mem.eql(u8, key, "turbulence")) {
+            knobs.turbulence = v;
+        } else if (std.mem.eql(u8, key, "wetness")) {
+            knobs.wetness = v;
+        } else if (std.mem.eql(u8, key, "droop")) {
+            knobs.droop = v;
+        } else if (std.mem.eql(u8, key, "classic")) {
+            knobs.classic = v;
         } else return error.UnknownKnob;
     }
     return knobs;
@@ -295,7 +384,16 @@ fn synthInto(out: []i16, p: VoiceParams, prng: *std.Random.DefaultPrng) void {
     }
 }
 
+/// One syllable with no phrase context (not word-final), in whichever engine
+/// the knobs select.
 fn renderSyllableInto(out: []i16, syl: *const Syll, stressed: bool, prng: *std.Random.DefaultPrng, knobs: VoiceKnobs) void {
+    if (knobs.isClassic()) return renderSyllableClassic(out, syl, stressed, prng, knobs);
+    renderSyllableV3(out, syl, .{ .stressed = stressed }, prng, knobs);
+}
+
+/// The v2 syllable renderer, untouched: `classic=1` and its golden
+/// fingerprints depend on every prng draw happening in this order.
+fn renderSyllableClassic(out: []i16, syl: *const Syll, stressed: bool, prng: *std.Random.DefaultPrng, knobs: VoiceKnobs) void {
     const eff = knobs.effort();
     const pitch = knobs.pitchFactor();
     var p: VoiceParams = undefined;
@@ -328,6 +426,871 @@ fn renderSyllableInto(out: []i16, syl: *const Syll, stressed: bool, prng: *std.R
     p.f0 *= 1.0 + (r.float(f32) - 0.5) * 0.06;
     p.wobble_hz += (r.float(f32) - 0.5) * 3.0;
     synthInto(out, p, prng);
+}
+
+// ---------------------------------------------------------------------
+// v3: the physical model
+// ---------------------------------------------------------------------
+
+// Bit-stable math. `@sin`, `@cos`, `@exp`, `@log`, `@log2` and
+// `std.math.pow` do not return the same bits in Debug and Release builds
+// (measured on this toolchain: all six move, and `@sin` even differs between
+// ReleaseSafe and ReleaseFast), while + - * / and `@sqrt` are exact IEEE and
+// do not. So the physical model does its transcendental maths with these
+// polynomials, built only from exact operations: v3 renders the same bytes in
+// every optimization mode. Accurate to ~1e-6, far below one i16 step.
+
+/// 2^x, x clamped to the normal f32 range.
+fn exp2D(x: f32) f32 {
+    const xc = std.math.clamp(x, -126.0, 126.0);
+    const fl = @floor(xc);
+    const f = xc - fl;
+    // Taylor series of e^(f ln 2) on [0, 1): 8 terms, error < 2e-7
+    const p = 1.0 + f * (0.6931472 + f * (0.2402265 + f * (0.05550411 + f * (0.009618129 + f * (0.001333356 + f * (1.540353e-4 + f * (1.525273e-5 + f * 1.321549e-6)))))));
+    const e: i32 = @intFromFloat(fl);
+    const scale: f32 = @bitCast(@as(u32, @intCast(e + 127)) << 23);
+    return p * scale;
+}
+
+fn expD(x: f32) f32 {
+    return exp2D(x * 1.442695);
+}
+
+/// log2(x) for x > 0 (anything smaller is treated as 1e-30).
+fn log2D(x: f32) f32 {
+    const bits: u32 = @bitCast(@max(x, 1e-30));
+    const e: i32 = @as(i32, @intCast(bits >> 23)) - 127;
+    const m: f32 = @bitCast((bits & 0x007F_FFFF) | 0x3F80_0000);
+    // ln(m) = 2 atanh(s), s = (m - 1) / (m + 1) in [0, 1/3): error < 1e-7
+    const s = (m - 1.0) / (m + 1.0);
+    const s2 = s * s;
+    const ln_m = 2.0 * s * (1.0 + s2 * (1.0 / 3.0 + s2 * (1.0 / 5.0 + s2 * (1.0 / 7.0 + s2 * (1.0 / 9.0 + s2 * (1.0 / 11.0 + s2 / 13.0))))));
+    return @as(f32, @floatFromInt(e)) + ln_m * 1.442695;
+}
+
+fn lnD(x: f32) f32 {
+    return log2D(x) * 0.6931472;
+}
+
+/// x^y for x > 0; 0 for x <= 0.
+fn powD(x: f32, y: f32) f32 {
+    if (x <= 0) return 0;
+    return exp2D(y * log2D(x));
+}
+
+fn sinD(x: f32) f32 {
+    const tau: f32 = std.math.tau;
+    const half_pi: f32 = std.math.pi / 2.0;
+    var r = x - @round(x / tau) * tau;
+    if (r > half_pi) r = std.math.pi - r else if (r < -half_pi) r = -std.math.pi - r;
+    const r2 = r * r;
+    // Taylor series to r^13 on [-pi/2, pi/2]: error < 1e-8
+    return r * (1.0 + r2 * (-1.0 / 6.0 + r2 * (1.0 / 120.0 + r2 * (-1.0 / 5040.0 + r2 * (1.0 / 362880.0 + r2 * (-1.0 / 39916800.0 + r2 / 6227020800.0))))));
+}
+
+fn cosD(x: f32) f32 {
+    return sinD(x + std.math.pi / 2.0);
+}
+
+/// `VoiceKnobs.pitchFactor` in bit-stable maths, for the v3 path.
+fn pitchFactorD(knobs: VoiceKnobs) f32 {
+    if (knobs.cents == 0) return 1.0;
+    return exp2D(std.math.clamp(knobs.cents, -VoiceKnobs.max_abs_cents, VoiceKnobs.max_abs_cents) / 1200.0);
+}
+
+/// Where a syllable sits in its phrase. The pressure reservoir is shaped by
+/// it: a stressed syllable pushes harder and sustains, a word-final one runs
+/// low and sputters, and the phrase's last one sputters out completely.
+pub const SylContext = struct {
+    stressed: bool = false,
+    word_final: bool = false,
+    phrase_final: bool = false,
+    /// 0 at the phrase's first syllable, 1 at its last: pressure and pitch
+    /// both sag a little across a phrase, like speech declination
+    position: f32 = 0,
+};
+
+/// How a consonant is made, which decides how the valve opens.
+pub const Manner = enum { vowel, stop, affricate, fricative, nasal, trill, lateral, glide };
+
+/// Where a consonant is made: picks the burst/hiss noise band and the
+/// formant transition into the vowel.
+pub const Place = enum { labial, dental, alveolar, palatal, velar, glottal };
+
+/// A consonant onset as the physical model sees it: how the valve opens,
+/// plus the pressure/tension/wetness/rasp tendencies the consonant brings.
+pub const Articulation = struct {
+    manner: Manner = .vowel,
+    place: Place = .glottal,
+    voiced: bool = true,
+    /// mb, nd, ng, nj, nz, ...: a hummed murmur before the consonant proper
+    prenasal: bool = false,
+    /// 'w' or 'y' for a glide onset or a closing glide (kwa, bwana, mya)
+    glide: u8 = 0,
+    /// multiplier on sphincter tension (and, as sqrt, on pitch)
+    tension: f32 = 1.0,
+    /// multiplier on intestinal pressure
+    pressure: f32 = 1.0,
+    /// wetness this onset brings, before the vowel's and the knob's
+    wet: f32 = 0.2,
+    /// roughness: period doubling (alternating strong/weak flaps) and jitter
+    rasp: f32 = 0.0,
+};
+
+fn mkArt(manner: Manner, place: Place, voiced: bool, tension: f32, pressure: f32, wet: f32, rasp: f32) Articulation {
+    return .{ .manner = manner, .place = place, .voiced = voiced, .tension = tension, .pressure = pressure, .wet = wet, .rasp = rasp };
+}
+
+/// Reads a Swahili onset (the consonants before the vowel) as a physical
+/// articulation. Stops (p t k b d g) become closure + pressure burst,
+/// affricates (ch j) a burst into hiss, fricatives (f v s z sh th dh gh kh h)
+/// a hiss the buzz grows out of, nasals a muffled hum, r a trill, w/y a
+/// formant glide. Prenasal clusters (mb, nd, ng, nj, nz) keep their hum.
+pub fn articulate(onset: []const u8) Articulation {
+    if (onset.len == 0) return .{};
+    var core = onset;
+    var glide: u8 = 0;
+    if (core.len >= 2) {
+        const tail = core[core.len - 1];
+        if (tail == 'w' or (tail == 'y' and !std.mem.eql(u8, core, "ny"))) {
+            glide = tail;
+            core = core[0 .. core.len - 1];
+        }
+    }
+    var prenasal = false;
+    if (core.len >= 2 and (core[0] == 'm' or core[0] == 'n') and core[1] != 'y' and !std.mem.startsWith(u8, core, "ng'")) {
+        prenasal = true;
+        core = core[1..];
+    }
+    const c0 = core[0];
+    const c1: u8 = if (core.len > 1) core[1] else 0;
+    //                       manner      place      voiced tension pressure wet  rasp
+    var a: Articulation = switch (c0) {
+        'p' => mkArt(.stop, .labial, false, 1.10, 1.15, 0.10, 0.05),
+        'b' => mkArt(.stop, .labial, true, 0.85, 1.10, 0.45, 0.05),
+        't' => if (c1 == 'h')
+            mkArt(.fricative, .dental, false, 1.10, 0.90, 0.10, 0.10)
+        else
+            mkArt(.stop, .alveolar, false, 1.25, 1.05, 0.05, 0.10),
+        'd' => if (c1 == 'h')
+            mkArt(.fricative, .dental, true, 1.05, 0.90, 0.15, 0.15)
+        else
+            mkArt(.stop, .alveolar, true, 1.00, 1.00, 0.30, 0.05),
+        'k', 'q' => if (c1 == 'h')
+            mkArt(.fricative, .velar, false, 1.05, 1.00, 0.15, 0.55)
+        else
+            mkArt(.stop, .velar, false, 1.10, 1.10, 0.12, 0.25),
+        'g' => if (c1 == 'h')
+            mkArt(.fricative, .velar, true, 0.95, 1.00, 0.35, 0.60)
+        else
+            mkArt(.stop, .velar, true, 0.90, 1.05, 0.40, 0.20),
+        'c' => mkArt(.affricate, .palatal, false, 1.20, 1.05, 0.10, 0.15),
+        'j' => mkArt(.affricate, .palatal, true, 0.95, 1.10, 0.60, 0.10),
+        'f' => mkArt(.fricative, .labial, false, 1.15, 0.85, 0.05, 0.10),
+        'v' => mkArt(.fricative, .labial, true, 1.00, 0.95, 0.15, 0.35),
+        's' => if (c1 == 'h')
+            mkArt(.fricative, .palatal, false, 1.30, 0.85, 0.05, 0.10)
+        else
+            mkArt(.fricative, .alveolar, false, 1.55, 0.80, 0.00, 0.05),
+        'z' => mkArt(.fricative, .alveolar, true, 1.35, 0.90, 0.10, 0.40),
+        'x' => mkArt(.fricative, .velar, false, 1.05, 1.00, 0.15, 0.55),
+        'h' => mkArt(.fricative, .glottal, false, 0.90, 0.75, 0.10, 0.00),
+        'm' => mkArt(.nasal, .labial, true, 0.75, 0.90, 0.35, 0.00),
+        'n' => if (c1 == 'y')
+            mkArt(.nasal, .palatal, true, 0.90, 0.95, 0.50, 0.00)
+        else if (c1 == 'g')
+            mkArt(.nasal, .velar, true, 0.80, 0.95, 0.35, 0.00)
+        else
+            mkArt(.nasal, .alveolar, true, 0.85, 0.90, 0.25, 0.00),
+        'r' => mkArt(.trill, .alveolar, true, 1.05, 1.05, 0.15, 0.35),
+        'l' => mkArt(.lateral, .alveolar, true, 0.90, 0.95, 0.30, 0.00),
+        'w' => mkArt(.glide, .labial, true, 0.80, 1.10, 0.30, 0.00),
+        'y' => mkArt(.glide, .palatal, true, 1.10, 1.00, 0.20, 0.00),
+        else => mkArt(.fricative, .glottal, false, 0.90, 0.75, 0.10, 0.00),
+    };
+    if (prenasal) {
+        a.prenasal = true;
+        a.wet += 0.20;
+        a.pressure *= 1.05;
+    }
+    switch (glide) {
+        'w' => {
+            a.tension *= 0.92;
+            a.wet += 0.08;
+        },
+        'y' => a.tension *= 1.06,
+        else => {},
+    }
+    a.glide = if (a.manner == .glide) c0 else glide;
+    return a;
+}
+
+const VowelPhys = struct { f1: f32, f2: f32, tension: f32, pressure: f32, wet: f32 };
+
+/// Vowel formants (an adult voice's F1/F2; the tract scales them down into
+/// the butt register) and what each vowel does to the valve: open "a" pushes
+/// more gas, close "i" tightens into a squeak, round "o"/"u" loosen and wet.
+fn vowelPhys(v: u8) VowelPhys {
+    return switch (v) {
+        'a' => .{ .f1 = 760, .f2 = 1250, .tension = 0.95, .pressure = 1.10, .wet = 0.00 },
+        'e' => .{ .f1 = 500, .f2 = 1750, .tension = 1.05, .pressure = 1.00, .wet = 0.00 },
+        'i' => .{ .f1 = 300, .f2 = 2200, .tension = 1.30, .pressure = 0.95, .wet = -0.05 },
+        'o' => .{ .f1 = 520, .f2 = 880, .tension = 0.88, .pressure = 1.05, .wet = 0.10 },
+        'u' => .{ .f1 = 330, .f2 = 760, .tension = 0.80, .pressure = 1.00, .wet = 0.15 },
+        // no vowel (a breath syllable): a neutral schwa cavity
+        else => .{ .f1 = 450, .f2 = 1100, .tension = 1.00, .pressure = 0.90, .wet = 0.00 },
+    };
+}
+
+/// Centre and Q of the burst/hiss noise for a place of articulation: "pff"
+/// is low and wide, "sss" high and narrow, "shh" in between.
+fn placeBand(p: Place) [2]f32 {
+    return switch (p) {
+        .labial => .{ 1300, 0.7 },
+        .dental => .{ 2600, 0.8 },
+        .alveolar => .{ 4200, 1.3 },
+        .palatal => .{ 3000, 1.5 },
+        .velar => .{ 1700, 1.8 },
+        .glottal => .{ 1100, 0.6 },
+    };
+}
+
+/// One syllable's fully resolved physical parameters.
+const FartParams = struct {
+    /// starting sphincter pitch, Hz (at full reservoir pressure)
+    f0: f32,
+    /// P0, intestinal pressure (1 = stock)
+    pressure: f32,
+    /// effective sphincter tension (1 = stock)
+    tension: f32,
+    /// terminal tract resonance amount (0 = none, 1 = stock)
+    tract: f32,
+    turbulence: f32,
+    /// 0 = bone dry, 1.5 = sloppy
+    wet: f32,
+    /// 0..1 period doubling and jitter
+    rasp: f32,
+    droop: f32,
+    /// 0..1: high pressure through a loose valve, emergent from the above
+    thunder: f32,
+    /// reservoir pressure left at the end of the syllable, as a fraction of P0
+    end_ratio: f32,
+    attack_s: f32,
+    noise_mix: f32,
+    wobble_hz: f32,
+    wobble_depth: f32,
+    level: f32,
+    f1: f32,
+    f2: f32,
+    art: Articulation,
+    /// a consonant-only syllable: a hum or a puff, not a full flap
+    breath: bool,
+};
+
+/// Resolves one syllable from the onset and vowel tables, its phrase context,
+/// and the knobs. `f0` arrives with the cents shift applied. The class table
+/// still owns attack, noise mix, wobble and level, so every v2 knob keeps its
+/// meaning here.
+fn buildFart(onset: []const u8, vowel: u8, f0: f32, ctx: SylContext, knobs: VoiceKnobs) FartParams {
+    const eff = knobs.effort();
+    const k = knobs.physical();
+    const a = articulate(onset);
+    const vp = vowelPhys(vowel);
+    const breath = vowel == 0;
+    const spec = if (breath)
+        knobs.apply(.{ .attack_s = 0.006, .noise_mix = 0.85, .wobble_hz = 31.0, .wobble_depth = 0.30, .level = 0.65 })
+    else
+        knobs.apply(voiceSpec(classify(onset)));
+
+    // #15 effort: level and noise as in v2, and it pushes a little harder too
+    var level = spec.level * eff;
+    if (ctx.stressed) level *= stressBoost(eff);
+    const noise_mix = std.math.clamp(spec.noise_mix * eff, 0.0, VoiceKnobs.max_noise_mix);
+
+    const pos = std.math.clamp(ctx.position, 0.0, 1.0);
+    const stress_push: f32 = if (ctx.stressed) 1.25 else 1.0;
+    const pressure = k.pressure * a.pressure * vp.pressure * powD(eff, 0.35) * stress_push * (1.0 - 0.12 * pos);
+    const tension = k.tension * a.tension * vp.tension;
+    const lt = log2D(tension);
+    const lp = log2D(pressure);
+    const thunder = std.math.clamp(0.5 * (lp - lt) - 0.1, 0.0, 1.0);
+    const wet = std.math.clamp(k.wetness * @max(0.0, a.wet + vp.wet) * (1.0 + 0.6 * @max(0.0, -lt)) * (0.75 + 0.25 * @min(pressure, 2.0)), 0.0, 1.5);
+    const rasp = std.math.clamp(a.rasp + 0.3 * @max(0.0, lt) * @min(pressure, 2.0) + 0.08 * k.turbulence, 0.0, 1.0);
+    const reservoir: f32 = if (ctx.phrase_final) 0.07 else if (ctx.word_final) 0.14 else if (ctx.stressed) 0.34 else 0.26;
+    const end_ratio = std.math.clamp(reservoir * powD(k.pressure, 0.4), 0.03, 0.75);
+    // Pitch: the vowel owns the base, and the consonant's and the knob's
+    // tension tune it like a string, sqrt(T). The vowel's own tension shapes
+    // the valve, not the pitch, so the vowel table stays the pitch table.
+    const stress_lift: f32 = if (ctx.stressed) 1.04 else 1.0;
+    const pitch = f0 * @sqrt(k.tension * a.tension) * powD(k.pressure, 0.1) * stress_lift * (1.0 - 0.06 * pos);
+    return .{
+        .f0 = pitch,
+        .pressure = pressure,
+        .tension = tension,
+        .tract = k.tract,
+        .turbulence = k.turbulence,
+        .wet = wet,
+        .rasp = rasp,
+        .droop = k.droop,
+        .thunder = thunder,
+        .end_ratio = end_ratio,
+        .attack_s = spec.attack_s,
+        .noise_mix = noise_mix,
+        .wobble_hz = spec.wobble_hz,
+        .wobble_depth = spec.wobble_depth,
+        .level = level,
+        .f1 = vp.f1,
+        .f2 = vp.f2,
+        .art = a,
+        .breath = breath,
+    };
+}
+
+/// When things happen inside one syllable, in seconds from its start.
+const Timeline = struct {
+    /// the sphincter opens and the reservoir starts to drain
+    release: f32 = 0,
+    /// nasal murmur: the tract is muffled until here
+    murmur_end: f32 = 0,
+    /// voicing during a prenasal murmur
+    murmur_voice: f32 = 0,
+    /// voicing during a stop's closure (a voiced stop's "voice bar")
+    bar_voice: f32 = 0,
+    fric_start: f32 = 0,
+    fric_end: f32 = 0,
+    fric_gain: f32 = 0,
+    /// how much buzz sits under the hiss while it lasts
+    fric_voicing: f32 = 1,
+    /// voiceless release: noise-only time before the buzz grows in
+    aspiration: f32 = 0,
+    /// plosive pressure spike at release, as a multiple of P0
+    spike: f32 = 0,
+    pop_noise: f32 = 0,
+    pop_tau: f32 = 0.008,
+    /// a voiced stop's low thud
+    thump: f32 = 0,
+    trill_end: f32 = 0,
+};
+
+fn buildTimeline(a: Articulation, dur: f32, breath: bool) Timeline {
+    // onsets are timed for a 240 ms syllable and shrink with shorter ones
+    const ts: f32 = @min(1.0, dur / 0.24);
+    var tl = Timeline{};
+    if (breath) {
+        if (a.manner == .nasal) {
+            tl.murmur_end = dur; // a syllabic "m": a hum through closed cheeks
+        } else {
+            tl.fric_end = dur * 0.8; // a puff with a little buzz under it
+            tl.fric_gain = 0.9;
+            tl.fric_voicing = 0.35;
+        }
+        return tl;
+    }
+    if (a.prenasal) {
+        tl.murmur_end = 0.045 * ts;
+        tl.murmur_voice = 0.6;
+    }
+    switch (a.manner) {
+        .vowel, .lateral, .glide => {},
+        .nasal => tl.murmur_end = 0.050 * ts,
+        .trill => tl.trill_end = 0.085 * ts,
+        .stop => {
+            const closure: f32 = if (a.voiced) 0.010 else 0.018;
+            tl.release = tl.murmur_end + closure * ts;
+            tl.bar_voice = if (a.voiced) 0.12 else 0.0;
+            tl.spike = if (a.voiced) 0.55 else 0.95;
+            tl.pop_noise = if (a.voiced) 0.45 else 1.0;
+            tl.aspiration = if (a.voiced) 0.0 else 0.022 * ts;
+            tl.thump = if (a.voiced) 0.55 else 0.25;
+            if (a.place == .labial) tl.thump *= 1.4;
+        },
+        .affricate => {
+            tl.release = tl.murmur_end + 0.012 * ts;
+            tl.bar_voice = if (a.voiced) 0.10 else 0.0;
+            tl.spike = 0.6;
+            tl.pop_noise = 0.8;
+            tl.pop_tau = 0.020;
+            const hiss: f32 = if (a.voiced) 0.030 else 0.045;
+            tl.fric_start = tl.release;
+            tl.fric_end = tl.release + hiss * ts;
+            tl.fric_gain = 0.8;
+            tl.aspiration = if (a.voiced) 0.0 else 0.015 * ts;
+            tl.thump = if (a.voiced) 0.3 else 0.1;
+        },
+        .fricative => {
+            const hiss: f32 = if (a.voiced) 0.045 else 0.065;
+            tl.fric_start = tl.murmur_end;
+            tl.fric_end = tl.murmur_end + hiss * ts;
+            tl.fric_gain = 1.0;
+            if (a.voiced) {
+                tl.release = tl.fric_start;
+                tl.fric_voicing = 0.6;
+            } else {
+                // the gas hisses through a valve that has not started to buzz
+                tl.release = tl.fric_start + 0.6 * (tl.fric_end - tl.fric_start);
+                tl.aspiration = 0.02 * ts;
+            }
+        },
+    }
+    return tl;
+}
+
+fn smoothStep(e0: f32, e1: f32, x: f32) f32 {
+    const s = std.math.clamp((x - e0) / (e1 - e0), 0.0, 1.0);
+    return s * s * (3.0 - 2.0 * s);
+}
+
+/// Rational tanh: round, warm saturation that never exceeds +-1. This is the
+/// "fat" — loud flaps squash into the cheeks instead of hard-clipping.
+fn softClip(x: f32) f32 {
+    if (x >= 3.0) return 1.0;
+    if (x <= -3.0) return -1.0;
+    const x2 = x * x;
+    return x * (27.0 + x2) / (27.0 + 9.0 * x2);
+}
+
+/// One prng draw split into three uniform [0, 1) dice of 21 bits each.
+fn diceTriple(r: std.Random) [3]f32 {
+    const v = r.int(u64);
+    const s: f32 = 1.0 / 2097152.0;
+    return .{
+        @as(f32, @floatFromInt(v & 0x1F_FFFF)) * s,
+        @as(f32, @floatFromInt((v >> 21) & 0x1F_FFFF)) * s,
+        @as(f32, @floatFromInt((v >> 42) & 0x1F_FFFF)) * s,
+    };
+}
+
+/// One-pole low-pass coefficient for cutoff `fc`. `w / (1 + w)` rather than
+/// `1 - exp(-w)`: close enough for a tone control, and no transcendental
+/// call in the per-block loop.
+fn onePoleCoef(fc: f32) f32 {
+    const w = std.math.tau * fc / @as(f32, @floatFromInt(SAMPLE_RATE));
+    return w / (1.0 + w);
+}
+
+/// RBJ band-pass with 0 dB peak gain, transposed direct form II: sharpening
+/// Q colours the sound without adding level at the centre.
+const Biquad = struct {
+    b0: f32 = 0,
+    b2: f32 = 0,
+    a1: f32 = 0,
+    a2: f32 = 0,
+    z1: f32 = 0,
+    z2: f32 = 0,
+
+    fn bandpass(fc: f32, q: f32) Biquad {
+        var bq = Biquad{};
+        bq.tune(fc, q);
+        return bq;
+    }
+
+    fn tune(self: *Biquad, fc: f32, q: f32) void {
+        const sr: f32 = @floatFromInt(SAMPLE_RATE);
+        const w0 = std.math.tau * std.math.clamp(fc, 20.0, 0.45 * sr) / sr;
+        const alpha = sinD(w0) / (2.0 * @max(q, 0.1));
+        const a0 = 1.0 + alpha;
+        self.b0 = alpha / a0;
+        self.b2 = -alpha / a0;
+        self.a1 = -2.0 * cosD(w0) / a0;
+        self.a2 = (1.0 - alpha) / a0;
+    }
+
+    fn step(self: *Biquad, x: f32) f32 {
+        const y = self.b0 * x + self.z1;
+        self.z1 = self.z2 - self.a1 * y;
+        self.z2 = self.b2 * x - self.a2 * y;
+        return y;
+    }
+};
+
+/// A gas bubble bursting in the wet: a damped sine that chirps upward as it
+/// shrinks (the Minnaert resonance rises with a falling radius).
+const Bubble = struct {
+    phase: f32 = 0,
+    freq: f32 = 0,
+    rise: f32 = 0,
+    env: f32 = 0,
+    mul: f32 = 0,
+
+    fn step(self: *Bubble) f32 {
+        if (self.env < 1e-4) return 0;
+        const y = self.env * sinD(self.phase);
+        self.phase += std.math.tau * self.freq / @as(f32, @floatFromInt(SAMPLE_RATE));
+        if (self.phase >= std.math.tau) self.phase -= std.math.tau;
+        self.freq += self.rise;
+        self.env *= self.mul;
+        return y;
+    }
+};
+
+fn spawnBubble(pool: *[4]Bubble, d_freq: f32, d_amp: f32, gain: f32, tension: f32) void {
+    var slot: usize = 0;
+    for (pool.*, 0..) |bub, j| {
+        if (bub.env < pool[slot].env) slot = j;
+    }
+    const sr: f32 = @floatFromInt(SAMPLE_RATE);
+    // mostly big, low bubbles; a tight valve squeezes out smaller ones
+    const f = std.math.clamp((150.0 + 650.0 * d_freq * d_freq) * powD(tension, 0.3), 100.0, 2000.0);
+    const life = std.math.clamp(3.0 / f, 0.002, 0.02);
+    pool[slot] = .{
+        .freq = f,
+        .rise = f * 0.25 / (life * sr),
+        .env = gain * (0.12 + 0.25 * d_amp),
+        .mul = expD(-1.0 / (life * sr)),
+    };
+}
+
+/// A band-passed noise burst with an exponential tail: turbulence spits and
+/// wet splats.
+const NoiseBurst = struct {
+    env: f32 = 0,
+    mul: f32 = 0,
+    bp: Biquad = .{},
+
+    fn fire(self: *NoiseBurst, gain: f32, decay_s: f32, fc: f32, q: f32) void {
+        self.env = gain;
+        self.mul = expD(-1.0 / (decay_s * @as(f32, @floatFromInt(SAMPLE_RATE))));
+        self.bp.tune(fc, q);
+    }
+
+    fn step(self: *NoiseBurst, white: f32) f32 {
+        if (self.env < 1e-4) return 0;
+        const y = self.bp.step(white) * self.env;
+        self.env *= self.mul;
+        return y;
+    }
+};
+
+/// Renders one physical-model fart phoneme into `out` (mono i16).
+///
+/// Per sample: the reservoir pressure decays exponentially from the release
+/// (plus a plosive spike), the sphincter runs a pulse-train valve whose cycle
+/// is re-decided at every flap — pitch from pressure^(0.3*droop), fire or
+/// sputter from pressure vs the tension's threshold, stick-slip, bubbles,
+/// noise bursts — and the flow goes through the terminal tract (formants and
+/// a body resonance), the trousers' low-pass, and a soft clip.
+///
+/// Deterministic: the only randomness comes from `prng`, and every per-cycle
+/// and per-sample draw happens whatever was decided, so a decision can never
+/// shift the stream under the rest of the syllable.
+fn fartInto(out: []i16, fp: FartParams, prng: *std.Random.DefaultPrng) void {
+    const n = out.len;
+    if (n == 0) return;
+    const r = prng.random();
+    const sr: f32 = @floatFromInt(SAMPLE_RATE);
+    const dt: f32 = 1.0 / sr;
+    const tau: f32 = std.math.tau;
+    const pi: f32 = std.math.pi;
+    const dur: f32 = @as(f32, @floatFromInt(n)) * dt;
+    const a = fp.art;
+    const tl = buildTimeline(a, dur, fp.breath);
+
+    // fixed per-syllable draws
+    const wob_phase = r.float(f32) * tau;
+    const wob_hz = fp.wobble_hz * (0.9 + 0.2 * r.float(f32));
+    const sq1_phase = r.float(f32) * tau;
+    const sq1_hz = 2.0 + 3.5 * r.float(f32);
+    const sq2_phase = r.float(f32) * tau;
+    const sq2_hz = 6.0 + 5.0 * r.float(f32);
+
+    // the valve
+    const lt = log2D(fp.tension);
+    // phonation threshold: below it the sphincter cannot sustain a buzz
+    const p_th = 0.13 * powD(fp.tension, 0.9);
+    // open quotient: a loose valve hangs open (round, flabby), a tight one
+    // flicks open and slaps shut (buzzy, squeaky)
+    const oq_base = std.math.clamp(0.60 - 0.16 * lt, 0.28, 0.80);
+    const skew = std.math.clamp(0.62 + 0.08 * lt, 0.52, 0.80);
+    const bright = std.math.clamp(0.32 + 0.20 * lt + 0.10 * log2D(fp.pressure) + 0.15 * fp.rasp, 0.06, 0.95);
+    const gamma = 0.30 * fp.droop;
+    const turb = fp.turbulence;
+    const jitter = std.math.clamp(0.008 + 0.018 * turb + 0.04 * fp.wet + 0.03 * fp.rasp, 0.0, 0.25);
+    const shimmer = std.math.clamp(0.05 + 0.08 * turb + 0.15 * fp.wet, 0.0, 0.6);
+    const q_burst = std.math.clamp(0.025 + 0.06 * turb, 0.0, 0.5);
+    const nm = fp.noise_mix;
+    const asp_gain = nm * (0.3 + 0.7 * @min(turb, 3.0));
+    const wd = fp.wobble_depth * 0.65;
+
+    // the reservoir: P falls from 1 to end_ratio across the voiced part
+    const active = @max(dur - tl.release, 0.01);
+    const tau_p = active / -lnD(std.math.clamp(fp.end_ratio, 0.02, 0.95));
+    const decay_mul = expD(-dt / tau_p);
+    const spike_mul = expD(-dt / 0.018);
+    const ts: f32 = @min(1.0, dur / 0.24);
+    const close_len = @max(0.022 * ts, 0.004);
+
+    // the tract
+    const fscale = 0.75 * (1.0 - 0.15 * fp.thunder);
+    const f1t = fp.f1 * fscale;
+    const f2t = fp.f2 * fscale;
+    var f1s = f1t;
+    var f2s = f2t;
+    if (a.manner != .vowel) {
+        switch (a.place) {
+            .labial => f2s = f2t * 0.8,
+            .alveolar, .dental => f2s = 0.5 * f2t + 0.5 * 1800.0 * fscale,
+            .palatal => f2s = 0.5 * f2t + 0.5 * 2200.0 * fscale,
+            .velar => {
+                f1s = f1t * 0.85;
+                f2s = f2t * 1.12;
+            },
+            .glottal => {},
+        }
+    }
+    if (a.glide == 'w') {
+        f1s = 330.0 * fscale;
+        f2s = 760.0 * fscale;
+    } else if (a.glide == 'y') {
+        f1s = 300.0 * fscale;
+        f2s = 2200.0 * fscale;
+    }
+    const n1 = 260.0 * fscale; // nasal murmur: one low resonance, closed off
+    const n2 = 1000.0 * fscale;
+    const mix = std.math.clamp(0.72 * @sqrt(fp.tract), 0.0, 0.95);
+    const qs = 0.6 + 0.4 * fp.tract;
+    // the cheeks ring around the 2nd-3rd harmonic: that is where a fart's
+    // "fat" lives on real speakers, which cannot reproduce a 60 Hz fundamental
+    const body_f = std.math.clamp(170.0 * powD(fp.tension, 0.25) * (1.0 - 0.25 * fp.thunder), 90.0, 300.0);
+    const body_g = 0.25 + 0.15 * fp.tract + 0.8 * fp.thunder;
+    var bp1 = Biquad.bandpass(f1s, 3.0 * qs);
+    var bp2 = Biquad.bandpass(f2s, 4.5 * qs);
+    var bpb = Biquad.bandpass(body_f, 1.3 * qs);
+    const lp_base = std.math.clamp(3200.0 * powD(fp.tension, 0.35) * (1.0 - 0.4 * fp.thunder), 350.0, 8000.0);
+    const band = placeBand(a.place);
+    var bp_asp = Biquad.bandpass(1500.0 + 1000.0 * bright, 0.8);
+    var bp_fric = Biquad.bandpass(band[0], band[1]);
+    var bp_pop = Biquad.bandpass(band[0] * 1.15, band[1] * 0.8);
+    const a_hiss = onePoleCoef(900.0);
+    const a_dc = onePoleCoef(35.0);
+    // thunder is already loud through the valve and the body resonance; the
+    // drive only leans it a little further into the soft clip
+    const drive = 1.0 + 0.1 * fp.thunder + 0.1 * @max(0.0, log2D(fp.pressure));
+    const sq1_depth = 0.07 + 0.10 * fp.thunder;
+    const sq2_depth = 0.04 + 0.06 * fp.thunder;
+    const th_f = std.math.clamp(2.0 * fp.f0, 90.0, 260.0);
+    const th_mul = expD(-dt / 0.014);
+    const pop_len: f32 = if (a.place == .labial) 0.0022 else 0.0012;
+    const pop_mul = expD(-dt / tl.pop_tau);
+    const trans_block = expD(-32.0 * dt / 0.035);
+    const muffle_block = expD(-32.0 * dt / 0.025);
+    const fric_mul = expD(-dt / 0.02);
+    // the hiss leads the flap by ~10 dB: gas leaking past the valve, not a
+    // spoken "s"
+    const fric_amp = 0.7 * @sqrt(fp.pressure);
+    const pop_amp = 1.2 * @sqrt(fp.pressure);
+    // a fricative keeps leaking a little hiss under the buzz; an affricate's
+    // hiss is gone once the valve is buzzing
+    const fric_floor: f32 = if (a.manner == .fricative) 0.05 else 0.0;
+    const fade_in: f32 = 0.001 * sr;
+    const fade_out: f32 = 0.006 * sr;
+
+    var x: f32 = 1.0; // position in the current cycle, in cycles
+    var span: f32 = 1.0; // cycle length in cycles (> 1 while the valve sticks)
+    var inc: f32 = fp.f0 / sr;
+    var amp: f32 = 0;
+    var oq: f32 = oq_base;
+    var odd = false;
+    var boost: f32 = 1.0;
+    var splat_due = false;
+    var u_prev: f32 = 0;
+    var u_lp: f32 = 0;
+    var decay: f32 = 1.0;
+    var spike_env: f32 = 1.0;
+    var trans: f32 = 1.0;
+    var muffle: f32 = if (tl.murmur_end > 0) 1.0 else 0.0;
+    var fric_tail: f32 = 1.0;
+    var pop_env: f32 = tl.pop_noise;
+    var th_env: f32 = tl.thump;
+    var th_ph: f32 = 0;
+    var hiss_lp: f32 = 0;
+    var lp1: f32 = 0;
+    var lp2: f32 = 0;
+    var a_lp = onePoleCoef(lp_base);
+    var dc_x: f32 = 0;
+    var dc_y: f32 = 0;
+    var bubbles: [4]Bubble = @splat(.{});
+    var turb_ev = NoiseBurst{};
+    var splat = NoiseBurst{};
+
+    for (0..n) |i| {
+        const fi: f32 = @floatFromInt(i);
+        const t = fi * dt;
+        const after = t >= tl.release;
+
+        // block rate: formant transitions and the nasal murmur opening up
+        if (i % 32 == 0) {
+            if (t >= tl.murmur_end) muffle *= muffle_block;
+            if (after) trans *= trans_block;
+            const f1 = (f1t + (f1s - f1t) * trans) * (1.0 - muffle) + n1 * muffle;
+            const f2 = (f2t + (f2s - f2t) * trans) * (1.0 - muffle) + n2 * muffle;
+            bp1.tune(f1, 3.0 * qs);
+            bp2.tune(f2, 4.5 * qs);
+            a_lp = onePoleCoef(lp_base * (1.0 - 0.7 * muffle));
+        }
+
+        // intestinal pressure: the reservoir (sets pitch) and the pressure at
+        // the valve (sets amplitude), which also has the attack and the final
+        // closing of the sphincter in it
+        const close = smoothStep(0.0, close_len, dur - t);
+        var res_p: f32 = 0.8;
+        var p_now: f32 = 0;
+        if (after) {
+            const te = t - tl.release;
+            const rise = @min(1.0, te / fp.attack_s);
+            // the gut squeezes unevenly; a big loose fart rolls with it
+            const squeeze = 1.0 + sq1_depth * sinD(tau * sq1_hz * t + sq1_phase) + sq2_depth * sinD(tau * sq2_hz * t + sq2_phase);
+            res_p = decay * squeeze + tl.spike * spike_env;
+            p_now = fp.pressure * (rise * decay * squeeze + tl.spike * spike_env) * close;
+            decay *= decay_mul;
+            spike_env *= spike_mul;
+        } else {
+            p_now = fp.pressure * 0.6 * @min(1.0, t / 0.012) * close;
+        }
+
+        // a new flap: decide everything about this cycle at once
+        if (x >= span) {
+            x -= span;
+            const d0 = diceTriple(r);
+            const d1 = diceTriple(r);
+            const d2 = diceTriple(r);
+            const d3 = diceTriple(r);
+            const d4 = diceTriple(r);
+            odd = !odd;
+            // exponential pitch decay: pitch rides the draining reservoir
+            const ratio = std.math.clamp(res_p, 0.05, 3.0);
+            const f = std.math.clamp(fp.f0 * powD(ratio, gamma) * (1.0 + jitter * (2.0 * d0[0] - 1.0)), 16.0, 1500.0);
+            inc = f / sr;
+            var fire_p: f32 = 1.0;
+            var a_t: f32 = 0;
+            if (after) {
+                // near the threshold the valve misses flaps: the sputter
+                // never quite zero: even a valve too tight for its pressure
+                // squeaks out the odd weak flap, so no preset is silent
+                fire_p = 0.12 + 0.88 * smoothStep(0.55, 1.45, p_now / p_th);
+                a_t = @sqrt(@max(p_now - 0.5 * p_th, 0.25 * p_now));
+            } else {
+                const v_pre = if (t < tl.murmur_end) tl.murmur_voice else tl.bar_voice;
+                a_t = @sqrt(p_now) * v_pre;
+            }
+            const fire = d0[1] < fire_p;
+            amp = if (fire) a_t * (1.0 + shimmer * (2.0 * d0[2] - 1.0)) * boost else 0.0;
+            boost = 1.0;
+            oq = oq_base * (1.0 + 0.12 * (2.0 * d1[0] - 1.0));
+            if (odd) {
+                // rasp: every other flap is weaker and floppier
+                amp *= 1.0 - 0.6 * fp.rasp;
+                oq *= 1.0 + 0.25 * fp.rasp;
+            }
+            oq = std.math.clamp(oq, 0.2, 0.95);
+            span = 1.0;
+            if (splat_due) {
+                splat.fire(fp.wet * @max(amp, 0.2) * 0.9, 0.004 + 0.008 * d4[1], 700.0 + 800.0 * d4[2], 0.9);
+                splat_due = false;
+            }
+            if (fire and after) {
+                if (d1[1] < fp.wet * 0.30) {
+                    // stick-slip: the wet valve sticks shut, pressure piles up
+                    // behind it, and it lets go with a bigger flap and a splat
+                    span = 1.3 + 1.0 * d1[2];
+                    boost = 1.2 + 0.35 * d1[2];
+                    splat_due = true;
+                }
+                if (d2[0] < fp.wet * 0.5) spawnBubble(&bubbles, d2[1], d2[2], fp.wet * @max(amp, 0.3), fp.tension);
+                if (d3[0] < q_burst) {
+                    turb_ev.fire(nm * turb * (0.35 + 0.65 * d3[1]) * @max(amp, 0.3), 0.003 + 0.014 * d3[2], 600.0 + 2000.0 * d4[0], 1.2);
+                }
+            }
+        }
+
+        // the flap: a pulse of flow while the valve is open, nothing while shut
+        var g: f32 = 0;
+        if (x < oq) {
+            const y = x / oq;
+            g = if (y < skew) 0.5 - 0.5 * cosD(pi * y / skew) else cosD(0.5 * pi * (y - skew) / (1.0 - skew));
+        }
+        const flow = amp * g;
+        // radiated sound is the flow's slope; normalised so the slap at
+        // closure peaks near `amp` at any pitch or open quotient
+        const slope = (flow - u_prev) * (oq * (1.0 - skew) / inc) * 0.6366;
+        u_prev = flow;
+        u_lp += a_dc * (flow - u_lp);
+        const flow_hp = flow - u_lp;
+
+        var v: f32 = 1.0;
+        if (after and tl.aspiration > 0) v = smoothStep(tl.release, tl.release + tl.aspiration, t);
+        if (t < tl.fric_end) v *= tl.fric_voicing;
+        var wob = 1.0 - wd * (0.5 + 0.5 * sinD(tau * wob_hz * t + wob_phase));
+        if (a.manner == .trill) {
+            const gate = 1.0 - smoothStep(tl.trill_end, tl.trill_end + 0.02, t);
+            wob *= 1.0 - 0.85 * gate * (0.5 + 0.5 * sinD(tau * 27.0 * t));
+        }
+        const src = (0.32 * flow_hp + (0.6 + 0.9 * bright) * slope) * v * wob;
+
+        // every sample draws the same noise, used or not
+        const na = diceTriple(r);
+        const nb = diceTriple(r);
+        // turbulence rides the flow: it only hisses while the valve is open
+        const asp = bp_asp.step((2.0 * na[0] - 1.0) * flow) * asp_gain * 1.6;
+        hiss_lp += a_hiss * ((2.0 * na[1] - 1.0) - hiss_lp);
+        const hiss = hiss_lp * (p_now + 0.04 * fp.pressure * close) * nm * 0.35;
+
+        // the plosive pop: a short pressure pulse at release
+        var pop: f32 = 0;
+        if (tl.spike > 0 and after) {
+            const te = t - tl.release;
+            if (te < pop_len) pop = tl.spike * fp.pressure * 0.9 * sinD(pi * te / pop_len);
+        }
+
+        // the terminal tract: formants + body resonance over a dry share
+        const tin = src + asp + pop;
+        const res = 1.3 * bp1.step(tin) + 0.8 * bp2.step(tin) + body_g * bpb.step(tin);
+        var y = (1.0 - mix) * tin + mix * 1.8 * res;
+        for (&bubbles) |*bub| y += bub.step();
+        y += splat.step(2.0 * na[2] - 1.0) + turb_ev.step(2.0 * nb[0] - 1.0) + hiss;
+
+        // the trousers
+        lp1 += a_lp * (y - lp1);
+        lp2 += a_lp * (lp1 - lp2);
+        y = lp2;
+
+        // frication and the release burst sit above the trousers' cutoff
+        if (tl.fric_gain > 0 and t >= tl.fric_start) {
+            if (t >= tl.fric_end) fric_tail *= fric_mul;
+            const fe = smoothStep(tl.fric_start, tl.fric_start + 0.006, t) * (fric_floor + (1.0 - fric_floor) * fric_tail);
+            y += bp_fric.step(2.0 * nb[1] - 1.0) * fe * tl.fric_gain * nm * fric_amp;
+        }
+        if (tl.pop_noise > 0 and after) {
+            y += bp_pop.step(2.0 * nb[2] - 1.0) * pop_env * nm * pop_amp;
+            pop_env *= pop_mul;
+        }
+        if (after and th_env > 1e-4) {
+            y += th_env * sinD(th_ph) * 0.5 * fp.pressure;
+            th_ph += tau * th_f * dt;
+            if (th_ph >= tau) th_ph -= tau;
+            th_env *= th_mul;
+        }
+
+        // DC block, level, and the fat soft clip
+        const dc = y - dc_x + 0.9957 * dc_y;
+        dc_x = y;
+        dc_y = dc;
+        var o = softClip(dc * fp.level * drive) * 0.94;
+        o *= @min(1.0, fi / fade_in) * @min(1.0, @as(f32, @floatFromInt(n - 1 - i)) / fade_out);
+        if (!std.math.isFinite(o)) o = 0;
+        out[i] = @intFromFloat(@round(o * 32767.0));
+        x += inc;
+    }
+}
+
+/// One v3 syllable in its phrase context.
+fn renderSyllableV3(out: []i16, syl: *const Syll, ctx: SylContext, prng: *std.Random.DefaultPrng, knobs: VoiceKnobs) void {
+    const base: f32 = if (syl.vowel == 0) 88.0 else vowelBaseFreq(syl.vowel).?;
+    var fp = buildFart(syl.onset(), syl.vowel, base * pitchFactorD(knobs), ctx, knobs);
+    // per-syllable jitter, a pure function of (phrase, syllable index)
+    const r = prng.random();
+    fp.f0 *= 1.0 + (r.float(f32) - 0.5) * 0.06;
+    fp.wobble_hz += (r.float(f32) - 0.5) * 3.0;
+    fartInto(out, fp, prng);
 }
 
 // ---------------------------------------------------------------------
@@ -475,6 +1438,7 @@ pub const PhraseItem = struct {
     start: usize, // sample offset in the rendered phrase
     len: usize, // samples this syllable occupies
     stressed: bool = false, // penultimate syllable of its word
+    word_final: bool = false, // last syllable of its word: v3 lets it run out of gas
 };
 
 pub const Plan = struct {
@@ -525,7 +1489,7 @@ pub fn planPhrase(allocator: std.mem.Allocator, phrase: []const u8) !Plan {
             // if it is voiced; a breath-syllable penult stays a whisper.
             const stressed = nsyl >= 2 and emitted + 1 == nsyl - 1 and syl.vowel != 0;
             const len: usize = if (syl.vowel == 0) BREATH_SAMPLES else if (stressed) STRESSED_SYLLABLE_SAMPLES else SYLLABLE_SAMPLES;
-            buf[nitems] = .{ .syl = syl, .start = cursor, .len = len, .stressed = stressed };
+            buf[nitems] = .{ .syl = syl, .start = cursor, .len = len, .stressed = stressed, .word_final = emitted + 1 == nsyl };
             nitems += 1;
             cursor += len;
             emitted += 1;
@@ -562,8 +1526,21 @@ pub fn renderPhraseSamplesWith(allocator: std.mem.Allocator, phrase: []const u8,
     errdefer allocator.free(samples);
     @memset(samples, 0);
     var prng = std.Random.DefaultPrng.init(std.hash.Wyhash.hash(0x5EED_F00D, phrase));
-    for (plan.items) |item| {
-        renderSyllableInto(samples[item.start..][0..item.len], &item.syl, item.stressed, &prng, knobs);
+    if (knobs.isClassic()) {
+        for (plan.items) |item| {
+            renderSyllableClassic(samples[item.start..][0..item.len], &item.syl, item.stressed, &prng, knobs);
+        }
+        return samples;
+    }
+    const last = plan.items.len - 1;
+    for (plan.items, 0..) |item, idx| {
+        const ctx = SylContext{
+            .stressed = item.stressed,
+            .word_final = item.word_final,
+            .phrase_final = idx == last,
+            .position = if (last == 0) 0 else @as(f32, @floatFromInt(idx)) / @as(f32, @floatFromInt(last)),
+        };
+        renderSyllableV3(samples[item.start..][0..item.len], &item.syl, ctx, &prng, knobs);
     }
     return samples;
 }
@@ -589,8 +1566,53 @@ pub fn renderShuziWav(allocator: std.mem.Allocator, seed: u64) ![]u8 {
 
 /// `renderShuziWav` with the voice knobs applied. `{}` is byte-identical to
 /// `renderShuziWav`. Effort (#15) scales the rumble's level and noise mix;
-/// `cents` does not apply — a shuzi has no vowels, its pitch is random.
+/// `cents` does not apply — a shuzi has no words, its pitch is random. In v3
+/// each rumble also draws a random onset and vowel colour, and the physical
+/// knobs apply as they do to a phrase.
 pub fn renderShuziWavWith(allocator: std.mem.Allocator, seed: u64, knobs: VoiceKnobs) ![]u8 {
+    if (knobs.isClassic()) return renderShuziClassic(allocator, seed, knobs);
+    var prng = std.Random.DefaultPrng.init(seed);
+    const r = prng.random();
+    const n_syl: usize = 1 + r.uintLessThan(usize, 3);
+    const onsets = [_][]const u8{ "", "b", "p", "bw", "mb", "ph", "g", "r", "gh", "v", "f", "ny", "pw", "d" };
+    const vowels = "aeiou";
+    const Seg = struct { fp: FartParams, len: usize, gap_after: usize };
+    var segs: [3]Seg = undefined;
+    var total: usize = 0;
+    for (0..n_syl) |i| {
+        const dur_ms: usize = (16 + r.uintLessThan(usize, 19)) * 10; // 160..340 ms
+        const gap_ms: usize = if (i + 1 < n_syl) (3 + r.uintLessThan(usize, 5)) * 10 else 0; // 30..70 ms
+        const onset = onsets[r.uintLessThan(usize, onsets.len)];
+        const vowel = vowels[r.uintLessThan(usize, vowels.len)];
+        const f0 = 60.0 + 50.0 * r.float(f32);
+        const ctx = SylContext{
+            .stressed = n_syl > 1 and i == 0,
+            .word_final = i + 1 == n_syl,
+            .phrase_final = i + 1 == n_syl,
+            .position = if (n_syl == 1) 0 else @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(n_syl - 1)),
+        };
+        var fp = buildFart(onset, vowel, f0, ctx, knobs);
+        fp.wobble_hz = 24.0 + 10.0 * r.float(f32);
+        segs[i] = .{
+            .fp = fp,
+            .len = dur_ms * SAMPLE_RATE / 1000,
+            .gap_after = gap_ms * SAMPLE_RATE / 1000,
+        };
+        total += segs[i].len + segs[i].gap_after;
+    }
+    const samples = try allocator.alloc(i16, total);
+    defer allocator.free(samples);
+    @memset(samples, 0);
+    var off: usize = 0;
+    for (segs[0..n_syl]) |seg| {
+        fartInto(samples[off..][0..seg.len], seg.fp, &prng);
+        off += seg.len + seg.gap_after;
+    }
+    return writeWavBytes(allocator, samples, SAMPLE_RATE);
+}
+
+/// The v2 shuzi, untouched, for `classic=1` and its golden fingerprints.
+fn renderShuziClassic(allocator: std.mem.Allocator, seed: u64, knobs: VoiceKnobs) ![]u8 {
     var prng = std.Random.DefaultPrng.init(seed);
     const r = prng.random();
     const n_syl: usize = 1 + r.uintLessThan(usize, 3);
@@ -1264,4 +2286,295 @@ test "cents reaches the consonant-only breath syllable too" {
         if (a != b) diffs += 1;
     }
     try testing.expect(diffs > n / 2);
+}
+
+// --------------------------------------------------------------------------
+// v3: the physical model
+// --------------------------------------------------------------------------
+
+fn testSyll(spelling: []const u8, onset_len: u8) Syll {
+    var syl = Syll{ .text_len = @intCast(spelling.len), .onset_len = onset_len };
+    @memcpy(syl.text_buf[0..spelling.len], spelling);
+    syl.vowel = if (onset_len < spelling.len) spelling[onset_len] else 0;
+    return syl;
+}
+
+/// One v3 syllable, rendered on its own with a fixed seed.
+fn renderTestSyllable(alloc: std.mem.Allocator, spelling: []const u8, onset_len: u8, ctx: SylContext, knobs: VoiceKnobs) ![]i16 {
+    const out = try alloc.alloc(i16, SYLLABLE_SAMPLES);
+    const syl = testSyll(spelling, onset_len);
+    var prng = std.Random.DefaultPrng.init(7);
+    renderSyllableV3(out, &syl, ctx, &prng, knobs);
+    return out;
+}
+
+/// Autocorrelation pitch over 40..400 Hz of a 2048-sample window centred at
+/// `centre_s` seconds. The window is low-passed first so the cheeks' strong
+/// 2nd harmonic cannot win, and the shortest lag within 85% of the best one
+/// is taken, so the rasp's period doubling does not read as an octave down.
+fn pitchAt(x: []const i16, centre_s: f32) f32 {
+    const len: usize = 2048;
+    const lo: usize = SAMPLE_RATE / 400;
+    const hi: usize = SAMPLE_RATE / 40;
+    const c: usize = @intFromFloat(centre_s * @as(f32, @floatFromInt(SAMPLE_RATE)));
+    var w: [len]f64 = undefined;
+    const k: f64 = onePoleCoef(150.0);
+    var l1: f64 = 0;
+    var l2: f64 = 0;
+    // run the filter in from up to 20 ms earlier so it has settled
+    for ((c - len / 2) -| (SAMPLE_RATE / 50)..c + len / 2) |i| {
+        l1 += k * (@as(f64, @floatFromInt(x[i])) - l1);
+        l2 += k * (l1 - l2);
+        if (i >= c - len / 2) w[i - (c - len / 2)] = l2;
+    }
+    var ac: [hi + 2]f64 = undefined;
+    var best: f64 = -std.math.inf(f64);
+    for (lo - 1..hi + 2) |lag| {
+        var acc: f64 = 0;
+        for (0..len - lag) |i| acc += w[i] * w[i + lag];
+        ac[lag] = acc / @as(f64, @floatFromInt(len - lag));
+        if (lag >= lo and lag <= hi) best = @max(best, ac[lag]);
+    }
+    for (lo..hi + 1) |lag| {
+        if (ac[lag] >= 0.85 * best and ac[lag] >= ac[lag - 1] and ac[lag] >= ac[lag + 1])
+            return @as(f32, @floatFromInt(SAMPLE_RATE)) / @as(f32, @floatFromInt(lag));
+    }
+    return 0;
+}
+
+fn zeroCrossings(x: []const i16) usize {
+    var n: usize = 0;
+    for (x[1..], x[0 .. x.len - 1]) |b, a| {
+        if ((a >= 0) != (b >= 0)) n += 1;
+    }
+    return n;
+}
+
+test "v3: classic=1 is the v2 engine and ignores the physical axes" {
+    const alloc = testing.allocator;
+    const v3 = try renderPhraseSamples(alloc, "kujamba karibu");
+    defer alloc.free(v3);
+    const classic = try renderPhraseSamplesWith(alloc, "kujamba karibu", .{ .classic = 1 });
+    defer alloc.free(classic);
+    try testing.expectEqual(v3.len, classic.len);
+    try testing.expect(!std.mem.eql(i16, v3, classic));
+
+    // the v3 axes do not exist in v2, so they must not move a sample there
+    const classic_knobbed = try renderPhraseSamplesWith(alloc, "kujamba karibu", .{ .classic = 1, .pressure = 3, .tension = 0.3, .tract = 0, .turbulence = 4, .wetness = 4, .droop = 0 });
+    defer alloc.free(classic_knobbed);
+    try testing.expectEqualSlices(i16, classic, classic_knobbed);
+
+    const shuzi = try renderShuziWavWith(alloc, 42, .{ .classic = 1 });
+    defer alloc.free(shuzi);
+    const shuzi_knobbed = try renderShuziWavWith(alloc, 42, .{ .classic = 1, .pressure = 3, .wetness = 0 });
+    defer alloc.free(shuzi_knobbed);
+    try testing.expectEqualSlices(u8, shuzi, shuzi_knobbed);
+
+    const parsed = try parseKnobs("classic=1");
+    try testing.expect(parsed.isClassic());
+    try testing.expect(!(VoiceKnobs{}).isClassic());
+}
+
+test "v3: spelling out every physical default is still the identity" {
+    const alloc = testing.allocator;
+    const plain = try renderPhraseWav(alloc, "shuzi kubwa sana");
+    defer alloc.free(plain);
+    const explicit = try renderPhraseWavWith(alloc, "shuzi kubwa sana", try parseKnobs("pressure=1,tension=1,tract=1,turbulence=1,wetness=1,droop=1,classic=0"));
+    defer alloc.free(explicit);
+    try testing.expectEqualSlices(u8, plain, explicit);
+}
+
+test "v3: each physical axis changes the audio, deterministically" {
+    const alloc = testing.allocator;
+    const plain = try renderPhraseWav(alloc, "kujamba karibu");
+    defer alloc.free(plain);
+    const axes = [_]VoiceKnobs{
+        .{ .pressure = 2.5 }, .{ .pressure = 0.5 },
+        .{ .tension = 2.0 },  .{ .tension = 0.5 },
+        .{ .tract = 0.0 },    .{ .tract = 3.0 },
+        .{ .turbulence = 0 }, .{ .turbulence = 3.0 },
+        .{ .wetness = 0 },    .{ .wetness = 3.0 },
+        .{ .droop = 0 },      .{ .droop = 2.5 },
+    };
+    for (axes) |k| {
+        const out = try renderPhraseWavWith(alloc, "kujamba karibu", k);
+        defer alloc.free(out);
+        try testing.expectEqual(plain.len, out.len);
+        try testing.expect(!std.mem.eql(u8, plain, out));
+        const again = try renderPhraseWavWith(alloc, "kujamba karibu", k);
+        defer alloc.free(again);
+        try testing.expectEqualSlices(u8, out, again);
+    }
+}
+
+test "v3: physical extremes are clamped, never NaN, never silent" {
+    const alloc = testing.allocator;
+    const wild = [_]VoiceKnobs{
+        .{ .pressure = 0, .tension = 0, .tract = 0, .turbulence = 0, .wetness = 0, .droop = 0 },
+        .{ .pressure = 1e9, .tension = 1e9, .tract = 1e9, .turbulence = 1e9, .wetness = 1e9, .droop = 1e9 },
+        .{ .pressure = 1e9, .tension = 0, .wetness = 1e9 },
+        .{ .pressure = 0, .tension = 1e9, .turbulence = 1e9 },
+        .{ .pressure = 4, .tension = 0.25, .intensity = 4, .noise = 1e9, .attack = 0 },
+        .{ .pressure = 0.25, .tension = 4, .intensity = 0.25, .cents = 1200 },
+        .{ .cents = -1200, .tension = 0.25, .droop = 4 },
+    };
+    for (wild) |k| {
+        const out = try renderPhraseSamplesWith(alloc, "kujamba mbwa nyuki ng'ombe mtu", k);
+        defer alloc.free(out);
+        try testing.expect(rmsOf(out) > 1.0);
+        const shuzi = try renderShuziWavWith(alloc, 3, k);
+        defer alloc.free(shuzi);
+        // a whisper through the tightest valve on the weakest push is meant
+        // to be quiet, so this asks for audio, not for loudness
+        var acc: f64 = 0;
+        const n = wavDataByteLen(shuzi) / 2;
+        for (0..n) |j| {
+            const v: f64 = @floatFromInt(std.mem.readInt(i16, shuzi[44 + 2 * j ..][0..2], .little));
+            acc += v * v;
+        }
+        try testing.expect(@sqrt(acc / @as(f64, @floatFromInt(n))) > 1.0);
+    }
+    const lo = (VoiceKnobs{ .pressure = 0, .tension = 0, .tract = -1, .turbulence = -1, .wetness = -1, .droop = -1 }).physical();
+    try testing.expectEqual(VoiceKnobs.min_pressure, lo.pressure);
+    try testing.expectEqual(VoiceKnobs.min_tension, lo.tension);
+    try testing.expectEqual(@as(f32, 0), lo.tract);
+    try testing.expectEqual(@as(f32, 0), lo.droop);
+    const hi = (VoiceKnobs{ .pressure = 99, .tension = 99, .tract = 99, .turbulence = 99, .wetness = 99, .droop = 99 }).physical();
+    try testing.expectEqual(VoiceKnobs.max_pressure, hi.pressure);
+    try testing.expectEqual(VoiceKnobs.max_tension, hi.tension);
+    try testing.expectEqual(VoiceKnobs.max_physical, hi.wetness);
+}
+
+test "v3: pitch rides the draining reservoir, and droop sets the depth" {
+    const alloc = testing.allocator;
+    // a clean valve (no jitter sources but the stock minimum) so the pitch
+    // tracker sees the pitch, not the rasp
+    const clean = VoiceKnobs{ .turbulence = 0, .wetness = 0 };
+    const stock = try renderTestSyllable(alloc, "a", 0, .{}, clean);
+    defer alloc.free(stock);
+    const p0 = pitchAt(stock, 0.04);
+    const p1 = pitchAt(stock, 0.12);
+    const p2 = pitchAt(stock, 0.20);
+    try testing.expect(p0 > 70 and p0 < 130);
+    try testing.expect(p1 < p0 and p2 < p1);
+    try testing.expect(p2 < 0.88 * p0);
+
+    // pitch = f0 * P^(0.3 * droop) with P decaying exponentially, so the
+    // log-pitch drop is proportional to droop: none at 0, double at 2
+    const drop = @log(p2 / p0);
+    var flat_knobs = clean;
+    flat_knobs.droop = 0;
+    const flat = try renderTestSyllable(alloc, "a", 0, .{}, flat_knobs);
+    defer alloc.free(flat);
+    try testing.expect(@abs(@log(pitchAt(flat, 0.20) / pitchAt(flat, 0.04))) < 0.05);
+
+    var sag_knobs = clean;
+    sag_knobs.droop = 2;
+    const sag = try renderTestSyllable(alloc, "a", 0, .{}, sag_knobs);
+    defer alloc.free(sag);
+    const sag_drop = @log(pitchAt(sag, 0.20) / pitchAt(sag, 0.04));
+    try testing.expect(sag_drop / drop > 1.5 and sag_drop / drop < 2.5);
+}
+
+test "v3: tension tunes the valve like a string, pressure pushes the level" {
+    const alloc = testing.allocator;
+    const clean = VoiceKnobs{ .turbulence = 0, .wetness = 0 };
+    var tight_k = clean;
+    tight_k.tension = 2.0;
+    var loose_k = clean;
+    loose_k.tension = 0.5;
+    const tight = try renderTestSyllable(alloc, "a", 0, .{}, tight_k);
+    defer alloc.free(tight);
+    const loose = try renderTestSyllable(alloc, "a", 0, .{}, loose_k);
+    defer alloc.free(loose);
+    // sqrt(2 / 0.5) = 2x the pitch
+    try testing.expect(pitchAt(tight, 0.05) > 1.6 * pitchAt(loose, 0.05));
+
+    const stock = try renderTestSyllable(alloc, "ba", 1, .{}, .{});
+    defer alloc.free(stock);
+    const hard = try renderTestSyllable(alloc, "ba", 1, .{}, .{ .pressure = 2.5 });
+    defer alloc.free(hard);
+    const weak = try renderTestSyllable(alloc, "ba", 1, .{}, .{ .pressure = 0.4 });
+    defer alloc.free(weak);
+    try testing.expect(rmsOf(hard) > 1.2 * rmsOf(stock));
+    try testing.expect(rmsOf(weak) < 0.75 * rmsOf(stock));
+}
+
+test "v3: the phrase's last syllable runs out of gas" {
+    const alloc = testing.allocator;
+    const mid = try renderTestSyllable(alloc, "na", 1, .{}, .{});
+    defer alloc.free(mid);
+    const last = try renderTestSyllable(alloc, "na", 1, .{ .word_final = true, .phrase_final = true, .position = 1 }, .{});
+    defer alloc.free(last);
+    const q = SYLLABLE_SAMPLES / 4;
+    try testing.expect(rmsOf(last[3 * q ..]) < 0.8 * rmsOf(mid[3 * q ..]));
+    // and it fades from a strong start, not from the outset
+    try testing.expect(rmsOf(last[3 * q ..]) < 0.6 * rmsOf(last[0..q]));
+}
+
+test "v3: a plosive bursts, a nasal hums in" {
+    const alloc = testing.allocator;
+    const pa = try renderTestSyllable(alloc, "pa", 1, .{}, .{});
+    defer alloc.free(pa);
+    const ma = try renderTestSyllable(alloc, "ma", 1, .{}, .{});
+    defer alloc.free(ma);
+    const head: usize = SAMPLE_RATE * 30 / 1000;
+    try testing.expect(rmsOf(pa[0..head]) > 1.3 * rmsOf(ma[0..head]));
+}
+
+test "v3: turbulence roughens, tract=0 strips the colour" {
+    const alloc = testing.allocator;
+    const smooth = try renderTestSyllable(alloc, "ka", 1, .{}, .{ .turbulence = 0 });
+    defer alloc.free(smooth);
+    const rough = try renderTestSyllable(alloc, "ka", 1, .{}, .{ .turbulence = 4 });
+    defer alloc.free(rough);
+    try testing.expect(zeroCrossings(rough) > zeroCrossings(smooth));
+
+    // different vowels sound different through the tract, the same without it
+    const a = try renderTestSyllable(alloc, "ba", 1, .{}, .{ .tract = 2 });
+    defer alloc.free(a);
+    const i = try renderTestSyllable(alloc, "bi", 1, .{}, .{ .tract = 2 });
+    defer alloc.free(i);
+    try testing.expect(!std.mem.eql(i16, a, i));
+}
+
+test "v3: the shuzi is deterministic per seed and varies across seeds" {
+    const alloc = testing.allocator;
+    const a = try renderShuziWav(alloc, 42);
+    defer alloc.free(a);
+    const b = try renderShuziWav(alloc, 42);
+    defer alloc.free(b);
+    try testing.expectEqualSlices(u8, a, b);
+    const c = try renderShuziWav(alloc, 43);
+    defer alloc.free(c);
+    try testing.expect(!std.mem.eql(u8, a, c));
+    try expectNotSilence(a);
+}
+
+test "v3: articulation reads Swahili onsets" {
+    try testing.expectEqual(Manner.vowel, articulate("").manner);
+    try testing.expectEqual(Manner.stop, articulate("k").manner);
+    try testing.expectEqual(Manner.affricate, articulate("ch").manner);
+    try testing.expectEqual(Manner.fricative, articulate("sh").manner);
+    try testing.expectEqual(Place.palatal, articulate("sh").place);
+    try testing.expectEqual(Manner.fricative, articulate("th").manner);
+    try testing.expectEqual(Manner.fricative, articulate("gh").manner);
+    try testing.expectEqual(Manner.nasal, articulate("ny").manner);
+    try testing.expectEqual(Manner.nasal, articulate("ng'").manner);
+    try testing.expectEqual(Manner.trill, articulate("r").manner);
+    try testing.expectEqual(Manner.glide, articulate("w").manner);
+
+    const mb = articulate("mb");
+    try testing.expect(mb.prenasal);
+    try testing.expectEqual(Manner.stop, mb.manner);
+    try testing.expectEqual(Place.labial, mb.place);
+    const kw = articulate("kw");
+    try testing.expectEqual(Manner.stop, kw.manner);
+    try testing.expectEqual(@as(u8, 'w'), kw.glide);
+    const mbw = articulate("mbw");
+    try testing.expect(mbw.prenasal);
+    try testing.expectEqual(@as(u8, 'w'), mbw.glide);
+    // voiced stops are wetter and looser than voiceless ones
+    try testing.expect(articulate("b").wet > articulate("p").wet);
+    try testing.expect(articulate("b").tension < articulate("p").tension);
 }

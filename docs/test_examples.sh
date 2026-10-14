@@ -11,6 +11,10 @@ cd "$WORK" # No automatic repository-local kujamba.toml affects the examples.
 "$BIN" render --phrase "kujamba karibu" --out karibu.ogg --seed 42
 "$BIN" check-ogg karibu.ogg
 "$BIN" render --phrase "kujamba karibu" --out shout.wav --voice "intensity=2.5"
+"$BIN" render --phrase "kujamba karibu" --out thunder.wav \
+  --voice "pressure=2.5,tension=0.6,wetness=1.5"
+"$BIN" render --phrase "kujamba karibu" --out squeak.wav \
+  --voice "pressure=0.6,tension=2.5"
 "$BIN" render --phrase "habari yako" --out pattern.ogg \
   --play loop --pattern 3+1 --bars 4 --bar-ms 500 --seed 42
 "$BIN" check-ogg pattern.ogg
@@ -23,6 +27,9 @@ noise = 0.5
 wobble = 1.0
 intensity = 0.8
 cents = -100
+pressure = 1.5
+tension = 0.8
+wetness = 1.2
 [map]
 note60 = "habari yako"
 note61 = "shuzi:3"

@@ -105,9 +105,12 @@ fn printUsage(io: std.Io) void {
         \\    --seed N           determinism seed: ids + payloads derive from it
         \\    --pattern P        bar pattern, e.g. 3+1 = 3 fart bars + 1 rest bar
         \\                       (default 3+1)
-        \\    --voice SPEC       synth voice knobs (#18), e.g. "noise=0,wobble=2".
-        \\                       Multipliers on each onset class's attack, noise mix
-        \\                       and wobble depth; 1 is today's sound exactly.
+        \\    --voice SPEC       synth voice knobs, e.g. "pressure=2.5,tension=0.6".
+        \\                       Multipliers, 1 = the stock sound: attack, noise,
+        \\                       wobble, intensity (effort), cents (pitch offset),
+        \\                       and the physical model's pressure, tension,
+        \\                       tract, turbulence, wetness, droop. classic=1
+        \\                       selects the previous (v2) engine, bit for bit.
         \\    --play MODE        how the phrase maps onto bars:
         \\                       repeat  restart at every fart bar (default)
         \\                       loop    play continuously, wrapping at the end
@@ -164,8 +167,8 @@ fn printUsage(io: std.Io) void {
         \\CONFIG (#22): a TOML-style file of defaults for join, render, play
         \\and trigger —
         \\  host (same syntax as --host, so "name:port" / "[::1]:port"), user,
-        \\  pass, phrase, pattern, a [voice] table with attack/noise/wobble
-        \\  multipliers, and a [map] table binding `noteN = phrase|shuzi:seed`
+        \\  pass, phrase, pattern, a [voice] table with the --voice knobs,
+        \\  and a [map] table binding `noteN = phrase|shuzi:seed`
         \\  for `trigger` (#21). Values apply defaults <- config <- flags, so a flag
         \\  always wins over the file; a --voice flag replaces the whole
         \\  [voice] table. Example: examples/kujamba.toml in the repo.
@@ -405,7 +408,7 @@ fn cmdJoin(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: [
             i += 1;
         } else if (std.mem.eql(u8, a, "--voice")) {
             s.knobs = synth.parseKnobs(next orelse fail(io, "--voice needs a value", .{})) catch |e|
-                fail(io, "bad --voice '{s}': {s} (want attack=N,noise=N,wobble=N)", .{ next.?, @errorName(e) });
+                fail(io, "bad --voice '{s}': {s} (want key=N,... with key in attack, noise, wobble, intensity, cents, pressure, tension, tract, turbulence, wetness, droop, classic)", .{ next.?, @errorName(e) });
             i += 1;
         } else if (std.mem.eql(u8, a, "--user")) {
             s.user = next orelse fail(io, "--user needs a value", .{});
@@ -702,7 +705,7 @@ fn cmdRender(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv:
             i += 1;
         } else if (std.mem.eql(u8, a, "--voice")) {
             knobs = synth.parseKnobs(next orelse fail(io, "--voice needs a value", .{})) catch |e|
-                fail(io, "bad --voice '{s}': {s} (want attack=N,noise=N,wobble=N)", .{ next.?, @errorName(e) });
+                fail(io, "bad --voice '{s}': {s} (want key=N,... with key in attack, noise, wobble, intensity, cents, pressure, tension, tract, turbulence, wetness, droop, classic)", .{ next.?, @errorName(e) });
             i += 1;
         } else if (std.mem.eql(u8, a, "--pattern")) {
             const v = next orelse fail(io, "--pattern needs a value", .{});
@@ -813,7 +816,7 @@ fn cmdPlay(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: [
             i += 1;
         } else if (std.mem.eql(u8, a, "--voice")) {
             knobs = synth.parseKnobs(next orelse fail(io, "--voice needs a value", .{})) catch |e|
-                fail(io, "bad --voice '{s}': {s} (want attack=N,noise=N,wobble=N)", .{ next.?, @errorName(e) });
+                fail(io, "bad --voice '{s}': {s} (want key=N,... with key in attack, noise, wobble, intensity, cents, pressure, tension, tract, turbulence, wetness, droop, classic)", .{ next.?, @errorName(e) });
             i += 1;
         } else if (std.mem.eql(u8, a, "--pattern")) {
             const v = next orelse fail(io, "--pattern needs a value", .{});

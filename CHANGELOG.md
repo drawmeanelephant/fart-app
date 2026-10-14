@@ -9,6 +9,23 @@ tagged `v<version>` and published on GitHub with CI-built binaries via
 
 ## [Unreleased]
 
+### Changed
+
+- The synth's default voice is now a physical model (v3): an intestinal
+  pressure reservoir that drains exponentially (so pitch falls
+  exponentially), a pulse-train sphincter valve that sputters below its
+  threshold, stick-slip splats and bubbles, noise-burst turbulence, plosive
+  pressure bursts, vowel formants, a buttock body resonance, and the
+  trousers' low-pass. Consonant manner and place decide how the valve
+  opens. v3 renders identical bytes in Debug, ReleaseSafe and ReleaseFast.
+
+### Added
+
+- `--voice` and `[voice]` knobs `pressure`, `tension`, `tract`,
+  `turbulence`, `wetness` and `droop`, and `classic=1`, which selects the
+  previous (v2) engine bit for bit. The golden guard keeps the v2 baseline
+  under `classic=1` and pins the new default separately.
+
 ## [1.0.0] - 2026-10-11
 
 The first tagged release of Flatlophone v2: a deterministic fart synthesizer

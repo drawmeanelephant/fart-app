@@ -46,6 +46,22 @@
 //! `wav_sha256` is still recorded, as the exact bytes at baseline time. It is
 //! documentation and a diagnostic, not an assertion.
 //!
+//! ## Two engines, two sets of fingerprints
+//!
+//! The v3 physical model is the default sound, and its fingerprints carry the
+//! plain names. The v2 engine is still reachable with `--voice classic=1`, and
+//! it is meant to be the *same* v2, byte for byte — so its original baseline
+//! is kept verbatim, rendered with `classic = 1`, under a `classic ` prefix.
+//! If a classic entry ever moves, v2 was broken by accident; never re-baseline
+//! those, fix the regression instead.
+//!
+//! v3 goes one better than the table above: it does its transcendental maths
+//! with polynomials built from exact IEEE operations (see "Bit-stable math" in
+//! synth.zig), and its `wav_sha256` was measured identical in Debug,
+//! ReleaseSafe and ReleaseFast. It is still recorded rather than asserted: the
+//! envelope already pins the sound, and exact bytes have not been measured on
+//! every platform CI runs on.
+//!
 //! Re-baselining: run `zig build test` and paste the block it prints over
 //! `expected`. No script, no flag to remember.
 
@@ -70,6 +86,8 @@ pub const Fingerprint = struct {
     kind: Kind,
     /// the phrase text, or the seed in decimal for `.shuzi`
     input: []const u8,
+    /// render with `--voice classic=1` (the v2 engine) instead of the default
+    classic: bool = false,
     /// syllables planned (0 for shuzi, which has no plan)
     items: u32,
     /// total samples in the rendered phrase
@@ -88,19 +106,35 @@ pub const Fingerprint = struct {
 
 /// The baseline. Any change here is a deliberate, reviewable act.
 pub const expected = [_]Fingerprint{
+    // ---- v3, the default physical model ----
     // the phrase the demo, the docs and the readme all use
-    .{ .name = "kujamba karibu", .kind = .phrase, .input = "kujamba karibu", .items = 6, .samples = 79380, .peak = 22007, .zero_crossings = 720, .rms_milli = 4173837, .envelope_sha256 = "b689f1368324e2b7abe414e01bdb121730f0bb6e7ffd0bd9a9defcb752f234d1", .wav_sha256 = "21c6faa26eb63b958968a6dfe2fcf33073182be7f34c0cef416894c84b045f3d" },
+    .{ .name = "kujamba karibu", .kind = .phrase, .input = "kujamba karibu", .items = 6, .samples = 79380, .peak = 28183, .zero_crossings = 992, .rms_milli = 6529839, .envelope_sha256 = "e9f54458d0ddf591eb888324e924154fdfe251fa6e0059333528a340a24e6895", .wav_sha256 = "39c6440619aa2a75ef8fdc38ce6480c48da30107cd38c07994087c30a28544e4" },
     // longer, so the fingerprint covers stress placement across several words
-    .{ .name = "asante sana kijiji", .kind = .phrase, .input = "asante sana kijiji", .items = 8, .samples = 109368, .peak = 25998, .zero_crossings = 1134, .rms_milli = 4164752, .envelope_sha256 = "a6b896d1bc43543a6827465d36223fa91cf49cefe4b44460fe7a0272efa55a13", .wav_sha256 = "5973bbb55e662d2d47fdef82c2d4ee4b2ba059aa3d760e7801060e1af1d80c07" },
-    // one syllable: the shortest render that still has an onset
-    .{ .name = "single syllable", .kind = .phrase, .input = "a", .items = 1, .samples = 10584, .peak = 15986, .zero_crossings = 114, .rms_milli = 3958198, .envelope_sha256 = "3c5018bab5a904216360d5629d715d4a23098c8197d13f4331cb7f0a5580b8fe", .wav_sha256 = "a62ad430e53741188447d842344e26e4fdc72bf86793fb5b84143ab0421f80f9" },
+    .{ .name = "asante sana kijiji", .kind = .phrase, .input = "asante sana kijiji", .items = 8, .samples = 109368, .peak = 28909, .zero_crossings = 2906, .rms_milli = 5985466, .envelope_sha256 = "a6e540d13112362d7a8147d0cc29327b88c151dc3c4cec14e9290867f3abcc64", .wav_sha256 = "598019ddadffd95c94bcd7eec3b374ea227fcd9f76e5f7eed2742b0fe33ead77" },
+    // one syllable: phrase-final, so it is also the sputter-out path
+    .{ .name = "single syllable", .kind = .phrase, .input = "a", .items = 1, .samples = 10584, .peak = 13813, .zero_crossings = 170, .rms_milli = 3326607, .envelope_sha256 = "9e211dc90d3aeba562db8564fea597ba77bd06002a424a54eaec040774a1fa85", .wav_sha256 = "a7333caf38eec5590006af89220a0cbc26a8f1fd8a510f2e18166e22c9578f26" },
     // digits and punctuation are not word characters, so the word splitter
     // has to skip them and still place the syllables correctly
-    .{ .name = "punctuation and digits", .kind = .phrase, .input = "kujamba 123 karibu!", .items = 6, .samples = 79380, .peak = 21565, .zero_crossings = 766, .rms_milli = 4192678, .envelope_sha256 = "46981dc90e5a44a07254e7e492b90d2c99a0675eac67a0c5efcb7177c7a7c245", .wav_sha256 = "ca7703195aa4a5e34da7c7eae0eb1bdfa0b096e206d1f489ec96074077172093" },
+    .{ .name = "punctuation and digits", .kind = .phrase, .input = "kujamba 123 karibu!", .items = 6, .samples = 79380, .peak = 27599, .zero_crossings = 950, .rms_milli = 6615932, .envelope_sha256 = "b8278fc07171febcf5adc00caf330a25b04dfcdef5aca3f680691b99f6efcea0", .wav_sha256 = "5696fb9ad740b2e90b039bc9161b2e35a95c184db0d13538772ab0ec27a0c982" },
+    // wordless farts: random onsets and vowels through the same physical model
+    .{ .name = "shuzi seed 0", .kind = .shuzi, .input = "0", .items = 0, .samples = 10143, .peak = 24357, .zero_crossings = 230, .rms_milli = 4532825, .envelope_sha256 = "5f26c94930dcaa8e987c1bf5328a9d90f64b2564cc34d04e2ed7130fc9ae601f", .wav_sha256 = "dcdef3cfc045a643b5548182edad081a317f7bc3537a82549355ed66dedcb305" },
+    .{ .name = "shuzi seed 42", .kind = .shuzi, .input = "42", .items = 0, .samples = 33957, .peak = 22294, .zero_crossings = 596, .rms_milli = 5877822, .envelope_sha256 = "5a27a5a122ac1abca07721aad11dd4bd05ddce416962922a4f86d6c7da37637b", .wav_sha256 = "a5913f706b6393302458dfc86d469c2c123fe44efb998f25f36fe6fa5dfef184" },
+    .{ .name = "shuzi seed 1234567", .kind = .shuzi, .input = "1234567", .items = 0, .samples = 10584, .peak = 20634, .zero_crossings = 160, .rms_milli = 4274980, .envelope_sha256 = "2eade4fc5bd79de9dd2703d601dbdd3c5c546d85d94ad7524ce5b602dc107805", .wav_sha256 = "cad39873caf47fdd5b26d4fbe3ef09a43e8cdcc376fcc6b3835a267eafbed797" },
+
+    // ---- v2 behind `classic=1`: the original baseline, verbatim ----
+    // the phrase the demo, the docs and the readme all use
+    .{ .name = "classic kujamba karibu", .kind = .phrase, .input = "kujamba karibu", .classic = true, .items = 6, .samples = 79380, .peak = 22007, .zero_crossings = 720, .rms_milli = 4173837, .envelope_sha256 = "b689f1368324e2b7abe414e01bdb121730f0bb6e7ffd0bd9a9defcb752f234d1", .wav_sha256 = "21c6faa26eb63b958968a6dfe2fcf33073182be7f34c0cef416894c84b045f3d" },
+    // longer, so the fingerprint covers stress placement across several words
+    .{ .name = "classic asante sana kijiji", .kind = .phrase, .input = "asante sana kijiji", .classic = true, .items = 8, .samples = 109368, .peak = 25998, .zero_crossings = 1134, .rms_milli = 4164752, .envelope_sha256 = "a6b896d1bc43543a6827465d36223fa91cf49cefe4b44460fe7a0272efa55a13", .wav_sha256 = "5973bbb55e662d2d47fdef82c2d4ee4b2ba059aa3d760e7801060e1af1d80c07" },
+    // one syllable: the shortest render that still has an onset
+    .{ .name = "classic single syllable", .kind = .phrase, .input = "a", .classic = true, .items = 1, .samples = 10584, .peak = 15986, .zero_crossings = 114, .rms_milli = 3958198, .envelope_sha256 = "3c5018bab5a904216360d5629d715d4a23098c8197d13f4331cb7f0a5580b8fe", .wav_sha256 = "a62ad430e53741188447d842344e26e4fdc72bf86793fb5b84143ab0421f80f9" },
+    // digits and punctuation are not word characters, so the word splitter
+    // has to skip them and still place the syllables correctly
+    .{ .name = "classic punctuation and digits", .kind = .phrase, .input = "kujamba 123 karibu!", .classic = true, .items = 6, .samples = 79380, .peak = 21565, .zero_crossings = 766, .rms_milli = 4192678, .envelope_sha256 = "46981dc90e5a44a07254e7e492b90d2c99a0675eac67a0c5efcb7177c7a7c245", .wav_sha256 = "ca7703195aa4a5e34da7c7eae0eb1bdfa0b096e206d1f489ec96074077172093" },
     // wordless farts: no plan, and the noise/wobble path M6 will touch
-    .{ .name = "shuzi seed 0", .kind = .shuzi, .input = "0", .items = 0, .samples = 10143, .peak = 18461, .zero_crossings = 180, .rms_milli = 4662515, .envelope_sha256 = "ff3acaee614295f74be4eec9ae8f1ced7e0d9542a5bfb90cf79c18e5e9068f4c", .wav_sha256 = "7e763663eadf675a0c5a26b05f460af57cb89566d68df11fd10b57796556fa8a" },
-    .{ .name = "shuzi seed 42", .kind = .shuzi, .input = "42", .items = 0, .samples = 34839, .peak = 21395, .zero_crossings = 486, .rms_milli = 4081417, .envelope_sha256 = "effa4312bb20886b185c43f4cada609baebbba77b539af351f7d839e71f38a17", .wav_sha256 = "4c0500f416ca522f8bda17db9a1bb3a11f107be23fda353d6e66268d3e44c46a" },
-    .{ .name = "shuzi seed 1234567", .kind = .shuzi, .input = "1234567", .items = 0, .samples = 10584, .peak = 19089, .zero_crossings = 104, .rms_milli = 4564000, .envelope_sha256 = "369cd4bd42022e93224eb9fb93ba0c0eac937e9f78dfd29a8e6e269498d343eb", .wav_sha256 = "fccfb948356d4697f6bf941a6b5f9dc59fcf712d3438f92919804de9724c20da" },
+    .{ .name = "classic shuzi seed 0", .kind = .shuzi, .input = "0", .classic = true, .items = 0, .samples = 10143, .peak = 18461, .zero_crossings = 180, .rms_milli = 4662515, .envelope_sha256 = "ff3acaee614295f74be4eec9ae8f1ced7e0d9542a5bfb90cf79c18e5e9068f4c", .wav_sha256 = "7e763663eadf675a0c5a26b05f460af57cb89566d68df11fd10b57796556fa8a" },
+    .{ .name = "classic shuzi seed 42", .kind = .shuzi, .input = "42", .classic = true, .items = 0, .samples = 34839, .peak = 21395, .zero_crossings = 486, .rms_milli = 4081417, .envelope_sha256 = "effa4312bb20886b185c43f4cada609baebbba77b539af351f7d839e71f38a17", .wav_sha256 = "4c0500f416ca522f8bda17db9a1bb3a11f107be23fda353d6e66268d3e44c46a" },
+    .{ .name = "classic shuzi seed 1234567", .kind = .shuzi, .input = "1234567", .classic = true, .items = 0, .samples = 10584, .peak = 19089, .zero_crossings = 104, .rms_milli = 4564000, .envelope_sha256 = "369cd4bd42022e93224eb9fb93ba0c0eac937e9f78dfd29a8e6e269498d343eb", .wav_sha256 = "fccfb948356d4697f6bf941a6b5f9dc59fcf712d3438f92919804de9724c20da" },
 };
 
 /// A fingerprint as measured right now, ready to paste into `expected`.
@@ -108,6 +142,7 @@ pub const Measured = struct {
     name: []const u8,
     kind: Kind,
     input: []const u8,
+    classic: bool,
     items: u32,
     samples: u32,
     peak: u32,
@@ -194,9 +229,18 @@ fn envelopeHash(alloc: std.mem.Allocator, data: []const u8) !struct { hex: [64]u
 
 /// Render `fp`'s input and measure it. `wav` is owned by the caller.
 pub fn measure(alloc: std.mem.Allocator, fp: Fingerprint) !struct { wav: []u8, out: Measured } {
+    // the default entries go through the knob-less entry points on purpose:
+    // they pin what a plain `kujamba render` sounds like
+    const classic: synth.VoiceKnobs = .{ .classic = 1 };
     const wav = switch (fp.kind) {
-        .phrase => try synth.renderPhraseWav(alloc, fp.input),
-        .shuzi => try synth.renderShuziWav(alloc, try std.fmt.parseInt(u64, fp.input, 10)),
+        .phrase => if (fp.classic)
+            try synth.renderPhraseWavWith(alloc, fp.input, classic)
+        else
+            try synth.renderPhraseWav(alloc, fp.input),
+        .shuzi => if (fp.classic)
+            try synth.renderShuziWavWith(alloc, try std.fmt.parseInt(u64, fp.input, 10), classic)
+        else
+            try synth.renderShuziWav(alloc, try std.fmt.parseInt(u64, fp.input, 10)),
     };
     errdefer alloc.free(wav);
 
@@ -216,6 +260,7 @@ pub fn measure(alloc: std.mem.Allocator, fp: Fingerprint) !struct { wav: []u8, o
         .name = fp.name,
         .kind = fp.kind,
         .input = fp.input,
+        .classic = fp.classic,
         .items = items,
         .samples = @intCast(sampleCount(pcm)),
         .peak = stats.peak,
@@ -232,9 +277,10 @@ pub fn formatBaseline(alloc: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
     for (expected) |fp| {
         const m = try measure(alloc, fp);
         defer alloc.free(m.wav);
-        try out.print(alloc, "    .{{ .name = \"{s}\", .kind = .{s}, .input = \"{s}\", .items = {d}, .samples = {d}, .peak = {d}, .zero_crossings = {d}, .rms_milli = {d}, .envelope_sha256 = \"{s}\", .wav_sha256 = \"{s}\" }},\n", .{
-            m.out.name, @tagName(m.out.kind), m.out.input,     m.out.items,           m.out.samples,
-            m.out.peak, m.out.zero_crossings, m.out.rms_milli, m.out.envelope_sha256, m.out.wav_sha256,
+        try out.print(alloc, "    .{{ .name = \"{s}\", .kind = .{s}, .input = \"{s}\"{s}, .items = {d}, .samples = {d}, .peak = {d}, .zero_crossings = {d}, .rms_milli = {d}, .envelope_sha256 = \"{s}\", .wav_sha256 = \"{s}\" }},\n", .{
+            m.out.name,       @tagName(m.out.kind), m.out.input,          if (m.out.classic) ", .classic = true" else "", m.out.items,
+            m.out.samples,    m.out.peak,           m.out.zero_crossings, m.out.rms_milli,                                m.out.envelope_sha256,
+            m.out.wav_sha256,
         });
     }
     try out.appendSlice(alloc, "};\n");

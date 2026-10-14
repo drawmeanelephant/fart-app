@@ -16,12 +16,19 @@ pass = "secret"
 phrase = "kujamba karibu"
 pattern = "3+1"                       # 3 fart bars, then 1 rest bar
 
-# The #18 voice knobs as multipliers on the onset-class table (see the
-# README's tuning section): 1 on every axis is today's sound exactly. A
-# --voice flag on the command line replaces this whole table.
+# The voice knobs, as multipliers on what each phrase already asks for: 1 on
+# every axis is the stock sound exactly. A --voice flag on the command line
+# replaces this whole table. See docs/site/content/guides/voice.md.
 [voice]
 attack = 1.0                          # e.g. 0.5 = snappier onsets
-noise = 1.0                           # e.g. 0    = clean, no attack splat
+noise = 1.0                           # e.g. 0    = no hiss, bursts or breath
 wobble = 1.0                          # e.g. 2    = twice the flutter depth
 intensity = 1.0                       # #15: 0.25..4 — whisper to shout
 cents = 0                             # #16: ±1200 — shift every vowel pitch
+pressure = 1.0                        # 0.25..4 — gas: 2.5 with tension 0.6 thunders
+tension = 1.0                         # 0.25..4 — sphincter: up squeaks, down flaps
+tract = 1.0                           # 0..4 — 0 = dry raw buzz, 3 = honking boom
+turbulence = 1.0                      # 0..4 — rasp and spitting noise bursts
+wetness = 1.0                         # 0..4 — splats, bubbles, sloppiness
+droop = 1.0                           # 0..4 — how far the pitch sags as gas runs out
+classic = 0                           # 1 = the previous (v2) engine, bit for bit

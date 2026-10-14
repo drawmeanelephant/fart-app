@@ -37,6 +37,9 @@ noise = 0.5
 wobble = 1.0
 intensity = 0.8
 cents = -100
+pressure = 1.5
+tension = 0.8
+wetness = 1.2
 
 [map]
 note60 = "habari yako"
@@ -49,7 +52,7 @@ note61 = "shuzi:3"
 | `pattern` | Bar pattern such as `"3+1"` |
 | `host` | Room address, including optional port |
 | `user`, `pass` | Join-only credentials |
-| `[voice]` | `attack`, `noise`, `wobble`, `intensity`, `cents` |
+| `[voice]` | `attack`, `noise`, `wobble`, `intensity`, `cents`, `pressure`, `tension`, `tract`, `turbulence`, `wetness`, `droop`, `classic` |
 | `[map]` | `noteN` bindings to phrase text or `"shuzi:SEED"` |
 
 Connection keys are ignored by offline rendering. The note map is used by
