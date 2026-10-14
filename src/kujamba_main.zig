@@ -728,6 +728,8 @@ fn cmdRender(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv:
     }
     const p = out_path orelse fail(io, "render needs --out FILE", .{});
 
+    if (seed != 0) knobs.seed = seed;
+
     const opts = kujamba_out.OfflineOpts{
         .mode = play_mode,
         .pattern = pattern,
@@ -784,6 +786,7 @@ fn cmdPlay(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: [
     var play_mode = kujamba_out.Mode.repeat;
     var bars: u32 = 1;
     var bar_ms: u64 = 0;
+    var seed: u64 = 0;
     var knobs: synth.VoiceKnobs = .{};
     var device: ?[]const u8 = null;
 
@@ -828,9 +831,7 @@ fn cmdPlay(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: [
             bar_ms = std.fmt.parseInt(u64, next orelse fail(io, "--bar-ms needs a value", .{}), 10) catch fail(io, "bad --bar-ms", .{});
             i += 1;
         } else if (std.mem.eql(u8, a, "--seed")) {
-            // accepted for render parity; the local render is deterministic
-            // regardless, and the OGG serial has no meaning here
-            _ = std.fmt.parseInt(u64, next orelse fail(io, "--seed needs a value", .{}), 10) catch fail(io, "bad --seed", .{});
+            seed = std.fmt.parseInt(u64, next orelse fail(io, "--seed needs a value", .{}), 10) catch fail(io, "bad --seed", .{});
             i += 1;
         } else if (std.mem.eql(u8, a, "--device")) {
             device = next orelse fail(io, "--device needs a name or index", .{});
@@ -848,6 +849,8 @@ fn cmdPlay(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: [
             fail(io, "play: both '{s}' and --phrase given — use one", .{p});
         phrase = p;
     }
+
+    if (seed != 0) knobs.seed = seed;
 
     const opts = kujamba_out.OfflineOpts{
         .mode = play_mode,

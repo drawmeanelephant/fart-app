@@ -117,6 +117,20 @@ pub const VoiceKnobs = struct {
     /// up, -1200 down), so a preset can pick a different "instrument". An
     /// offset, not a multiplier — negative is meaningful, not an error.
     cents: f32 = 0.0,
+    /// intestinal pressure multiplier (driving expulsion force, attack pop, and pitch surge)
+    pressure: f32 = 1.0,
+    /// sphincter tension multiplier (stiffness: high harmonics vs loose subharmonic bass flap)
+    tension: f32 = 1.0,
+    /// terminal tract resonance multiplier (depth and Q of vowel formant cavity)
+    resonance: f32 = 1.0,
+    /// noise-burst turbulence multiplier (cycle-synchronized flow rasp)
+    turbulence: f32 = 1.0,
+    /// exponential pitch decay rate multiplier
+    decay: f32 = 1.0,
+    /// viscous moisture & micro-bubble popping texture multiplier (0 = bone dry, 1 = natural, 2+ = juicy)
+    wetness: f32 = 1.0,
+    /// seed salt for phrase determinism (0 = default Wyhash seed)
+    seed: u64 = 0,
 
     /// Bounds on the *resulting* spec, not on the multipliers. Each one exists
     /// because the value feeds arithmetic that breaks outside its range.
@@ -139,6 +153,18 @@ pub const VoiceKnobs = struct {
     /// #16: one octave either way. Beyond that the buzzy oscillator leaves the
     /// instrument's register (at -1200 the lowest vowel is a 37 Hz rumble).
     pub const max_abs_cents: f32 = 1200.0;
+    pub const min_pressure: f32 = 0.1;
+    pub const max_pressure: f32 = 5.0;
+    pub const min_tension: f32 = 0.1;
+    pub const max_tension: f32 = 4.0;
+    pub const min_resonance: f32 = 0.0;
+    pub const max_resonance: f32 = 3.0;
+    pub const min_turbulence: f32 = 0.0;
+    pub const max_turbulence: f32 = 4.0;
+    pub const min_decay: f32 = 0.1;
+    pub const max_decay: f32 = 4.0;
+    pub const min_wetness: f32 = 0.0;
+    pub const max_wetness: f32 = 4.0;
 
     /// `2^(cents/1200)` — the factor every base frequency is multiplied by,
     /// with `cents` clamped to one octave either way. The `cents == 0` branch
@@ -202,6 +228,18 @@ pub fn parseKnobs(s: []const u8) KnobsError!VoiceKnobs {
             knobs.intensity = v;
         } else if (std.mem.eql(u8, key, "cents")) {
             knobs.cents = v;
+        } else if (std.mem.eql(u8, key, "pressure")) {
+            knobs.pressure = v;
+        } else if (std.mem.eql(u8, key, "tension")) {
+            knobs.tension = v;
+        } else if (std.mem.eql(u8, key, "resonance")) {
+            knobs.resonance = v;
+        } else if (std.mem.eql(u8, key, "turbulence")) {
+            knobs.turbulence = v;
+        } else if (std.mem.eql(u8, key, "decay")) {
+            knobs.decay = v;
+        } else if (std.mem.eql(u8, key, "wetness")) {
+            knobs.wetness = v;
         } else return error.UnknownKnob;
     }
     return knobs;
@@ -219,6 +257,79 @@ pub fn classify(onset: []const u8) VoiceClass {
     };
 }
 
+/// Detects whether an onset starts with or contains an explosive plosive consonant
+/// (e.g. p, b, t, d, k, g, ch, j, or prenasalized mb, nd, ng, nj).
+pub fn isPlosive(onset: []const u8) bool {
+    if (onset.len == 0) return false;
+    const c0 = onset[0];
+    if (c0 == 'p' or c0 == 't' or c0 == 'k' or c0 == 'c' or c0 == 'b' or c0 == 'd' or c0 == 'g' or c0 == 'j')
+        return true;
+    if ((c0 == 'm' or c0 == 'n') and onset.len > 1) {
+        const c1 = onset[1];
+        if (c1 == 'p' or c1 == 't' or c1 == 'k' or c1 == 'c' or c1 == 'b' or c1 == 'd' or c1 == 'g' or c1 == 'j')
+            return true;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------
+// Physical acoustic modeling: Resonant Formant Filter
+// ---------------------------------------------------------------------
+
+pub const Formants = struct {
+    f1: f32,
+    f2: f32,
+    q1: f32,
+    q2: f32,
+};
+
+/// Terminal tract acoustic resonant frequencies and bandwidths (F1, F2)
+/// tuned for phonetic Swahili vowel tract geometries.
+pub fn vowelFormants(v: u8) Formants {
+    return switch (v) {
+        'a' => .{ .f1 = 740.0, .f2 = 1240.0, .q1 = 4.2, .q2 = 5.2 },
+        'e' => .{ .f1 = 520.0, .f2 = 1840.0, .q1 = 4.2, .q2 = 5.8 },
+        'i' => .{ .f1 = 320.0, .f2 = 2250.0, .q1 = 4.8, .q2 = 6.5 },
+        'o' => .{ .f1 = 460.0, .f2 = 860.0, .q1 = 4.2, .q2 = 4.8 },
+        'u' => .{ .f1 = 320.0, .f2 = 700.0, .q1 = 4.8, .q2 = 4.8 },
+        else => .{ .f1 = 600.0, .f2 = 1400.0, .q1 = 3.0, .q2 = 3.5 },
+    };
+}
+
+/// Constant 0 dB peak gain bandpass biquad resonator.
+/// Strictly stable with poles inside unit circle and zero DC drift.
+pub const Resonator = struct {
+    c0: f32,
+    d1: f32,
+    d2: f32,
+    x1: f32 = 0,
+    x2: f32 = 0,
+    y1: f32 = 0,
+    y2: f32 = 0,
+
+    pub fn init(fc: f32, q: f32, sample_rate: f32) Resonator {
+        const safe_fc = std.math.clamp(fc, 50.0, sample_rate * 0.48);
+        const safe_q = std.math.clamp(q, 0.2, 20.0);
+        const w0 = std.math.tau * safe_fc / sample_rate;
+        const alpha = @sin(w0) / (2.0 * safe_q);
+        const a0 = 1.0 + alpha;
+        return .{
+            .c0 = alpha / a0,
+            .d1 = (-2.0 * @cos(w0)) / a0,
+            .d2 = (1.0 - alpha) / a0,
+        };
+    }
+
+    pub fn step(self: *Resonator, x: f32) f32 {
+        const y = self.c0 * (x - self.x2) - self.d1 * self.y1 - self.d2 * self.y2;
+        self.x2 = self.x1;
+        self.x1 = x;
+        self.y2 = self.y1;
+        self.y1 = y;
+        return y;
+    }
+};
+
 // ---------------------------------------------------------------------
 // Sample rendering
 // ---------------------------------------------------------------------
@@ -231,8 +342,15 @@ const VoiceParams = struct {
     wobble_depth: f32,
     level: f32,
     glide: f32,
+    pressure: f32 = 1.0,
+    tension: f32 = 1.0,
+    resonance: f32 = 1.0,
+    turbulence: f32 = 1.0,
+    decay_rate: f32 = 1.0,
+    wetness: f32 = 1.0,
+    is_plosive: bool = false,
+    vowel: u8 = 'a',
 };
-
 /// #15: one syllable's spec under vocal effort `eff`. Level and noise mix
 /// scale together — a shout is louder *and* splattier, a whisper quiet and
 /// clean — with the stress emphasis applied on top by the caller for the one
@@ -255,40 +373,145 @@ fn stressBoost(eff: f32) f32 {
 fn synthInto(out: []i16, p: VoiceParams, prng: *std.Random.DefaultPrng) void {
     const dt: f32 = 1.0 / @as(f32, SAMPLE_RATE);
     const tau: f32 = std.math.tau;
-    var phase: f32 = 0;
-    var lp_body: f32 = 0;
-    var lp_burst: f32 = 0;
-    const alpha_body: f32 = 1.0 - @exp(-tau * 700.0 * dt);
-    const alpha_burst: f32 = 1.0 - @exp(-tau * 1900.0 * dt);
-    const wobble_phase: f32 = prng.random().float(f32) * tau;
-    const wobble_hz: f32 = p.wobble_hz * (0.9 + 0.2 * prng.random().float(f32));
     const n = out.len;
+    if (n == 0) return;
+
+    const pressure = std.math.clamp(p.pressure, VoiceKnobs.min_pressure, VoiceKnobs.max_pressure);
+    const tension = std.math.clamp(p.tension, VoiceKnobs.min_tension, VoiceKnobs.max_tension);
+    const resonance = std.math.clamp(p.resonance, VoiceKnobs.min_resonance, VoiceKnobs.max_resonance);
+    const turbulence = std.math.clamp(p.turbulence, VoiceKnobs.min_turbulence, VoiceKnobs.max_turbulence);
+    const decay_k = std.math.clamp(p.decay_rate, VoiceKnobs.min_decay, VoiceKnobs.max_decay);
+    const wetness = std.math.clamp(p.wetness, VoiceKnobs.min_wetness, VoiceKnobs.max_wetness);
+
+    // Formant resonators for terminal tract acoustic resonance
+    const formants = vowelFormants(p.vowel);
+    const q_scale = std.math.clamp(resonance, 0.3, 2.5);
+    var r1 = Resonator.init(formants.f1, formants.q1 * q_scale, @as(f32, SAMPLE_RATE));
+    var r2 = Resonator.init(formants.f2, formants.q2 * q_scale, @as(f32, SAMPLE_RATE));
+
+    var phase: f32 = 0;
+    var sub_phase: f32 = prng.random().float(f32) * tau;
+    var lp_body: f32 = 0;
+    var lp_rasp: f32 = 0;
+    var lp_burst: f32 = 0;
+    const alpha_body: f32 = 1.0 - @exp(-tau * 650.0 * dt);
+    const alpha_rasp: f32 = 1.0 - @exp(-tau * 2200.0 * dt);
+    const alpha_burst: f32 = 1.0 - @exp(-tau * 2600.0 * dt);
+
+    const wobble_phase: f32 = prng.random().float(f32) * tau;
+    const wobble_hz: f32 = p.wobble_hz * (0.92 + 0.16 * prng.random().float(f32));
+
+    // Wet bubble pops
+    var pop_amp: f32 = 0;
+    var pop_phase: f32 = 0;
+    var pop_freq: f32 = 1100.0;
+
     for (0..n) |i| {
         const fi: f32 = @floatFromInt(i);
         const t = fi * dt;
         const u = fi / @as(f32, @floatFromInt(n));
 
-        // Buzzy low-frequency oscillator, pitch gliding down ~20%.
-        const f = p.f0 * (1.0 - p.glide * u);
+        // 1. Physical Intestinal Pressure Curve P(t)
+        // Exponential discharge of pressure over time:
+        const p_discharge = @exp(-2.4 * decay_k * u);
+        const plosive_burst: f32 = if (p.is_plosive) 0.95 * @exp(-t / 0.024) else 0.0;
+        const p_env = (0.32 + 0.68 * p_discharge) * (1.0 + plosive_burst);
+        const inst_pressure = pressure * p_env;
+
+        // 2. Exponential Pitch Decay — pitch drops as pressure drops
+        const pitch_drop_from_pressure = 0.32 * (p_env - 0.32);
+        const glide_drop = p.glide * (1.0 - @exp(-3.2 * u));
+        const f_jitter = 1.0 + 0.022 * @sin(tau * wobble_hz * t + wobble_phase);
+        var f = p.f0 * (1.0 + pitch_drop_from_pressure - glide_drop) * f_jitter;
+        f = std.math.clamp(f, 25.0, 480.0);
+
         phase += tau * f * dt;
         if (phase >= tau) phase -= tau;
-        const carrier = (@sin(phase) + 0.55 * @sin(2.0 * phase) + 0.30 * @sin(3.0 * phase) + 0.12 * @sin(4.0 * phase)) * 0.42;
+        sub_phase += tau * (f * 0.5) * dt;
+        if (sub_phase >= tau) sub_phase -= tau;
 
-        // Filtered noise: a decaying attack burst + a quiet body hiss.
+        // 3. Sphincter Relaxation Oscillator Carrier
+        // Non-linear mucosal relaxation oscillation with tension-dependent harmonics:
+        const s1 = @sin(phase);
+        const s2 = @sin(2.0 * phase);
+        const h3 = 0.28 + 0.12 * tension;
+        const h4 = 0.15 + 0.10 * tension;
+        const h5 = 0.08 + 0.08 * tension;
+        const h6 = 0.04 + 0.06 * tension;
+        var raw_carrier = s1 + 0.65 * s2 + h3 * @sin(3.0 * phase) + h4 * @sin(4.0 * phase) + h5 * @sin(5.0 * phase) + h6 * @sin(6.0 * phase);
+
+        // Subharmonic loose cheek flapping (period-doubling at 0.5 * f)
+        const sub_flap_weight = 0.32 / (0.4 + 0.6 * tension);
+        const sub_flap = @sin(sub_phase) * sub_flap_weight;
+        raw_carrier = (raw_carrier + sub_flap) * 0.38;
+
+        // Asymmetric flesh contact waveshaping:
+        raw_carrier = raw_carrier + 0.20 * raw_carrier * raw_carrier - 0.08 * raw_carrier * raw_carrier * raw_carrier;
+
+        // 4. Flow-Modulated Turbulence & Noise Burst
+        // Draw exactly 3 PRNG numbers per sample to ensure rock-solid determinism
         const wn_body = prng.random().float(f32) * 2.0 - 1.0;
-        lp_body += alpha_body * (wn_body - lp_body);
-        const wn_burst = prng.random().float(f32) * 2.0 - 1.0;
-        lp_burst += alpha_burst * (wn_burst - lp_burst);
-        const burst_env = @exp(-t / 0.045);
-        const noise = lp_body * 0.35 + lp_burst * 0.9 * burst_env;
+        const wn_rasp = prng.random().float(f32) * 2.0 - 1.0;
+        const wn_pop = prng.random().float(f32);
 
-        // Envelope: fast attack, decay to zero, fluttering at ~24-34 Hz.
+        // Aperture opening: flow peaks during positive half-wave of opening
+        const aperture = @max(0.0, s1 + 0.35 * s2);
+        const flow_mod = 0.22 + 0.78 * aperture * aperture;
+
+        lp_body += alpha_body * (wn_body - lp_body);
+        lp_rasp += alpha_rasp * (wn_rasp - lp_rasp);
+        const hp_rasp = wn_rasp - lp_rasp;
+        lp_burst += alpha_burst * (wn_body - lp_burst);
+        const burst_env = @exp(-t / 0.035);
+
+        const turb_signal = (lp_body * 0.42 + hp_rasp * 0.32 * tension + lp_burst * 0.75 * burst_env) * flow_mod * p_env * turbulence;
+
+        // Plosive sudden pressure impulse (balloon/sphincter blowout snap)
+        const plosive_pop: f32 = if (p.is_plosive and t < 0.012)
+            0.50 * @exp(-t / 0.0035) * @sin(tau * 150.0 * t)
+        else
+            0.0;
+
+        // 5. Viscous Moisture & Wet Bubbling Pops
+        var wet_pop: f32 = 0;
+        if (wetness > 0.05) {
+            if (pop_amp < 0.01 and flow_mod > 0.55 and wn_pop < 0.007 * wetness) {
+                pop_amp = 0.26 * wetness * p_env;
+                pop_freq = 900.0 + 300.0 * (wn_body + 1.0);
+            }
+            if (pop_amp > 0.002) {
+                pop_phase += tau * pop_freq * dt;
+                wet_pop = pop_amp * @sin(pop_phase);
+                pop_amp *= 0.955;
+            }
+        }
+
+        // Sum excitation into terminal tract
+        const exc = raw_carrier + p.noise_mix * turb_signal + plosive_pop + wet_pop;
+
+        // 6. Terminal Tract Resonant Formant Filters
+        const res1 = r1.step(exc);
+        const res2 = r2.step(exc);
+        const tract_filtered = res1 * 0.68 + res2 * 0.44;
+        const tract_mix = std.math.clamp(0.42 * resonance, 0.0, 0.85);
+        const colored = exc * (1.0 - tract_mix) + tract_filtered * tract_mix * 1.5;
+
+        // 7. Envelope, Wobble Flutter & Amplitude
         const attack = @min(1.0, t / p.attack_s);
-        const decay = std.math.pow(f32, 1.0 - u, 1.3);
+        const decay = std.math.pow(f32, 1.0 - u, 1.25);
         const env = attack * decay;
         const wob = 1.0 - p.wobble_depth * (0.5 + 0.5 * @sin(tau * wobble_hz * t + wobble_phase));
 
-        var x = (carrier + p.noise_mix * noise) * env * wob * p.level;
+        var x = colored * env * wob * p.level * (0.80 + 0.20 * inst_pressure);
+
+        // Soft analog saturation (preventing harsh digital clipping)
+        if (x > 0.72) {
+            const d = x - 0.72;
+            x = 0.72 + d / (1.0 + d * d);
+        } else if (x < -0.72) {
+            const d = -x - 0.72;
+            x = -(0.72 + d / (1.0 + d * d));
+        }
         if (x > 0.95) x = 0.95;
         if (x < -0.95) x = -0.95;
         out[i] = @intFromFloat(@round(x * 32767.0));
@@ -304,7 +527,23 @@ fn renderSyllableInto(out: []i16, syl: *const Syll, stressed: bool, prng: *std.R
         // literal too, so `--voice noise=0` means "no noise anywhere" rather
         // than "no noise except on the rare breath syllable".
         const spec = knobs.apply(.{ .attack_s = 0.006, .noise_mix = 0.85, .wobble_hz = 31.0, .wobble_depth = 0.30, .level = 0.65 });
-        p = .{ .f0 = 88.0 * pitch, .attack_s = spec.attack_s, .noise_mix = spec.noise_mix, .wobble_hz = spec.wobble_hz, .wobble_depth = spec.wobble_depth, .level = spec.level, .glide = 0.15 };
+        p = .{
+            .f0 = 88.0 * pitch,
+            .attack_s = spec.attack_s,
+            .noise_mix = spec.noise_mix,
+            .wobble_hz = spec.wobble_hz,
+            .wobble_depth = spec.wobble_depth,
+            .level = spec.level,
+            .glide = 0.15,
+            .pressure = knobs.pressure * 0.6,
+            .tension = knobs.tension,
+            .resonance = knobs.resonance * 0.5,
+            .turbulence = knobs.turbulence,
+            .decay_rate = knobs.decay,
+            .wetness = knobs.wetness * 0.5,
+            .is_plosive = false,
+            .vowel = 0,
+        };
         applyEffort(&p, eff);
     } else {
         const spec = knobs.apply(voiceSpec(classify(syl.onset())));
@@ -316,6 +555,14 @@ fn renderSyllableInto(out: []i16, syl: *const Syll, stressed: bool, prng: *std.R
             .wobble_depth = spec.wobble_depth,
             .level = spec.level,
             .glide = PITCH_DROP,
+            .pressure = knobs.pressure,
+            .tension = knobs.tension,
+            .resonance = knobs.resonance,
+            .turbulence = knobs.turbulence,
+            .decay_rate = knobs.decay,
+            .wetness = knobs.wetness,
+            .is_plosive = isPlosive(syl.onset()),
+            .vowel = syl.vowel,
         };
         applyEffort(&p, eff);
         // Swahili stresses the penultimate syllable of a word. The emphasis
@@ -561,7 +808,8 @@ pub fn renderPhraseSamplesWith(allocator: std.mem.Allocator, phrase: []const u8,
     const samples = try allocator.alloc(i16, plan.total_samples);
     errdefer allocator.free(samples);
     @memset(samples, 0);
-    var prng = std.Random.DefaultPrng.init(std.hash.Wyhash.hash(0x5EED_F00D, phrase));
+    const salt = if (knobs.seed != 0) 0x5EED_F00D ^ knobs.seed else 0x5EED_F00D;
+    var prng = std.Random.DefaultPrng.init(std.hash.Wyhash.hash(salt, phrase));
     for (plan.items) |item| {
         renderSyllableInto(samples[item.start..][0..item.len], &item.syl, item.stressed, &prng, knobs);
     }
@@ -616,6 +864,14 @@ pub fn renderShuziWavWith(allocator: std.mem.Allocator, seed: u64, knobs: VoiceK
                 .wobble_depth = 0.45 + 0.15 * r.float(f32),
                 .level = 1.0 * eff,
                 .glide = PITCH_DROP,
+                .pressure = knobs.pressure,
+                .tension = knobs.tension,
+                .resonance = knobs.resonance,
+                .turbulence = knobs.turbulence,
+                .decay_rate = knobs.decay,
+                .wetness = knobs.wetness,
+                .is_plosive = (r.float(f32) < 0.5),
+                .vowel = (if (r.float(f32) < 0.5) 'u' else 'o'),
             },
             .len = dur_ms * SAMPLE_RATE / 1000,
             .gap_after = gap_ms * SAMPLE_RATE / 1000,
@@ -999,6 +1255,12 @@ test "voice knobs: each axis actually changes the audio" {
         .{ .name = "intensity", .knobs = .{ .intensity = 2.0 } },
         .{ .name = "cents up", .knobs = .{ .cents = 700 } },
         .{ .name = "cents down", .knobs = .{ .cents = -700 } },
+        .{ .name = "pressure", .knobs = .{ .pressure = 2.0 } },
+        .{ .name = "tension", .knobs = .{ .tension = 2.0 } },
+        .{ .name = "resonance", .knobs = .{ .resonance = 2.0 } },
+        .{ .name = "turbulence", .knobs = .{ .turbulence = 2.0 } },
+        .{ .name = "decay", .knobs = .{ .decay = 2.0 } },
+        .{ .name = "wetness", .knobs = .{ .wetness = 0.0 } },
     };
     for (axes) |ax| {
         const out = try renderPhraseWavWith(alloc, "kujamba karibu", ax.knobs);
@@ -1102,6 +1364,17 @@ test "voice knob parsing accepts order, whitespace and rejects nonsense" {
     try testing.expectError(error.Negative, parseKnobs("intensity=-1"));
     try testing.expectError(error.NotFinite, parseKnobs("cents=nan"));
     try testing.expectError(error.UnknownKnob, parseKnobs("pitch=2"));
+
+    // physical parameters: pressure, tension, resonance, turbulence, decay, wetness
+    const physical = try parseKnobs("pressure=2.5, tension=1.8, resonance=0.5, turbulence=2.0, decay=1.5, wetness=3.0");
+    try testing.expectEqual(@as(f32, 2.5), physical.pressure);
+    try testing.expectEqual(@as(f32, 1.8), physical.tension);
+    try testing.expectEqual(@as(f32, 0.5), physical.resonance);
+    try testing.expectEqual(@as(f32, 2.0), physical.turbulence);
+    try testing.expectEqual(@as(f32, 1.5), physical.decay);
+    try testing.expectEqual(@as(f32, 3.0), physical.wetness);
+    try testing.expectError(error.Negative, parseKnobs("pressure=-1"));
+    try testing.expectError(error.Negative, parseKnobs("wetness=-0.5"));
 
     try testing.expectError(error.MalformedKnob, parseKnobs("attack"));
     try testing.expectError(error.MalformedKnob, parseKnobs("attack="));
@@ -1265,3 +1538,66 @@ test "cents reaches the consonant-only breath syllable too" {
     }
     try testing.expect(diffs > n / 2);
 }
+
+// --------------------------------------------------------------------------
+// Physical acoustic modeling: pressure, tension, formant resonance, turbulence
+// --------------------------------------------------------------------------
+
+test "physical modeling: isPlosive detects plosive and prenasalized plosive onsets" {
+    try testing.expect(isPlosive("p"));
+    try testing.expect(isPlosive("b"));
+    try testing.expect(isPlosive("t"));
+    try testing.expect(isPlosive("d"));
+    try testing.expect(isPlosive("k"));
+    try testing.expect(isPlosive("g"));
+    try testing.expect(isPlosive("ch"));
+    try testing.expect(isPlosive("j"));
+    try testing.expect(isPlosive("mb"));
+    try testing.expect(isPlosive("nd"));
+    try testing.expect(isPlosive("ng"));
+    try testing.expect(isPlosive("nj"));
+
+    try testing.expect(!isPlosive("s"));
+    try testing.expect(!isPlosive("f"));
+    try testing.expect(!isPlosive("m"));
+    try testing.expect(!isPlosive("l"));
+    try testing.expect(!isPlosive(""));
+}
+
+test "physical modeling: terminal tract formant filters vary by vowel" {
+    const alloc = testing.allocator;
+    const wav_a = try renderPhraseWav(alloc, "ba");
+    defer alloc.free(wav_a);
+    const wav_u = try renderPhraseWav(alloc, "bu");
+    defer alloc.free(wav_u);
+    const wav_i = try renderPhraseWav(alloc, "bi");
+    defer alloc.free(wav_i);
+
+    try testing.expect(!std.mem.eql(u8, wav_a, wav_u));
+    try testing.expect(!std.mem.eql(u8, wav_a, wav_i));
+    try testing.expect(!std.mem.eql(u8, wav_u, wav_i));
+    try expectNotSilence(wav_a);
+    try expectNotSilence(wav_u);
+    try expectNotSilence(wav_i);
+}
+
+test "physical modeling: plosives produce explosive initial transient" {
+    const alloc = testing.allocator;
+    // 'ba' (plosive voiced stop) vs 'ma' (nasal, smooth onset)
+    const samples_ba = try renderPhraseSamples(alloc, "ba");
+    defer alloc.free(samples_ba);
+    const samples_ma = try renderPhraseSamples(alloc, "ma");
+    defer alloc.free(samples_ma);
+
+    // Initial 15 ms peak check
+    const n15 = SAMPLE_RATE * 15 / 1000;
+    var max_ba: i32 = 0;
+    var max_ma: i32 = 0;
+    for (0..n15) |k| {
+        max_ba = @max(max_ba, @as(i32, @intCast(@abs(@as(i32, samples_ba[k])))));
+        max_ma = @max(max_ma, @as(i32, @intCast(@abs(@as(i32, samples_ma[k])))));
+    }
+    // Plosive release pop has significantly higher initial peak energy than nasal glide
+    try testing.expect(max_ba > max_ma);
+}
+
