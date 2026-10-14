@@ -13,6 +13,7 @@ const netmod = @import("ninjam/net.zig");
 const clock = @import("ninjam/clock.zig");
 const vorbis = @import("ninjam/vorbis.zig");
 const kujamba_out = @import("ninjam_out.zig");
+const registry = @import("engine_registry.zig");
 
 test "multi-channel live capture shares one block per step (channels stay aligned)" {
     var a = LocalChannel{ .pending = Buf.init(std.testing.allocator), .dump = Buf.init(std.testing.allocator) };
@@ -1138,8 +1139,8 @@ test "kujamba: switching phrases does not re-render, so payloads stay byte-ident
     defer bank_a.deinit();
     var bank_b = kujamba_out.PhraseBank.init(alloc);
     defer bank_b.deinit();
-    try bank_a.parse("kujamba karibu\nasante sana\n", .{});
-    try bank_b.parse("kujamba karibu\nasante sana\n", .{});
+    try bank_a.parse("kujamba karibu\nasante sana\n", registry.defaultKnobs(.stock));
+    try bank_b.parse("kujamba karibu\nasante sana\n", registry.defaultKnobs(.stock));
 
     // Same phrase from both banks is the same audio, byte for byte.
     for (bank_a.entries.items, bank_b.entries.items) |x, y| {

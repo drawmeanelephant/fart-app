@@ -17,9 +17,12 @@
 //!     # instrument (join + render)
 //!     phrase  = "kujamba karibu"
 //!     pattern = "3+1"               # exactly --pattern's syntax
-//!     [voice]                       # the #18 knobs, as multipliers
-//!     attack = 1.0                  # 1 on every axis is the stock sound
-//!     noise  = 0.5
+//!     engine  = "swe2"              # M9: the fart-off engine selector — one of
+//!                                   # the names `kujamba join --engine` takes;
+//!                                   # absent means "stock"
+//!     [voice]                       # voice knobs for the selected engine, as
+//!     attack = 1.0                  # multipliers. 1 on every axis is that
+//!     noise  = 0.5                  # engine's stock sound
 //!     wobble = 2
 //!     intensity = 1.5               # #15: whisper 0.25 .. shout 4
 //!     cents = -700                  # #16: shift the vowel pitches a fifth down
@@ -39,7 +42,7 @@
 //! keep that buffer alive (in practice: the arena that read the file).
 
 const std = @import("std");
-const synth = @import("synth.zig");
+const registry = @import("engine_registry.zig");
 const kujamba_out = @import("ninjam_out.zig");
 
 /// The file loaded when `--config` is not given. Its absence is the normal
@@ -109,13 +112,47 @@ pub const Config = struct {
     pass: ?[]const u8 = null,
     phrase: ?[]const u8 = null,
     pattern: ?kujamba_out.Pattern = null,
-    /// the [voice] table: axes the file leaves alone stay at 1 (the identity),
-    /// so applying it keeps the stock sound everywhere the file is silent
-    knobs: synth.VoiceKnobs = .{},
+    /// the fart-off engine (M9): set by `engine = "<slug>"` at top level or an
+    /// `engine` line inside [voice]. null = the registry default ("stock").
+    engine: ?registry.Id = null,
+    /// the [voice] table, stored as raw key/value pairs: which knob names are
+    /// legal depends on `engine`, so only the engine's own parser can judge
+    /// them. Validation still happens here (see `parse`), just deferred to
+    /// after the whole file is read and the engine is known.
+    voice: [max_voice_pairs]VoicePair = undefined,
+    voice_len: usize = 0,
     /// the [map] table (#21): note -> sound for `kujamba trigger`. Slots the
     /// file leaves alone stay `.none`. Phrase slices point into the file text.
     map: [128]NoteSound = @splat(.none),
+
+    /// The [voice] table as one `--voice`-shaped spec ("k=v,k=v"), or null
+    /// when the file had no voice pairs. Keys and values are already validated
+    /// to be comma-free, so joining is lossless. `engine` pairs are not in
+    /// `voice` — they live in `cfg.engine` — so the spec is pure knobs.
+    pub fn voiceSpec(cfg: *const Config, alloc: std.mem.Allocator) !?[]const u8 {
+        if (cfg.voice_len == 0) return null;
+        var out: std.ArrayList(u8) = .empty;
+        for (cfg.voice[0..cfg.voice_len], 0..) |p, i| {
+            if (i != 0) try out.append(alloc, ',');
+            try out.appendSlice(alloc, p.key);
+            try out.append(alloc, '=');
+            try out.appendSlice(alloc, p.value);
+        }
+        return try out.toOwnedSlice(alloc);
+    }
 };
+
+/// One `[voice]` line, kept verbatim for the engine's own parseKnobs.
+pub const VoicePair = struct {
+    key: []const u8,
+    value: []const u8,
+    /// 1-based source line — reported when the engine rejects the pair
+    line: usize,
+};
+
+/// The most knobs any shipped engine takes is 16; 24 leaves headroom without
+/// an allocator.
+pub const max_voice_pairs = 24;
 
 /// One [map] binding: MIDI note N plays a wordless shuzi by seed, or a whole
 /// phrase (owned by the config text's allocator).
@@ -150,6 +187,12 @@ pub const ParseError = error{
     BadMapValue,
     /// a [voice] value is not a finite non-negative number
     BadVoiceValue,
+    /// `engine` names no engine the registry knows
+    UnknownEngine,
+    /// the [voice] table holds more than `max_voice_pairs` entries
+    TooManyVoicePairs,
+    /// the resolved engine's own parseKnobs rejected a [voice] key
+    EngineRejectedVoice,
 };
 
 /// Where and why a parse failed. `parse` fills it before every error return;
@@ -199,7 +242,7 @@ pub fn parse(text_in: []const u8, diag: *Diag) ParseError!Config {
     var seen_pass = false;
     var seen_phrase = false;
     var seen_pattern = false;
-    var seen_knobs: u8 = 0; // one bit per knob, for duplicate detection
+    var seen_engine = false;
 
     var lines = std.mem.splitScalar(u8, text, '\n');
     var line_no: usize = 0;
@@ -248,7 +291,7 @@ pub fn parse(text_in: []const u8, diag: *Diag) ParseError!Config {
         const value = try parseValue(t[eq + 1 ..], diag, line_no);
 
         if (in_voice) {
-            try setKnob(&cfg, key, value, line_no, &seen_knobs, diag);
+            try setVoicePair(&cfg, key, value, line_no, &seen_engine, diag);
             continue;
         }
         if (in_map) {
@@ -294,63 +337,81 @@ pub fn parse(text_in: []const u8, diag: *Diag) ParseError!Config {
             seen_pattern = true;
             cfg.pattern = kujamba_out.parsePattern(value) catch
                 return diag.fail(line_no, error.BadPattern, "bad pattern '{s}' (want N or N+M)", .{value});
+        } else if (std.mem.eql(u8, key, "engine")) {
+            if (seen_engine) return diag.dup(line_no, key);
+            seen_engine = true;
+            cfg.engine = registry.fromName(value) orelse
+                return diag.fail(line_no, error.UnknownEngine, "unknown engine '{s}' (want one of: {s})", .{ value, registry.names_csv });
         } else if (std.mem.eql(u8, key, "voice")) {
-            return diag.fail(line_no, error.UnknownKey, "unknown key 'voice' (set [voice] attack/noise/wobble/intensity/cents)", .{});
+            return diag.fail(line_no, error.UnknownKey, "unknown key 'voice' (set [voice] engine/knobs)", .{});
         } else if (std.mem.startsWith(u8, key, "voice.")) {
             const knob = key["voice.".len..];
             if (knob.len == 0 or std.mem.indexOfScalar(u8, knob, '.') != null)
                 return diag.fail(line_no, error.UnknownKey, "unknown key '{s}'", .{key});
-            try setKnob(&cfg, knob, value, line_no, &seen_knobs, diag);
+            try setVoicePair(&cfg, knob, value, line_no, &seen_engine, diag);
         } else {
-            return diag.fail(line_no, error.UnknownKey, "unknown key '{s}' (want host, user, pass, phrase, pattern or voice.attack/noise/wobble/intensity/cents)", .{key});
+            return diag.fail(line_no, error.UnknownKey, "unknown key '{s}' (want host, user, pass, phrase, pattern, engine or voice.<knob>)", .{key});
         }
+    }
+
+    // Now that `engine` is known wherever it appeared, let the engine's own
+    // parser judge the [voice] pairs — the knob vocabulary is per-engine (#95).
+    if (cfg.voice_len > 0) {
+        var spec_buf: [4096]u8 = undefined;
+        var w: usize = 0;
+        for (cfg.voice[0..cfg.voice_len]) |p| {
+            const need = p.key.len + 1 + p.value.len + 1;
+            if (w + need > spec_buf.len) return error.TooManyVoicePairs;
+            if (w != 0) {
+                spec_buf[w] = ',';
+                w += 1;
+            }
+            @memcpy(spec_buf[w .. w + p.key.len], p.key);
+            w += p.key.len;
+            spec_buf[w] = '=';
+            w += 1;
+            @memcpy(spec_buf[w .. w + p.value.len], p.value);
+            w += p.value.len;
+        }
+        const id = cfg.engine orelse registry.default_id;
+        _ = registry.parseKnobs(spec_buf[0..w], null, id) catch |e|
+            return diag.fail(cfg.voice[0].line, error.EngineRejectedVoice, "engine '{s}' rejected a [voice] entry: {s} (its knobs: {s})", .{ registry.name(id), @errorName(e), registry.knobNamesFor(id) });
     }
     return cfg;
 }
 
-const Knob = enum(u3) { attack, noise, wobble, intensity, cents };
+/// One [voice] entry from config text. The knob vocabulary is per-engine (M9),
+/// so a pair is stored verbatim for the engine's own parseKnobs — which runs
+/// at the end of `parse`, once `engine` is known — rather than applied to a
+/// struct here. What IS checked now: `engine = <slug>` resolves through the
+/// registry, and every other value is a finite number that is >= 0 unless the
+/// key is `cents` (#16's offset knob is the one negative value that means
+/// something). Engines clamp to their own spec bounds at apply time, so no
+/// range check belongs here.
+fn setVoicePair(cfg: *Config, key: []const u8, value: []const u8, line_no: usize, seen_engine: *bool, diag: *Diag) ParseError!void {
+    if (std.mem.eql(u8, key, "engine")) {
+        if (seen_engine.*) return diag.dup(line_no, key);
+        seen_engine.* = true;
+        cfg.engine = registry.fromName(value) orelse
+            return diag.fail(line_no, error.UnknownEngine, "unknown engine '{s}' (want one of: {s})", .{ value, registry.names_csv });
+        return;
+    }
 
-fn knobBit(k: Knob) u8 {
-    return @as(u8, 1) << @intCast(@backingInt(k));
-}
-
-/// One voice knob from config text, with parseKnobs' own rules for --voice:
-/// a finite, non-negative multiplier — except `cents` (#16), which is an
-/// offset in cents and the one knob a negative value is meaningful for. The
-/// synth clamps to the spec bounds when the knobs are applied, so no range
-/// check is needed here.
-fn setKnob(cfg: *Config, key: []const u8, value: []const u8, line_no: usize, seen: *u8, diag: *Diag) ParseError!void {
-    const k: Knob = if (std.mem.eql(u8, key, "attack"))
-        .attack
-    else if (std.mem.eql(u8, key, "noise"))
-        .noise
-    else if (std.mem.eql(u8, key, "wobble"))
-        .wobble
-    else if (std.mem.eql(u8, key, "intensity"))
-        .intensity
-    else if (std.mem.eql(u8, key, "cents"))
-        .cents
-    else
-        return diag.fail(line_no, error.UnknownKey, "unknown [voice] key '{s}' (want attack, noise, wobble, intensity or cents)", .{key});
-
-    const bit = knobBit(k);
-    if (seen.* & bit != 0) return diag.dup(line_no, key);
-    seen.* |= bit;
+    for (cfg.voice[0..cfg.voice_len]) |p| {
+        if (std.mem.eql(u8, p.key, key)) return diag.dup(line_no, key);
+    }
+    if (cfg.voice_len == max_voice_pairs)
+        return diag.fail(line_no, error.TooManyVoicePairs, "more than {d} [voice] keys", .{max_voice_pairs});
 
     const v = std.fmt.parseFloat(f32, value) catch
         return diag.fail(line_no, error.BadVoiceValue, "voice.{s} must be a number (got '{s}')", .{ key, value });
     if (!std.math.isFinite(v))
         return diag.fail(line_no, error.BadVoiceValue, "voice.{s} must be finite (got '{s}')", .{ key, value });
-    if (v < 0 and k != .cents)
+    if (v < 0 and !std.mem.eql(u8, key, "cents"))
         return diag.fail(line_no, error.BadVoiceValue, "voice.{s} must be >= 0 (got '{s}'; knobs are multipliers)", .{ key, value });
 
-    switch (k) {
-        .attack => cfg.knobs.attack = v,
-        .noise => cfg.knobs.noise = v,
-        .wobble => cfg.knobs.wobble = v,
-        .intensity => cfg.knobs.intensity = v,
-        .cents => cfg.knobs.cents = v,
-    }
+    cfg.voice[cfg.voice_len] = .{ .key = key, .value = value, .line = line_no };
+    cfg.voice_len += 1;
 }
 
 /// The value half of a `key = value` line: a double-quoted literal (no escape
@@ -417,11 +478,11 @@ test "a full config file parses into typed values" {
     try testing.expectEqualStrings("pw", cfg.pass.?);
     try testing.expectEqualStrings("habari yako", cfg.phrase.?);
     try testing.expectEqual(kujamba_out.Pattern{ .play = 2, .rest = 2 }, cfg.pattern.?);
-    try testing.expectEqual(@as(f32, 2.0), cfg.knobs.attack);
-    try testing.expectEqual(@as(f32, 0.5), cfg.knobs.noise);
-    try testing.expectEqual(@as(f32, 3.0), cfg.knobs.wobble);
-    try testing.expectEqual(@as(f32, 1.5), cfg.knobs.intensity);
-    try testing.expectEqual(@as(f32, -700.0), cfg.knobs.cents);
+    // [voice] arrives as raw pairs; the engine's own parser applies them
+    try testing.expectEqual(@as(usize, 5), cfg.voice_len);
+    const spec = (try cfg.voiceSpec(testing.allocator)).?;
+    defer testing.allocator.free(spec);
+    try testing.expectEqualStrings("attack=2,noise=0.5,wobble=3,intensity=1.5,cents=-700", spec);
 }
 
 test "host carries the port and IPv6 brackets exactly like --host" {
@@ -447,29 +508,25 @@ test "dotted voice keys are the same as the [voice] table" {
         \\voice.wobble = 0
         \\
     );
-    try testing.expectEqual(@as(f32, 0.5), cfg.knobs.attack);
-    try testing.expectEqual(@as(f32, 2.0), cfg.knobs.noise);
-    try testing.expectEqual(@as(f32, 0.0), cfg.knobs.wobble);
+    try testing.expectEqual(@as(usize, 3), cfg.voice_len);
+    const spec = (try cfg.voiceSpec(testing.allocator)).?;
+    defer testing.allocator.free(spec);
+    try testing.expectEqualStrings("attack=0.5,noise=2,wobble=0", spec);
 }
 
-test "knobs the file leaves alone stay at 1 (the identity)" {
+test "knobs the file leaves alone are simply absent (the identity is the engine's)" {
     const cfg = parseOk("[voice]\nnoise = 0\n");
-    try testing.expectEqual(@as(f32, 1.0), cfg.knobs.attack);
-    try testing.expectEqual(@as(f32, 0.0), cfg.knobs.noise);
-    try testing.expectEqual(@as(f32, 1.0), cfg.knobs.wobble);
-    // the #15/#16 axes share the identity rule: intensity 1, cents 0
-    try testing.expectEqual(@as(f32, 1.0), cfg.knobs.intensity);
-    try testing.expectEqual(@as(f32, 0.0), cfg.knobs.cents);
+    try testing.expectEqual(@as(usize, 1), cfg.voice_len);
+    try testing.expectEqualStrings("noise", cfg.voice[0].key);
+    try testing.expectEqualStrings("0", cfg.voice[0].value);
 }
 
 test "intensity and cents ride the same [voice] table (#15, #16)" {
     const table = parseOk("[voice]\nintensity = 0.5\ncents = -700\n");
-    try testing.expectEqual(@as(f32, 0.5), table.knobs.intensity);
-    try testing.expectEqual(@as(f32, -700.0), table.knobs.cents);
-
-    const dotted = parseOk("voice.intensity = 2\nvoice.cents = 1200\n");
-    try testing.expectEqual(@as(f32, 2.0), dotted.knobs.intensity);
-    try testing.expectEqual(@as(f32, 1200.0), dotted.knobs.cents);
+    try testing.expectEqual(@as(usize, 2), table.voice_len);
+    const spec = (try table.voiceSpec(testing.allocator)).?;
+    defer testing.allocator.free(spec);
+    try testing.expectEqualStrings("intensity=0.5,cents=-700", spec);
 
     // cents is an offset, so a negative value is fine — but intensity is a
     // multiplier and negative is rejected like every other knob
@@ -494,15 +551,46 @@ test "an empty config is valid and sets nothing" {
         try testing.expectEqual(@as(?[]const u8, null), cfg.pass);
         try testing.expectEqual(@as(?[]const u8, null), cfg.phrase);
         try testing.expectEqual(@as(?kujamba_out.Pattern, null), cfg.pattern);
-        try testing.expectEqual(synth.VoiceKnobs{}, cfg.knobs);
+        try testing.expectEqual(@as(?registry.Id, null), cfg.engine);
+        try testing.expectEqual(@as(usize, 0), cfg.voice_len);
     }
 }
 
 test "unknown keys and sections are rejected with file and line" {
     try expectParseError(error.UnknownKey, "user = a\npass = b\nusr = oops\n", 3, "unknown key 'usr'");
     try expectParseError(error.UnknownKey, "seed = 5\n", 1, "unknown key 'seed'");
-    try expectParseError(error.UnknownKey, "[voice]\nwobble_hz = 30\n", 2, "unknown [voice] key 'wobble_hz'");
     try expectParseError(error.UnknownKey, "[connection]\nhost = \"x\"\n", 1, "unknown section '[connection]'");
+}
+
+test "the engine selector: config spellings, validation, duplicates" {
+    // top-level engine key, validated against the registry
+    var cfg = parseOk("engine = \"swe2\"\n");
+    try testing.expectEqual(registry.Id.swe2, cfg.engine.?);
+
+    // inside [voice] and dotted both mean the same key
+    cfg = parseOk("[voice]\nengine = \"fable\"\n");
+    try testing.expectEqual(registry.Id.fable, cfg.engine.?);
+    cfg = parseOk("voice.engine = \"opus\"\n");
+    try testing.expectEqual(registry.Id.opus, cfg.engine.?);
+
+    try expectParseError(error.UnknownEngine, "engine = \"bert\"\n", 1, "unknown engine 'bert'");
+    try expectParseError(error.UnknownEngine, "[voice]\nengine = bert\n", 2, "unknown engine 'bert'");
+    try expectParseError(error.DuplicateKey, "engine = swe2\nengine = fable\n", 2, "'engine' appears twice");
+    // the dotted spelling and the table share the one slot
+    try expectParseError(error.DuplicateKey, "voice.engine = swe2\n[voice]\nengine = fable\n", 3, "'engine' appears twice");
+}
+
+test "[voice] keys are validated against the resolved engine (#95)" {
+    // 'wet' is a swe2 knob: rejected under the default engine, legal under swe2
+    try expectParseError(error.EngineRejectedVoice, "[voice]\nwet = 2\n", 2, "engine 'stock' rejected");
+    const cfg = parseOk("engine = swe2\n[voice]\nwet = 2\npressure = 2\n");
+    try testing.expectEqual(registry.Id.swe2, cfg.engine.?);
+    try testing.expectEqual(@as(usize, 2), cfg.voice_len);
+    const spec = (try cfg.voiceSpec(testing.allocator)).?;
+    defer testing.allocator.free(spec);
+    const parsed = try registry.parseKnobs(spec, null, cfg.engine.?);
+    try testing.expectEqual(@as(f32, 2.0), parsed.knobs.swe2.wet);
+    try testing.expectEqual(@as(f32, 2.0), parsed.knobs.swe2.pressure);
 }
 
 test "duplicate keys and a repeated [voice] table are rejected" {
@@ -606,6 +694,7 @@ test "[map] coexists with [voice] and keeps sections separate" {
         \\note61 = "habari yako"
     );
     try testing.expect(cfg.map[60] == .shuzi);
-    try testing.expectEqual(@as(f64, 0.5) * 0 + cfg.knobs.attack, cfg.knobs.attack);
+    try testing.expectEqual(@as(usize, 1), cfg.voice_len);
+    try testing.expectEqualStrings("attack", cfg.voice[0].key);
     try testing.expect(cfg.map[61] == .phrase);
 }

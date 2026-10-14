@@ -145,10 +145,31 @@ Ballots go on
 [#95](https://github.com/drawmeanelephant/fart-app/issues/95) — say which
 entry owns baseline and which owns showcase.
 
+## Play every entry from one binary
+
+All nine engines shipped into the tree as `src/engines/<slug>.zig` behind an
+`--engine` selector (#95). Nothing was crowned: `stock` is still the default
+voice until judging closes.
+
+```bash
+./zig-out/bin/kujamba render --engine swe2 \
+  --voice "wet=1.3,drop=1.6" --phrase "kujamba karibu" --out swe2.wav
+```
+
+- `--engine <slug>` works on `join`, `render`, `play`, and `trigger`.
+- `engine=<slug>` inside `--voice` is a shortcut; a real `--engine` flag
+  beats it, and both beat the config file's `engine = "<slug>"` key.
+- Each engine parses its own `--voice` spec — `wet` is swe2-only, `glide`
+  is fable-only — and a foreign knob name fails with that engine's knob
+  list. See the field table above for each entry's keys.
+- Every engine carries its own `src/golden.zig` fingerprints, so a drift in
+  any single engine fails the suite without touching the others.
+
 ## Reproduce any entry exactly
 
-Every entry is a `fartoff/<slug>` branch off the same base commit and a
-deterministic renderer:
+The selector is the easy path, but every entry also exists as a
+`fartoff/<slug>` branch off the same base commit — the historical record of
+what each model actually wrote:
 
 ```bash
 git fetch origin fartoff/argon4   # any entry slug

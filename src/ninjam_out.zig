@@ -23,6 +23,7 @@
 
 const std = @import("std");
 const synth = @import("synth.zig");
+const registry = @import("engine_registry.zig");
 const instrument = @import("ninjam/instrument.zig");
 const session = @import("ninjam/session.zig");
 const proto = @import("ninjam/proto.zig");
@@ -319,7 +320,7 @@ pub const PhraseBank = struct {
 
     /// Render `phrase` once and append it. This is the whole of #10: the
     /// expensive part (synthesis) happens here, at load, and never again.
-    pub fn add(self: *PhraseBank, phrase: []const u8, knobs: synth.VoiceKnobs) !void {
+    pub fn add(self: *PhraseBank, phrase: []const u8, knobs: registry.Knobs) !void {
         const samples = try renderPhraseF32With(self.alloc, phrase, knobs);
         errdefer self.alloc.free(samples);
         // Checked after the render, because the length is only known then: a
@@ -340,7 +341,7 @@ pub const PhraseBank = struct {
     /// Line-oriented means `name == phrase text`, so `!kujamba <name>` and
     /// `!kujamba <n>` are two ways to say the same thing and there is no second
     /// vocabulary to keep in sync.
-    pub fn parse(self: *PhraseBank, text: []const u8, knobs: synth.VoiceKnobs) !void {
+    pub fn parse(self: *PhraseBank, text: []const u8, knobs: registry.Knobs) !void {
         var lines = std.mem.splitScalar(u8, text, '\n');
         var lineno: usize = 0;
         while (lines.next()) |raw| {
@@ -464,17 +465,18 @@ pub const PlanAdapter = struct {
 /// at `synth.SAMPLE_RATE`, with a short linear fade-out so phrase tails and
 /// loop wraps don't click. Deterministic: same phrase -> same samples.
 pub fn renderPhraseF32(alloc: std.mem.Allocator, phrase: []const u8) ![]f32 {
-    return renderPhraseF32With(alloc, phrase, .{});
+    return renderPhraseF32With(alloc, phrase, registry.defaultKnobs(registry.default_id));
 }
 
-/// `renderPhraseF32` with the synth's voice knobs applied (#18). The default
-/// `{}` is the identity and byte-identical to `renderPhraseF32`.
+/// `renderPhraseF32` with a fart-off engine's voice knobs applied (#18, #95).
+/// The `Knobs` tag selects the engine; `defaultKnobs(default_id)` is the
+/// identity and byte-identical to `renderPhraseF32`.
 pub fn renderPhraseF32With(
     alloc: std.mem.Allocator,
     phrase: []const u8,
-    knobs: synth.VoiceKnobs,
+    knobs: registry.Knobs,
 ) ![]f32 {
-    const pcm16 = try synth.renderPhraseSamplesWith(alloc, phrase, knobs);
+    const pcm16 = try registry.renderPhraseSamplesWith(alloc, phrase, knobs);
     defer alloc.free(pcm16);
     const out = try alloc.alloc(f32, pcm16.len);
     for (pcm16, out) |v, *o| o.* = @as(f32, @floatFromInt(v)) / 32768.0;
@@ -500,8 +502,9 @@ pub const OfflineOpts = struct {
     /// samples per bar. 0 means "one bar exactly as long as the phrase", so the
     /// defaults render the phrase untouched rather than truncating it at 1s.
     bar_samples: u64 = 0,
-    /// voice tuning for the synth (#18); the default is the identity
-    knobs: synth.VoiceKnobs = .{},
+    /// voice tuning (#18) and the fart-off engine (M9, #95): the union tag is
+    /// the engine, the payload its knobs. The default is stock identity.
+    knobs: registry.Knobs = registry.defaultKnobs(registry.default_id),
 };
 
 /// Render a phrase to the bar-shaped audio `join` would upload, with no server.
@@ -1328,7 +1331,7 @@ test "a phrases file renders every phrase once, up front, deterministically (#10
     ;
     var bank = PhraseBank.init(alloc);
     defer bank.deinit();
-    try bank.parse(text, .{});
+    try bank.parse(text, registry.defaultKnobs(.stock));
 
     // blank lines and full-line comments are skipped; the rest are phrases
     try testing.expectEqual(@as(usize, 3), bank.entries.items.len);
@@ -1347,7 +1350,7 @@ test "a phrases file renders every phrase once, up front, deterministically (#10
     // second load is sample-identical and a switch can never re-render.
     var again = PhraseBank.init(alloc);
     defer again.deinit();
-    try again.parse(text, .{});
+    try again.parse(text, registry.defaultKnobs(.stock));
     for (bank.entries.items, again.entries.items) |a, b| {
         try testing.expectEqualStrings(a.name, b.name);
         try testing.expectEqualSlices(f32, a.samples, b.samples);
@@ -1371,7 +1374,7 @@ test "a bank renders up to its audio budget and no further (#8, #10)" {
     var bank = PhraseBank.init(alloc);
     defer bank.deinit();
 
-    try bank.add("kujamba karibu", .{});
+    try bank.add("kujamba karibu", registry.defaultKnobs(.stock));
     const first = bank.entries.items[0].samples.len;
     try testing.expectEqual(first, bank.rendered);
 
@@ -1379,7 +1382,7 @@ test "a bank renders up to its audio budget and no further (#8, #10)" {
     // that has to be refused. This is what makes the budget cumulative: a cap
     // checked per entry would let this through.
     bank.budget = first;
-    try testing.expectError(error.BankTooLarge, bank.add("asante sana", .{}));
+    try testing.expectError(error.BankTooLarge, bank.add("asante sana", registry.defaultKnobs(.stock)));
 
     // The refused phrase leaves nothing behind: no entry to play, no allocation
     // to leak, and the running total untouched.
@@ -1395,7 +1398,7 @@ test "a phrases file that overruns the budget reports the line that did it" {
 
     try testing.expectError(
         error.BankTooLarge,
-        bank.parse("# a comment\nkujamba karibu\nasante sana\n", .{}),
+        bank.parse("# a comment\nkujamba karibu\nasante sana\n", registry.defaultKnobs(.stock)),
     );
     // Line 2, not line 1: comments and blank lines still consume a line, so the
     // number is the one the user sees in their editor.
@@ -1407,7 +1410,7 @@ test "a phrases file with CRLF endings parses the same as one with LF" {
     const alloc = testing.allocator;
     var bank = PhraseBank.init(alloc);
     defer bank.deinit();
-    try bank.parse("kujamba karibu\r\nasante sana\r\n", .{});
+    try bank.parse("kujamba karibu\r\nasante sana\r\n", registry.defaultKnobs(.stock));
     try testing.expectEqual(@as(usize, 2), bank.entries.items.len);
     try testing.expectEqualStrings("asante sana", bank.entries.items[1].name);
 }
@@ -1416,7 +1419,7 @@ test "a selector resolves by 1-based position or by name, case-insensitively" {
     const alloc = testing.allocator;
     var bank = PhraseBank.init(alloc);
     defer bank.deinit();
-    try bank.parse("kujamba karibu\nasante sana\nhabari yako\n", .{});
+    try bank.parse("kujamba karibu\nasante sana\nhabari yako\n", registry.defaultKnobs(.stock));
 
     // position, 1-based because a person counting phrases in a room starts at 1
     try testing.expectEqual(@as(?usize, 0), bank.resolve("1"));
@@ -1434,7 +1437,7 @@ test "an invalid or empty selector is rejected and the current phrase keeps play
     const alloc = testing.allocator;
     var bank = PhraseBank.init(alloc);
     defer bank.deinit();
-    try bank.parse("kujamba karibu\nasante sana\n", .{});
+    try bank.parse("kujamba karibu\nasante sana\n", registry.defaultKnobs(.stock));
     const first = bank.active().?;
     try testing.expectEqualStrings("kujamba karibu", first.name);
 
@@ -1455,7 +1458,7 @@ test "a request is applied at the next bar, not when it is typed (#8)" {
     const alloc = testing.allocator;
     var bank = PhraseBank.init(alloc);
     defer bank.deinit();
-    try bank.parse("kujamba karibu\nasante sana\n", .{});
+    try bank.parse("kujamba karibu\nasante sana\n", registry.defaultKnobs(.stock));
     try testing.expectEqualStrings("kujamba karibu", bank.active().?.name);
 
     bank.request("2");
