@@ -11,8 +11,8 @@ summary: Syllables, oscillator/noise envelopes, timing, and measured determinism
 It renders mono 44.1 kHz PCM; WAV output is 16-bit. The instrument converts
 that synthesis into float samples for its shared phrase-to-bar path.
 
-One syllable combines a low buzzy oscillator with falling pitch, a noisy
-attack splat, and a fluttering decay. A small parser groups Swahili vowels,
+One syllable combines an uneven valve pulse with falling pitch, a noisy
+pressure release, and a fluttering decay. A small parser groups Swahili vowels,
 digraphs, and consonant onsets; it is not a general linguistic model.
 
 ## Vowel pitch
@@ -27,6 +27,37 @@ digraphs, and consonant onsets; it is not a general linguistic model.
 
 `cents` multiplies these by `2^(cents/1200)`. The breath tail's 88 Hz carrier
 follows that shift. Shuzi has randomly selected pitch keyed by its seed.
+
+## Pressure, valve and terminal tract
+
+Reservoir pressure is `pressure * exp(-decay * normalized_time)`. Pitch follows
+its square root towards a low floor, with tension setting the register.
+Plosives add a separate 24 ms exponential pressure release: `p` is explosive,
+`k/t/ch` sharp, `b` rounder, and `d/g/j` softer. Clusters such as `mb`, `mp`,
+`nk` and `kw` retain the stop; fricative digraphs do not become plosives.
+
+Each valve cycle has seeded timing/amplitude variation. Loose tension broadens
+the pulse and adds subharmonic body; tight tension narrows it into a rasp.
+Seeded, valve-gated noise clusters decay in 2.5–7.5 ms, rather than producing
+a continuous white-noise wash. The existing noise knob controls every air layer.
+
+Two constant-peak bandpass filters model vowel cavities, in parallel with a
+115–180 Hz body resonance and the direct source:
+
+| Vowel | First formant | Second formant |
+|---|---|---|
+| a | 620 Hz | 1120 Hz |
+| e | 430 Hz | 1450 Hz |
+| i | 290 Hz | 1850 Hz |
+| o | 390 Hz | 760 Hz |
+| u | 260 Hz | 570 Hz |
+
+Tension scales these formants by `0.82 + 0.30 * tension`. Resonance increases
+their prominence and ringing, without removing the low-end source. A DC
+blocker and smooth saturation round the pressure slap. A quadratic final
+release guarantees exact zero endpoints and preserves all phrase timing.
+All filter state and randomness are local to the render, with no new allocation
+in the sample loop, dependencies, I/O or libc.
 
 ## Onset character
 
