@@ -9,6 +9,29 @@ tagged `v<version>` and published on GitHub with CI-built binaries via
 
 ## [Unreleased]
 
+### Changed
+
+- **The default sound is now a physical fart model** (`synthFart` in
+  `src/synth.zig`): exponentially draining pressure, two flapping sphincter
+  lips with per-cycle jitter/shimmer/period doubling, pulse-gated turbulence,
+  vowel-selected formant filters plus a low boom cavity, wet bubbles, and
+  consonant-specific onsets (plosives are pressure bursts, fricatives hiss,
+  nasals close, `w y l r` glide and roll). It is louder (about -12 dBFS) and
+  much brighter than the old buzz. Output bytes of every phrase changed.
+  `--voice legacy=1` renders the previous synth bit for bit.
+- The physical model evaluates its own exp/sin/tan, so its WAV bytes are
+  identical in Debug, ReleaseSafe, ReleaseFast and ReleaseSmall.
+- Wordless shuzi farts pick a random archetype (thunderous, squeaker, wet,
+  raspy, dry), vowel and onset per syllable.
+
+### Added
+
+- `--voice` / `[voice]` knobs: `pressure`, `tension`, `resonance`,
+  `turbulence`, `wetness`, `rasp`, `decay`, `burst`, `boom`, `seed` and
+  `legacy`. Each is documented on `VoiceKnobs` and in the voice guide.
+- Golden fingerprints for both engines: the old seven are kept as
+  `(legacy)` rows, and seven new rows pin the default sound.
+
 ## [1.0.0] - 2026-10-11
 
 The first tagged release of Flatlophone v2: a deterministic fart synthesizer

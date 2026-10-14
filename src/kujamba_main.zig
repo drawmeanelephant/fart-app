@@ -107,7 +107,11 @@ fn printUsage(io: std.Io) void {
         \\                       (default 3+1)
         \\    --voice SPEC       synth voice knobs (#18), e.g. "noise=0,wobble=2".
         \\                       Multipliers on each onset class's attack, noise mix
-        \\                       and wobble depth; 1 is today's sound exactly.
+        \\                       and wobble depth, plus the physical axes pressure,
+        \\                       tension, resonance, turbulence, wetness, rasp,
+        \\                       decay, burst and boom (wet: "wetness=2.5"; thunder:
+        \\                       "pressure=1.6,tension=0.6,boom=2"); 1 is the stock
+        \\                       sound. seed=N re-rolls it; legacy=1 is the old synth.
         \\    --play MODE        how the phrase maps onto bars:
         \\                       repeat  restart at every fart bar (default)
         \\                       loop    play continuously, wrapping at the end

@@ -46,6 +46,17 @@
 //! `wav_sha256` is still recorded, as the exact bytes at baseline time. It is
 //! documentation and a diagnostic, not an assertion.
 //!
+//! ## Two engines, two kinds of stability
+//!
+//! The default voice is the physical-model engine (`synthFart`). It evaluates
+//! its own exp/sin/tan from plain IEEE arithmetic, so its WAV bytes are
+//! identical in Debug, ReleaseSafe, ReleaseFast and ReleaseSmall: the
+//! `wav_sha256` of the default-engine rows below is exact everywhere, and the
+//! "bytes moved" note stays silent for them. The `(legacy)` rows run the
+//! original engine (`--voice legacy=1`), kept verbatim, `@exp`/`@sin` and all,
+//! so *they* show the codegen wobble described above, which is why the
+//! asserted fields are the stable ones.
+//!
 //! Re-baselining: run `zig build test` and paste the block it prints over
 //! `expected`. No script, no flag to remember.
 
@@ -62,7 +73,14 @@ pub const Kind = enum {
     phrase,
     /// render via `synth.renderShuziWav` (a wordless fart, seeded)
     shuzi,
+    /// `phrase`, through the pre-physics synth (`legacy=1`)
+    phrase_legacy,
+    /// `shuzi`, through the pre-physics synth (`legacy=1`)
+    shuzi_legacy,
 };
+
+/// `--voice legacy=1`: the original synth, bit for bit.
+const legacy_knobs = synth.VoiceKnobs{ .legacy = 1 };
 
 pub const Fingerprint = struct {
     /// stable label; used in failure output and as the copy-paste key
@@ -89,18 +107,27 @@ pub const Fingerprint = struct {
 /// The baseline. Any change here is a deliberate, reviewable act.
 pub const expected = [_]Fingerprint{
     // the phrase the demo, the docs and the readme all use
-    .{ .name = "kujamba karibu", .kind = .phrase, .input = "kujamba karibu", .items = 6, .samples = 79380, .peak = 22007, .zero_crossings = 720, .rms_milli = 4173837, .envelope_sha256 = "b689f1368324e2b7abe414e01bdb121730f0bb6e7ffd0bd9a9defcb752f234d1", .wav_sha256 = "21c6faa26eb63b958968a6dfe2fcf33073182be7f34c0cef416894c84b045f3d" },
+    .{ .name = "kujamba karibu", .kind = .phrase, .input = "kujamba karibu", .items = 6, .samples = 79380, .peak = 30931, .zero_crossings = 3882, .rms_milli = 7433186, .envelope_sha256 = "0403eb7a29001dcc2c165c154583e54a8430cd084e2a3247cbd660780630fc7b", .wav_sha256 = "4835e1d7be92bdbd706487b3e34efa5130f8ab944b749d7edfa06163bda67442" },
     // longer, so the fingerprint covers stress placement across several words
-    .{ .name = "asante sana kijiji", .kind = .phrase, .input = "asante sana kijiji", .items = 8, .samples = 109368, .peak = 25998, .zero_crossings = 1134, .rms_milli = 4164752, .envelope_sha256 = "a6b896d1bc43543a6827465d36223fa91cf49cefe4b44460fe7a0272efa55a13", .wav_sha256 = "5973bbb55e662d2d47fdef82c2d4ee4b2ba059aa3d760e7801060e1af1d80c07" },
+    .{ .name = "asante sana kijiji", .kind = .phrase, .input = "asante sana kijiji", .items = 8, .samples = 109368, .peak = 31107, .zero_crossings = 8078, .rms_milli = 7004470, .envelope_sha256 = "c8d060c354b778b329b477d8e78f8c2aa3f5a6b5cc103f1a5af30c971358e5af", .wav_sha256 = "c26a7f655bec00b73c5d9bb352d33d8d48b2629e0a2e75b3e0615ef94bf19241" },
     // one syllable: the shortest render that still has an onset
-    .{ .name = "single syllable", .kind = .phrase, .input = "a", .items = 1, .samples = 10584, .peak = 15986, .zero_crossings = 114, .rms_milli = 3958198, .envelope_sha256 = "3c5018bab5a904216360d5629d715d4a23098c8197d13f4331cb7f0a5580b8fe", .wav_sha256 = "a62ad430e53741188447d842344e26e4fdc72bf86793fb5b84143ab0421f80f9" },
+    .{ .name = "single syllable", .kind = .phrase, .input = "a", .items = 1, .samples = 10584, .peak = 30040, .zero_crossings = 622, .rms_milli = 7194811, .envelope_sha256 = "e11322102a6019d12cb58ed02b1ea588b4fee084720e2fc0649107e788bc46b5", .wav_sha256 = "ddc798b152da85bd76ece014767c00ce25707428df40144af69a6f9c41ac4395" },
     // digits and punctuation are not word characters, so the word splitter
     // has to skip them and still place the syllables correctly
-    .{ .name = "punctuation and digits", .kind = .phrase, .input = "kujamba 123 karibu!", .items = 6, .samples = 79380, .peak = 21565, .zero_crossings = 766, .rms_milli = 4192678, .envelope_sha256 = "46981dc90e5a44a07254e7e492b90d2c99a0675eac67a0c5efcb7177c7a7c245", .wav_sha256 = "ca7703195aa4a5e34da7c7eae0eb1bdfa0b096e206d1f489ec96074077172093" },
-    // wordless farts: no plan, and the noise/wobble path M6 will touch
-    .{ .name = "shuzi seed 0", .kind = .shuzi, .input = "0", .items = 0, .samples = 10143, .peak = 18461, .zero_crossings = 180, .rms_milli = 4662515, .envelope_sha256 = "ff3acaee614295f74be4eec9ae8f1ced7e0d9542a5bfb90cf79c18e5e9068f4c", .wav_sha256 = "7e763663eadf675a0c5a26b05f460af57cb89566d68df11fd10b57796556fa8a" },
-    .{ .name = "shuzi seed 42", .kind = .shuzi, .input = "42", .items = 0, .samples = 34839, .peak = 21395, .zero_crossings = 486, .rms_milli = 4081417, .envelope_sha256 = "effa4312bb20886b185c43f4cada609baebbba77b539af351f7d839e71f38a17", .wav_sha256 = "4c0500f416ca522f8bda17db9a1bb3a11f107be23fda353d6e66268d3e44c46a" },
-    .{ .name = "shuzi seed 1234567", .kind = .shuzi, .input = "1234567", .items = 0, .samples = 10584, .peak = 19089, .zero_crossings = 104, .rms_milli = 4564000, .envelope_sha256 = "369cd4bd42022e93224eb9fb93ba0c0eac937e9f78dfd29a8e6e269498d343eb", .wav_sha256 = "fccfb948356d4697f6bf941a6b5f9dc59fcf712d3438f92919804de9724c20da" },
+    .{ .name = "punctuation and digits", .kind = .phrase, .input = "kujamba 123 karibu!", .items = 6, .samples = 79380, .peak = 31128, .zero_crossings = 3846, .rms_milli = 7177126, .envelope_sha256 = "04a7e5d13e342225eb80dc3ca6ad4c969372cf4247a98be20dd0da6eeb1b513b", .wav_sha256 = "7ea9f9dff4f8a4adeef1b3843389ad259260735c34f0684caf41a3c8d077f274" },
+    // wordless farts: no plan, and the archetype/noise/wobble path
+    .{ .name = "shuzi seed 0", .kind = .shuzi, .input = "0", .items = 0, .samples = 10143, .peak = 30900, .zero_crossings = 640, .rms_milli = 11064764, .envelope_sha256 = "adc2f23b83ebc07303c9133432b33278ff268882220a6807895310f6e8b00ca6", .wav_sha256 = "e1542d0c8e53356e1d4164e2b7e3d23a425cd230a7754ac9ce497f62ec75ae37" },
+    .{ .name = "shuzi seed 42", .kind = .shuzi, .input = "42", .items = 0, .samples = 34839, .peak = 31129, .zero_crossings = 2212, .rms_milli = 13382513, .envelope_sha256 = "659a4dae47980eb6e70219210c75c2eabb77eef50a51769becde27dbb1213c97", .wav_sha256 = "983053678233f8cb87e6637cd89e22b5b7dbb44d1c4591075a5af9a7e4c098af" },
+    .{ .name = "shuzi seed 1234567", .kind = .shuzi, .input = "1234567", .items = 0, .samples = 10584, .peak = 20491, .zero_crossings = 550, .rms_milli = 4629417, .envelope_sha256 = "66d3d9c1e559effda2f1d221b0579ce207cf5a4fade5f75db79f891e0e5c5f18", .wav_sha256 = "ac5f70a4d0383fc50dfcedcc462cf6c61cd7c2d63149f072a170fbb0d0714f8a" },
+    // the pre-physics synth, kept bit for bit behind `--voice legacy=1`:
+    // the same inputs again, so the old sound stays pinned next to the new default
+    .{ .name = "kujamba karibu (legacy)", .kind = .phrase_legacy, .input = "kujamba karibu", .items = 6, .samples = 79380, .peak = 22007, .zero_crossings = 720, .rms_milli = 4173837, .envelope_sha256 = "b689f1368324e2b7abe414e01bdb121730f0bb6e7ffd0bd9a9defcb752f234d1", .wav_sha256 = "21c6faa26eb63b958968a6dfe2fcf33073182be7f34c0cef416894c84b045f3d" },
+    .{ .name = "asante sana kijiji (legacy)", .kind = .phrase_legacy, .input = "asante sana kijiji", .items = 8, .samples = 109368, .peak = 25998, .zero_crossings = 1134, .rms_milli = 4164752, .envelope_sha256 = "a6b896d1bc43543a6827465d36223fa91cf49cefe4b44460fe7a0272efa55a13", .wav_sha256 = "5973bbb55e662d2d47fdef82c2d4ee4b2ba059aa3d760e7801060e1af1d80c07" },
+    .{ .name = "single syllable (legacy)", .kind = .phrase_legacy, .input = "a", .items = 1, .samples = 10584, .peak = 15986, .zero_crossings = 114, .rms_milli = 3958198, .envelope_sha256 = "3c5018bab5a904216360d5629d715d4a23098c8197d13f4331cb7f0a5580b8fe", .wav_sha256 = "a62ad430e53741188447d842344e26e4fdc72bf86793fb5b84143ab0421f80f9" },
+    .{ .name = "punctuation and digits (legacy)", .kind = .phrase_legacy, .input = "kujamba 123 karibu!", .items = 6, .samples = 79380, .peak = 21565, .zero_crossings = 766, .rms_milli = 4192678, .envelope_sha256 = "46981dc90e5a44a07254e7e492b90d2c99a0675eac67a0c5efcb7177c7a7c245", .wav_sha256 = "ca7703195aa4a5e34da7c7eae0eb1bdfa0b096e206d1f489ec96074077172093" },
+    .{ .name = "shuzi seed 0 (legacy)", .kind = .shuzi_legacy, .input = "0", .items = 0, .samples = 10143, .peak = 18461, .zero_crossings = 180, .rms_milli = 4662515, .envelope_sha256 = "ff3acaee614295f74be4eec9ae8f1ced7e0d9542a5bfb90cf79c18e5e9068f4c", .wav_sha256 = "7e763663eadf675a0c5a26b05f460af57cb89566d68df11fd10b57796556fa8a" },
+    .{ .name = "shuzi seed 42 (legacy)", .kind = .shuzi_legacy, .input = "42", .items = 0, .samples = 34839, .peak = 21395, .zero_crossings = 486, .rms_milli = 4081417, .envelope_sha256 = "effa4312bb20886b185c43f4cada609baebbba77b539af351f7d839e71f38a17", .wav_sha256 = "4c0500f416ca522f8bda17db9a1bb3a11f107be23fda353d6e66268d3e44c46a" },
+    .{ .name = "shuzi seed 1234567 (legacy)", .kind = .shuzi_legacy, .input = "1234567", .items = 0, .samples = 10584, .peak = 19089, .zero_crossings = 104, .rms_milli = 4564000, .envelope_sha256 = "369cd4bd42022e93224eb9fb93ba0c0eac937e9f78dfd29a8e6e269498d343eb", .wav_sha256 = "fccfb948356d4697f6bf941a6b5f9dc59fcf712d3438f92919804de9724c20da" },
 };
 
 /// A fingerprint as measured right now, ready to paste into `expected`.
@@ -197,11 +224,13 @@ pub fn measure(alloc: std.mem.Allocator, fp: Fingerprint) !struct { wav: []u8, o
     const wav = switch (fp.kind) {
         .phrase => try synth.renderPhraseWav(alloc, fp.input),
         .shuzi => try synth.renderShuziWav(alloc, try std.fmt.parseInt(u64, fp.input, 10)),
+        .phrase_legacy => try synth.renderPhraseWavWith(alloc, fp.input, legacy_knobs),
+        .shuzi_legacy => try synth.renderShuziWavWith(alloc, try std.fmt.parseInt(u64, fp.input, 10), legacy_knobs),
     };
     errdefer alloc.free(wav);
 
     var items: u32 = 0;
-    if (fp.kind == .phrase) {
+    if (fp.kind == .phrase or fp.kind == .phrase_legacy) {
         var plan = try synth.planPhrase(alloc, fp.input);
         defer plan.deinit(alloc);
         items = @intCast(plan.items.len);

@@ -49,7 +49,7 @@ note61 = "shuzi:3"
 | `pattern` | Bar pattern such as `"3+1"` |
 | `host` | Room address, including optional port |
 | `user`, `pass` | Join-only credentials |
-| `[voice]` | `attack`, `noise`, `wobble`, `intensity`, `cents` |
+| `[voice]` | `attack`, `noise`, `wobble`, `intensity`, `cents`, `pressure`, `tension`, `resonance`, `turbulence`, `wetness`, `rasp`, `decay`, `burst`, `boom`, `seed`, `legacy` |
 | `[map]` | `noteN` bindings to phrase text or `"shuzi:SEED"` |
 
 Connection keys are ignored by offline rendering. The note map is used by

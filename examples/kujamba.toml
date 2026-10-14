@@ -16,12 +16,30 @@ pass = "secret"
 phrase = "kujamba karibu"
 pattern = "3+1"                       # 3 fart bars, then 1 rest bar
 
-# The #18 voice knobs as multipliers on the onset-class table (see the
-# README's tuning section): 1 on every axis is today's sound exactly. A
-# --voice flag on the command line replaces this whole table.
+# The voice knobs (see docs: guides/voice). Every axis is a multiplier, 1 is
+# the default sound exactly; `cents`, `seed` and `legacy` are offsets/switches
+# that default to 0. A --voice flag on the command line replaces this whole
+# table.
 [voice]
 attack = 1.0                          # e.g. 0.5 = snappier onsets
 noise = 1.0                           # e.g. 0    = clean, no attack splat
 wobble = 1.0                          # e.g. 2    = twice the flutter depth
 intensity = 1.0                       # #15: 0.25..4 — whisper to shout
 cents = 0                             # #16: ±1200 — shift every vowel pitch
+
+# The physical model of the fart itself:
+pressure = 1.0                        # intestinal pressure: 0.1..3, loud+high vs timid
+tension = 1.0                         # sphincter tension: 0..3, slack flap vs squeak
+resonance = 1.0                       # terminal tract: 0..3, bare buzz vs ringing vowel
+turbulence = 1.0                      # noise-burst turbulence: 0..4, clean vs airy
+wetness = 1.0                         # bubbles + spluttering tail: 0..4, dry vs soggy
+rasp = 1.0                            # sphincter instability: 0..4, steady vs ragged
+decay = 1.0                           # exponential pitch decay: 0 = flat, 2 = sagging
+burst = 1.0                           # plosive pressure burst on p t k b d g j ch
+boom = 1.0                            # low cavity resonance: chest weight
+seed = 0                              # re-roll the random fingerprint (integer)
+legacy = 0                            # 1 = the pre-physics buzz, bit for bit
+
+# Recipes: thunderous = pressure 1.6, tension 0.6, boom 2.2, decay 0.7
+#          wet        = wetness 2.5, tension 0.8
+#          squeaker   = tension 2, pressure 0.7, decay 1.5, boom 0.3
