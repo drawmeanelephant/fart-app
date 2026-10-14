@@ -107,7 +107,9 @@ fn printUsage(io: std.Io) void {
         \\                       (default 3+1)
         \\    --voice SPEC       synth voice knobs (#18), e.g. "noise=0,wobble=2".
         \\                       Multipliers on each onset class's attack, noise mix
-        \\                       and wobble depth; 1 is today's sound exactly.
+        \\                       and wobble depth, plus intensity, cents, and the
+        \\                       physical layer: pressure, tension, resonance,
+        \\                       turbulence, wet, drop. 1 is today's sound exactly.
         \\    --play MODE        how the phrase maps onto bars:
         \\                       repeat  restart at every fart bar (default)
         \\                       loop    play continuously, wrapping at the end
@@ -164,7 +166,7 @@ fn printUsage(io: std.Io) void {
         \\CONFIG (#22): a TOML-style file of defaults for join, render, play
         \\and trigger —
         \\  host (same syntax as --host, so "name:port" / "[::1]:port"), user,
-        \\  pass, phrase, pattern, a [voice] table with attack/noise/wobble
+        \\  pass, phrase, pattern, a [voice] table with the synth's knob
         \\  multipliers, and a [map] table binding `noteN = phrase|shuzi:seed`
         \\  for `trigger` (#21). Values apply defaults <- config <- flags, so a flag
         \\  always wins over the file; a --voice flag replaces the whole

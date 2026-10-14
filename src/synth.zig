@@ -6,14 +6,28 @@
 //! else, so the same phrase always produces byte-identical WAV bytes. Always.
 //!
 //! One fart "phoneme" (one Swahili syllable) is:
-//!   * a low-frequency buzzy oscillator whose pitch falls 20% across the syllable
-//!   * a filtered noise burst at the attack (the "splat") plus a quiet
-//!     low-passed body hiss
-//!   * an amplitude envelope with a fast attack and a ~24-34 Hz flutter wobble
+//!   * a low-frequency buzzy oscillator with a sub-octave belly, soft-clipped
+//!     for fatness, whose pitch sags *exponentially* as the vent pressure
+//!     collapses (fast drop early, settling late — real deflation)
+//!   * a sphincter flutter that wobbles amplitude *and* pitch at ~24-34 Hz
+//!     with a slowly drifting rate, so it reads as muscle rather than LFO
+//!   * filtered noise: a decaying attack burst (the "splat"), a quiet
+//!     low-passed body hiss, a turbulence layer chopped into sputtering
+//!     bursts by a slow random gate, and a raspy high edge under tension
+//!   * a plosive layer for stop consonants (k, p, t, b, d, g): a ~7 ms
+//!     pressure-hold dip, then a release burst of click + low thump
+//!   * two resonant formant bandpasses tuned per vowel — the terminal tract
+//!   * an amplitude envelope with a fast attack, pressure-coupled decay and
+//!     a hard taper to exact zero (the loop-wrap invariant depends on it)
+//!
+//! Six physical knobs (`pressure`, `tension`, `resonance`, `turbulence`,
+//! `wet`, `drop`) shape the instrument; see `VoiceKnobs` for what each does
+//! to the sound.
 //!
 //! Swahili is nearly pure CV. `Scanner` splits a word into syllables: each
-//! vowel picks the base pitch, the consonant onset picks the attack/decay
-//! character, and the syllable count sets the total duration.
+//! vowel picks the base pitch and the formant pair, the consonant onset
+//! picks the attack/decay character and the plosive strength, and the
+//! syllable count sets the total duration.
 //! The full mapping tables live in README.md.
 //!
 //! Vocabulary note: kujamba = to fart, shuzi = a fart. Use them proudly.
@@ -89,17 +103,20 @@ pub fn voiceSpec(cls: VoiceClass) VoiceSpec {
 /// class keeps its character — `--voice wobble=2` doubles the wobble of every
 /// class instead of flattening them all to one number.
 ///
-/// Two more axes ride along and are applied by the renderer rather than by
-/// `apply`, because neither belongs to the onset class: `intensity` (#15) is
+/// More axes ride along and are applied by the renderer rather than by
+/// `apply`, because none belongs to the onset class: `intensity` (#15) is
 /// vocal effort — it reaches the level, the noise mix and the stress emphasis,
 /// which `apply` never sees — and `cents` (#16) transposes the vowel pitch
-/// table, which is a property of the vowel, not of the consonant onset.
+/// table, which is a property of the vowel, not of the consonant onset. The
+/// physical layer is the same: `pressure`, `tension`, `resonance`,
+/// `turbulence`, `wet` and `drop` describe the instrument, not the onset.
 ///
 /// The default is 1.0 on every multiplier and 0 on `cents`, and `x * 1.0` is
 /// exact in IEEE-754, so an untouched `VoiceKnobs` reproduces the class table
 /// bit for bit. That is load-bearing, not decorative: the golden fingerprints
-/// in `src/golden.zig` assert it, and all seven of them have to keep passing
-/// unchanged.
+/// in `src/golden.zig` assert the default voice, so any deliberate change to
+/// the stock sound means re-baselining them — as the physical-layer knobs did
+/// when they made the default fart richer.
 pub const VoiceKnobs = struct {
     /// scales `attack_s`
     attack: f32 = 1.0,
@@ -117,6 +134,30 @@ pub const VoiceKnobs = struct {
     /// up, -1200 down), so a preset can pick a different "instrument". An
     /// offset, not a multiplier — negative is meaningful, not an error.
     cents: f32 = 0.0,
+    /// Intestinal pressure, a multiplier. Higher pressure starts the pitch
+    /// higher, hits louder, drives stronger plosive bursts and vents faster
+    /// (the tail collapses sooner). Low pressure is a weak, straining wheeze.
+    pressure: f32 = 1.0,
+    /// Sphincter tension, a multiplier. Higher tension raises the pitch,
+    /// speeds up and shallows the flutter, thins the sub-octave belly and adds
+    /// a raspy ~3.4 kHz edge — dry and squeaky. Lower is loose, slow, flappy
+    /// and sub-heavy — thunderous.
+    tension: f32 = 1.0,
+    /// Terminal-tract resonance. Scales the gain and sharpness of the vowel
+    /// formant resonators: 0 is a flat wideband splat, high values ring and
+    /// honk and make the vowel color unmistakable.
+    resonance: f32 = 1.0,
+    /// Noise-burst turbulence: a slow random gate that chops the breath noise
+    /// into sputtering bursts across the whole syllable, not just the attack.
+    /// 0 is a pure flutter tone; high values splutter and splatter.
+    turbulence: f32 = 1.0,
+    /// Wetness. Slow random gurgle modulates the buzz's amplitude and pitch
+    /// and fattens the body hiss — bubbly and goopy at high values, dry at 0.
+    wet: f32 = 1.0,
+    /// Exponential pitch-drop rate: how hard the pitch sags as the vent
+    /// pressure collapses. 0 holds pitch steady, 1 is a natural sag, high
+    /// values dive-bomb.
+    drop: f32 = 1.0,
 
     /// Bounds on the *resulting* spec, not on the multipliers. Each one exists
     /// because the value feeds arithmetic that breaks outside its range.
@@ -139,6 +180,18 @@ pub const VoiceKnobs = struct {
     /// #16: one octave either way. Beyond that the buzzy oscillator leaves the
     /// instrument's register (at -1200 the lowest vowel is a 37 Hz rumble).
     pub const max_abs_cents: f32 = 1200.0;
+    /// The physical layer's useful ranges. Pressure and tension floor above 0
+    /// for the same reason intensity does: they multiply pitch and level, and
+    /// 0 would be silence or a DC flatline. Resonance, turbulence, wet and
+    /// drop are texture amounts — 0 is a legitimate dry/clean/steady sound.
+    pub const min_pressure: f32 = 0.25;
+    pub const max_pressure: f32 = 4.0;
+    pub const min_tension: f32 = 0.25;
+    pub const max_tension: f32 = 4.0;
+    pub const max_resonance: f32 = 3.0;
+    pub const max_turbulence: f32 = 3.0;
+    pub const max_wet: f32 = 3.0;
+    pub const max_drop: f32 = 4.0;
 
     /// `2^(cents/1200)` — the factor every base frequency is multiplied by,
     /// with `cents` clamped to one octave either way. The `cents == 0` branch
@@ -155,6 +208,37 @@ pub const VoiceKnobs = struct {
     /// into its useful range, so a preset can never mute the instrument.
     pub fn effort(self: VoiceKnobs) f32 {
         return std.math.clamp(self.intensity, min_intensity, max_intensity);
+    }
+
+    /// `pressure` clamped into its useful range — it multiplies pitch and
+    /// level, so like `intensity` it can never reach 0 and mute the fart.
+    pub fn pressureEff(self: VoiceKnobs) f32 {
+        return std.math.clamp(self.pressure, min_pressure, max_pressure);
+    }
+
+    /// `tension` clamped: it scales pitch and flutter rate.
+    pub fn tensionEff(self: VoiceKnobs) f32 {
+        return std.math.clamp(self.tension, min_tension, max_tension);
+    }
+
+    /// `resonance` clamped; 0 (flat tract, no ring) is a real sound.
+    pub fn resonanceEff(self: VoiceKnobs) f32 {
+        return std.math.clamp(self.resonance, 0.0, max_resonance);
+    }
+
+    /// `turbulence` clamped; 0 (no sputter) is a real sound.
+    pub fn turbulenceEff(self: VoiceKnobs) f32 {
+        return std.math.clamp(self.turbulence, 0.0, max_turbulence);
+    }
+
+    /// `wet` clamped; 0 (dry) is a real sound.
+    pub fn wetEff(self: VoiceKnobs) f32 {
+        return std.math.clamp(self.wet, 0.0, max_wet);
+    }
+
+    /// `drop` clamped; 0 holds the pitch steady for the whole syllable.
+    pub fn dropEff(self: VoiceKnobs) f32 {
+        return std.math.clamp(self.drop, 0.0, max_drop);
     }
 
     /// The class table with the knobs applied. `wobble_hz` is deliberately
@@ -179,7 +263,8 @@ pub const KnobsError = error{ UnknownKnob, MalformedKnob, NotFinite, Negative };
 /// identity, which is what `--voice ""` and an omitted flag both mean.
 /// `intensity` and `cents` (#15, #16) take the same spelling: `intensity` is
 /// a multiplier (>= 0), `cents` an offset in cents and the one key a negative
-/// value is meaningful for.
+/// value is meaningful for. The physical layer — `pressure`, `tension`,
+/// `resonance`, `turbulence`, `wet`, `drop` — are all multipliers too.
 pub fn parseKnobs(s: []const u8) KnobsError!VoiceKnobs {
     var knobs = VoiceKnobs{};
     var it = std.mem.splitScalar(u8, s, ',');
@@ -202,6 +287,18 @@ pub fn parseKnobs(s: []const u8) KnobsError!VoiceKnobs {
             knobs.intensity = v;
         } else if (std.mem.eql(u8, key, "cents")) {
             knobs.cents = v;
+        } else if (std.mem.eql(u8, key, "pressure")) {
+            knobs.pressure = v;
+        } else if (std.mem.eql(u8, key, "tension")) {
+            knobs.tension = v;
+        } else if (std.mem.eql(u8, key, "resonance")) {
+            knobs.resonance = v;
+        } else if (std.mem.eql(u8, key, "turbulence")) {
+            knobs.turbulence = v;
+        } else if (std.mem.eql(u8, key, "wet")) {
+            knobs.wet = v;
+        } else if (std.mem.eql(u8, key, "drop")) {
+            knobs.drop = v;
         } else return error.UnknownKnob;
     }
     return knobs;
@@ -223,6 +320,20 @@ pub fn classify(onset: []const u8) VoiceClass {
 // Sample rendering
 // ---------------------------------------------------------------------
 
+/// The terminal-tract formants a vowel rings at: two resonant bandpasses,
+/// tuned a fourth or so below speech formants — this tract is not a mouth.
+/// The breath syllable (vowel 0) gets a wide, low midrange pair.
+pub fn vowelFormants(v: u8) [2]f32 {
+    return switch (v) {
+        'a' => .{ 380.0, 980.0 }, // open: bright, broad
+        'e' => .{ 340.0, 1500.0 }, // fronted: a higher edge
+        'i' => .{ 280.0, 1900.0 }, // tight: buzzy, nasal ring
+        'o' => .{ 340.0, 760.0 }, // rounded: dark honk
+        'u' => .{ 260.0, 620.0 }, // closed: tubby, throaty
+        else => .{ 300.0, 900.0 }, // breath syllable: neutral tract
+    };
+}
+
 const VoiceParams = struct {
     f0: f32,
     attack_s: f32,
@@ -231,7 +342,27 @@ const VoiceParams = struct {
     wobble_depth: f32,
     level: f32,
     glide: f32,
+    // Physical layer, already knob-resolved by the caller. Defaults are the
+    // stock tract so a VoiceParams literal that names only the old fields
+    // still describes the default instrument.
+    pressure: f32 = 1.0, // intestinal pressure multiplier
+    tension: f32 = 1.0, // sphincter tension multiplier
+    resonance: f32 = 1.0, // formant resonator amount/sharpness
+    turbulence: f32 = 1.0, // stochastic noise-burst sputter amount
+    wet: f32 = 1.0, // gurgle depth
+    drop: f32 = 1.0, // exponential pitch-sag rate multiplier
+    plosive: f32 = 0.0, // stop-onset release burst strength (0 = no closure)
+    f1: f32 = 300.0, // tract formant 1, Hz
+    f2: f32 = 900.0, // tract formant 2, Hz
 };
+
+/// Cubic soft clipper: `x(27+x²)/(27+9x²)` tracks tanh within a percent but
+/// needs no libcall. Saturation adds the odd harmonics that make the buzz
+/// fat instead of flute-like, and gently squashes the loudest peaks.
+fn softClip(x: f32) f32 {
+    const x2 = x * x;
+    return x * (27.0 + x2) / (27.0 + 9.0 * x2);
+}
 
 /// #15: one syllable's spec under vocal effort `eff`. Level and noise mix
 /// scale together — a shout is louder *and* splattier, a whisper quiet and
@@ -252,43 +383,168 @@ fn stressBoost(eff: f32) f32 {
 
 /// Renders one fart phoneme into `out` (mono i16). Deterministic: the only
 /// randomness comes from `prng`, whose seed is fixed per render.
+///
+/// The model, roughly: intestinal pressure pushes air through a fluttering
+/// aperture (the carrier, amplitude-modulated by the flap) and the turbulent
+/// jet makes noise; the terminal tract's two formants ring on top. Pressure
+/// vents exponentially, so pitch and amplitude sag with it.
 fn synthInto(out: []i16, p: VoiceParams, prng: *std.Random.DefaultPrng) void {
     const dt: f32 = 1.0 / @as(f32, SAMPLE_RATE);
     const tau: f32 = std.math.tau;
     var phase: f32 = 0;
+    var sub_phase: f32 = 0;
     var lp_body: f32 = 0;
     var lp_burst: f32 = 0;
+    var lp_sput: f32 = 0; // sputter texture band, ~2.4 kHz
+    var lp_edge: f32 = 0; // raspy edge band for high tension, ~3.4 kHz
     const alpha_body: f32 = 1.0 - @exp(-tau * 700.0 * dt);
     const alpha_burst: f32 = 1.0 - @exp(-tau * 1900.0 * dt);
-    const wobble_phase: f32 = prng.random().float(f32) * tau;
-    const wobble_hz: f32 = p.wobble_hz * (0.9 + 0.2 * prng.random().float(f32));
+    const alpha_sput: f32 = 1.0 - @exp(-tau * 2400.0 * dt);
+    const alpha_edge: f32 = 1.0 - @exp(-tau * 3400.0 * dt);
+    const r = prng.random();
+    const wobble_phase: f32 = r.float(f32) * tau;
+    const drift_phase: f32 = r.float(f32) * tau;
+    const wobble_hz: f32 = p.wobble_hz * (0.9 + 0.2 * r.float(f32));
+
+    // Slow modulators. A one-pole LP at ~6 Hz would squash white noise to a
+    // wiggle of a few percent, so the gurgle and the turbulence gate are sums
+    // of incommensurate sinusoids with per-syllable random phases instead —
+    // smooth pseudo-random wander with real depth, still deterministic.
+    const gurgle_ph = [2]f32{ r.float(f32) * tau, r.float(f32) * tau };
+    const gurgle_hz = [2]f32{ 6.0 + 2.5 * r.float(f32), 11.0 + 4.0 * r.float(f32) };
+    const sput_ph = [3]f32{ r.float(f32) * tau, r.float(f32) * tau, r.float(f32) * tau };
+    const sput_hz = [3]f32{ 3.5 + 1.5 * r.float(f32), 6.5 + 2.5 * r.float(f32), 9.5 + 3.0 * r.float(f32) };
+
+    // Terminal tract: two Chamberlin SVF bandpasses, one per vowel formant.
+    // `damp` falls as `resonance` rises, so the knob both sharpens the ring
+    // and (through the `damp` gain compensation below) leaves its loudness to
+    // `res_gain` alone.
+    const f1c = std.math.clamp(p.f1, 60.0, 3000.0);
+    const f2c = std.math.clamp(p.f2, 60.0, 4000.0);
+    const g1 = 2.0 * @sin(std.math.pi * f1c * dt);
+    const g2 = 2.0 * @sin(std.math.pi * f2c * dt);
+    const damp = std.math.clamp(0.55 - 0.15 * p.resonance, 0.08, 0.55);
+    const res_gain = p.resonance * 0.6;
+    var f1_low: f32 = 0;
+    var f1_band: f32 = 0;
+    var f2_low: f32 = 0;
+    var f2_band: f32 = 0;
+
+    // Exponential pitch decay: pitch sags as the vent pressure collapses,
+    // normalized so the total drop across the syllable is `drop_amt` —
+    // `glide * drop` — with most of the fall early, like real deflation.
+    const drop_amt = std.math.clamp(p.glide * p.drop, 0.0, 0.85);
+    const vent_tau: f32 = 0.30; // pressure vents over ~30% of the syllable
+    const drop_norm = 1.0 - @exp(-1.0 / vent_tau);
+
+    // Higher pressure hits harder and vents sooner.
+    const press_rate = std.math.clamp(0.8 + 0.5 * (p.pressure - 1.0), 0.3, 2.5);
+    const decay_pow = 1.3 * (0.75 + 0.25 * p.pressure);
+    // Tension trades belly for rasp: low tension keeps a fat sub-octave,
+    // high tension grows a 3.4 kHz scratch band.
+    const sub_gain = 0.42 * std.math.clamp(1.6 - 0.6 * p.tension, 0.0, 1.3);
+    const edge_gain = std.math.clamp(p.tension - 1.0, 0.0, 2.0) * 0.16;
+    // Plosive geometry: a ~7 ms closure dip in the carrier, then a ~14 ms
+    // release burst of click + low thump. Zero plosive skips both.
+    const hold_n: usize = @intFromFloat(0.007 * @as(f32, SAMPLE_RATE));
+    const plosive_n: usize = @intFromFloat(0.014 * @as(f32, SAMPLE_RATE));
+    const plosive_gain = p.plosive * (0.6 + 0.4 * p.pressure);
+    // Everything the envelope does must still land on exact zero at the last
+    // sample (the loop-mode wrap test asserts it), so the last 64 samples get
+    // a hard linear taper on top of the natural decay.
     const n = out.len;
+    const nf: f32 = @floatFromInt(n);
     for (0..n) |i| {
         const fi: f32 = @floatFromInt(i);
         const t = fi * dt;
-        const u = fi / @as(f32, @floatFromInt(n));
+        const u = fi / nf;
 
-        // Buzzy low-frequency oscillator, pitch gliding down ~20%.
-        const f = p.f0 * (1.0 - p.glide * u);
+        const press_env = @exp(-u * press_rate);
+
+        // Wetness: a slow pseudo-random gurgle rides the buzz's amplitude and
+        // pitch — two beating low sinusoids per syllable, so it wanders like
+        // liquid rather than buzzing like an LFO.
+        const gurgle = 0.6 * @sin(tau * gurgle_hz[0] * t + gurgle_ph[0]) +
+            0.4 * @sin(tau * gurgle_hz[1] * t + gurgle_ph[1]);
+        const gurgle_am = 1.0 + p.wet * 0.40 * gurgle;
+        const gurgle_fm = 1.0 + p.wet * 0.05 * gurgle;
+
+        // The flap rate drifts slowly so the flutter reads as muscle, not LFO.
+        const wob_rate = wobble_hz * (1.0 + 0.14 * @sin(tau * 0.9 * t + drift_phase));
+        const flap = @sin(tau * wob_rate * t + wobble_phase);
+        const wob = 1.0 - p.wobble_depth * (0.5 + 0.5 * flap);
+
+        // Pitch: exponential sag + flutter FM (the aperture's flutter beats
+        // the stream too) + gurgle wander.
+        const sag = 1.0 - drop_amt * (1.0 - @exp(-u / vent_tau)) / drop_norm;
+        const f = p.f0 * sag * gurgle_fm * (1.0 + 0.05 * p.tension * flap * p.wobble_depth);
         phase += tau * f * dt;
         if (phase >= tau) phase -= tau;
-        const carrier = (@sin(phase) + 0.55 * @sin(2.0 * phase) + 0.30 * @sin(3.0 * phase) + 0.12 * @sin(4.0 * phase)) * 0.42;
+        sub_phase += tau * f * 0.5 * dt;
+        if (sub_phase >= tau) sub_phase -= tau;
+        var carrier = @sin(phase) + 0.55 * @sin(2.0 * phase) + 0.30 * @sin(3.0 * phase) + 0.12 * @sin(4.0 * phase);
+        carrier = softClip((carrier + sub_gain * @sin(sub_phase)) * (0.42 + 0.10 * p.pressure));
+        // A stop holds the pressure for a beat before releasing it.
+        if (i < hold_n and p.plosive > 0) {
+            const h = fi / @as(f32, @floatFromInt(hold_n));
+            carrier *= 0.25 + 0.75 * h * h;
+        }
 
-        // Filtered noise: a decaying attack burst + a quiet body hiss.
+        // Plosive release: a click plus a low thump, in the first ~14 ms.
+        var plos: f32 = 0;
+        if (i < plosive_n and p.plosive > 0) {
+            const pc = prng.random().float(f32) * 2.0 - 1.0;
+            plos = plosive_gain * (0.65 * pc * @exp(-t / 0.004) + 0.9 * @sin(tau * 62.0 * t) * @exp(-t / 0.022));
+        }
+
+        // Turbulence: the breath band chopped into sputtering bursts by a
+        // slow pseudo-random gate — irregular splatter rather than a steady
+        // hiss. The gate spends real time near zero, so bursts cluster.
+        const sput_lfo = 0.5 * @sin(tau * sput_hz[0] * t + sput_ph[0]) +
+            0.35 * @sin(tau * sput_hz[1] * t + sput_ph[1]) +
+            0.30 * @sin(tau * sput_hz[2] * t + sput_ph[2]);
+        const sput_gate = std.math.clamp(1.7 * (sput_lfo - 0.10), 0.0, 1.0);
+        const wn_sp = prng.random().float(f32) * 2.0 - 1.0;
+        lp_sput += alpha_sput * (wn_sp - lp_sput);
+        const sputter = lp_sput * sput_gate * p.turbulence * 0.85;
+
+        // Filtered noise: a decaying attack burst + a quiet body hiss + the
+        // sputter layer + the tension edge.
         const wn_body = prng.random().float(f32) * 2.0 - 1.0;
         lp_body += alpha_body * (wn_body - lp_body);
         const wn_burst = prng.random().float(f32) * 2.0 - 1.0;
         lp_burst += alpha_burst * (wn_burst - lp_burst);
+        const wn_edge = prng.random().float(f32) * 2.0 - 1.0;
+        lp_edge += alpha_edge * (wn_edge - lp_edge);
         const burst_env = @exp(-t / 0.045);
-        const noise = lp_body * 0.35 + lp_burst * 0.9 * burst_env;
+        const noise = lp_body * (0.30 + 0.15 * p.wet) + lp_burst * 0.9 * burst_env + sputter + lp_edge * edge_gain;
 
-        // Envelope: fast attack, decay to zero, fluttering at ~24-34 Hz.
+        const dry = carrier * gurgle_am + p.noise_mix * noise + plos;
+
+        // The tract rings on the dry mix: two resonant bandpasses whose band
+        // output peaks near input level once damp-normalized.
+        f1_low += g1 * f1_band;
+        const f1_high = dry - f1_low - damp * f1_band;
+        f1_band += g1 * f1_high;
+        f2_low += g2 * f2_band;
+        const f2_high = dry - f2_low - damp * f2_band;
+        f2_band += g2 * f2_high;
+        const formant = res_gain * damp * (f1_band + 0.7 * f2_band);
+
+        // Envelope: fast attack, decay to zero, venting with the pressure,
+        // fluttering at ~24-34 Hz.
         const attack = @min(1.0, t / p.attack_s);
-        const decay = std.math.pow(f32, 1.0 - u, 1.3);
-        const env = attack * decay;
-        const wob = 1.0 - p.wobble_depth * (0.5 + 0.5 * @sin(tau * wobble_hz * t + wobble_phase));
+        const decay = std.math.pow(f32, 1.0 - u, decay_pow);
+        const vent = 0.35 + 0.65 * press_env;
+        const tail = @min(1.0, (nf - fi) / 64.0);
+        const env = attack * decay * vent * tail;
 
-        var x = (carrier + p.noise_mix * noise) * env * wob * p.level;
+        // Master trim: the added layers (sub, saturation, formants, plosives)
+        // run the pre-clip signal hot, and hot is good — but only at the
+        // transient. 0.62 keeps the steady state under the rail so level
+        // differences (stress, effort, pressure) stay audible instead of
+        // being squashed flat against the clip.
+        var x = (dry + formant) * env * wob * p.level * 0.62;
         if (x > 0.95) x = 0.95;
         if (x < -0.95) x = -0.95;
         out[i] = @intFromFloat(@round(x * 32767.0));
@@ -298,6 +554,17 @@ fn synthInto(out: []i16, p: VoiceParams, prng: *std.Random.DefaultPrng) void {
 fn renderSyllableInto(out: []i16, syl: *const Syll, stressed: bool, prng: *std.Random.DefaultPrng, knobs: VoiceKnobs) void {
     const eff = knobs.effort();
     const pitch = knobs.pitchFactor();
+    // A stressed syllable is *pushed*, not just louder: the loudness emphasis
+    // lands on `level` below, and here the same accent adds a little pressure
+    // — brighter pitch, harder onset, faster vent. The bump tracks how much
+    // emphasis effort left intact, so a whisper still has no dynamic shape.
+    const boost = if (syl.vowel != 0 and stressed) stressBoost(eff) else 1.0;
+    const pressure = std.math.clamp(
+        knobs.pressureEff() * (1.0 + (boost - 1.0) * 0.9),
+        VoiceKnobs.min_pressure,
+        VoiceKnobs.max_pressure,
+    );
+    const tension = knobs.tensionEff();
     var p: VoiceParams = undefined;
     if (syl.vowel == 0) {
         // Consonant-only tail: a short whisper, not a buzz. The knobs reach this
@@ -307,7 +574,9 @@ fn renderSyllableInto(out: []i16, syl: *const Syll, stressed: bool, prng: *std.R
         p = .{ .f0 = 88.0 * pitch, .attack_s = spec.attack_s, .noise_mix = spec.noise_mix, .wobble_hz = spec.wobble_hz, .wobble_depth = spec.wobble_depth, .level = spec.level, .glide = 0.15 };
         applyEffort(&p, eff);
     } else {
-        const spec = knobs.apply(voiceSpec(classify(syl.onset())));
+        const cls = classify(syl.onset());
+        const spec = knobs.apply(voiceSpec(cls));
+        const fm = vowelFormants(syl.vowel);
         p = .{
             .f0 = vowelBaseFreq(syl.vowel).? * pitch,
             .attack_s = spec.attack_s,
@@ -316,17 +585,45 @@ fn renderSyllableInto(out: []i16, syl: *const Syll, stressed: bool, prng: *std.R
             .wobble_depth = spec.wobble_depth,
             .level = spec.level,
             .glide = PITCH_DROP,
+            // Stops are closures: the tract seals, pressure builds, then lets
+            // go in a burst. Voiceless stops snap hardest; voiced ones thump.
+            .plosive = switch (cls) {
+                .stop_voiceless => 1.0,
+                .stop_voiced => 0.75,
+                else => 0.0,
+            },
+            .f1 = fm[0],
+            .f2 = fm[1],
         };
         applyEffort(&p, eff);
         // Swahili stresses the penultimate syllable of a word. The emphasis
         // rides on effort (#15): a shout pushes it past the stock 1.2, and a
         // whisper flatlines it — a whispered word has no dynamic shape.
-        if (stressed) p.level *= stressBoost(eff);
+        p.level *= boost;
     }
-    // Per-syllable jitter, still a pure function of (phrase, syllable index).
+    // The physical layer: the knobs resolve once per syllable and ride the
+    // same paths a body would — pressure pushes pitch and level up and vents
+    // faster; tension raises pitch and flutter rate while loosening the flap.
+    p.pressure = pressure;
+    p.tension = tension;
+    p.resonance = knobs.resonanceEff();
+    p.turbulence = knobs.turbulenceEff();
+    p.wet = knobs.wetEff();
+    p.drop = knobs.dropEff();
+    p.f0 *= std.math.pow(f32, tension, 0.5) * std.math.pow(f32, pressure, 0.30);
+    p.level *= @sqrt(pressure);
+    p.wobble_hz = std.math.clamp(p.wobble_hz * std.math.pow(f32, tension, 0.8), 8.0, 90.0);
+    p.wobble_depth = std.math.clamp(p.wobble_depth / @sqrt(tension), 0.0, VoiceKnobs.max_wobble_depth);
+    // Per-syllable jitter, still a pure function of (phrase, syllable index):
+    // each syllable gets its own pitch, flap rate and tract texture so the
+    // phrase does not sound like a looped sample.
     const r = prng.random();
     p.f0 *= 1.0 + (r.float(f32) - 0.5) * 0.06;
     p.wobble_hz += (r.float(f32) - 0.5) * 3.0;
+    p.wet = std.math.clamp(p.wet * (0.85 + 0.3 * r.float(f32)), 0.0, VoiceKnobs.max_wet);
+    p.turbulence = std.math.clamp(p.turbulence * (0.85 + 0.3 * r.float(f32)), 0.0, VoiceKnobs.max_turbulence);
+    p.f1 *= 1.0 + (r.float(f32) - 0.5) * 0.12;
+    p.f2 *= 1.0 + (r.float(f32) - 0.5) * 0.12;
     synthInto(out, p, prng);
 }
 
@@ -602,20 +899,40 @@ pub fn renderShuziWavWith(allocator: std.mem.Allocator, seed: u64, knobs: VoiceK
     while (i < n_syl) : (i += 1) {
         const dur_ms: usize = (16 + r.uintLessThan(usize, 19)) * 10; // 160..340 ms
         const classes = [_]VoiceClass{ .stop_voiced, .stop_voiceless, .fricative, .nasal, .liquid };
-        const spec = knobs.apply(voiceSpec(classes[r.uintLessThan(usize, classes.len)]));
+        const cls = classes[r.uintLessThan(usize, classes.len)];
+        const spec = knobs.apply(voiceSpec(cls));
         const gap_ms: usize = if (i + 1 < n_syl) (3 + r.uintLessThan(usize, 5)) * 10 else 0; // 30..70 ms
+        // A wordless fart still has a tract: pick a random vowel-shaped
+        // formant pair and a random physique per segment, then let the knobs
+        // scale them. That is where the variety between seeds comes from.
+        const fm = vowelFormants("aeiou"[r.uintLessThan(usize, 5)]);
+        const pressure = (0.7 + 0.9 * r.float(f32)) * knobs.pressureEff();
+        const tension = (0.5 + 1.0 * r.float(f32)) * knobs.tensionEff();
         segs[i] = .{
             .params = .{
-                .f0 = 70.0 + 40.0 * r.float(f32),
+                .f0 = (70.0 + 40.0 * r.float(f32)) * std.math.pow(f32, tension, 0.5) * std.math.pow(f32, pressure, 0.30),
                 .attack_s = spec.attack_s,
                 // no clamp: this path's +0.10 already sits past the class
                 // table's 1.0 cap, and clamping it now would move today's
                 // bytes; effort multiplies what is there
                 .noise_mix = (spec.noise_mix + 0.10) * eff,
-                .wobble_hz = 24.0 + 10.0 * r.float(f32),
+                .wobble_hz = std.math.clamp((24.0 + 10.0 * r.float(f32)) * std.math.pow(f32, tension, 0.8), 8.0, 90.0),
                 .wobble_depth = 0.45 + 0.15 * r.float(f32),
-                .level = 1.0 * eff,
+                .level = 1.0 * eff * @sqrt(pressure),
                 .glide = PITCH_DROP,
+                .pressure = pressure,
+                .tension = tension,
+                .resonance = (0.5 + 1.0 * r.float(f32)) * knobs.resonanceEff(),
+                .turbulence = (0.5 + 1.2 * r.float(f32)) * knobs.turbulenceEff(),
+                .wet = (0.3 + 1.2 * r.float(f32)) * knobs.wetEff(),
+                .drop = (0.6 + 1.2 * r.float(f32)) * knobs.dropEff(),
+                .plosive = switch (cls) {
+                    .stop_voiceless => 1.0,
+                    .stop_voiced => 0.75,
+                    else => 0.0,
+                },
+                .f1 = fm[0],
+                .f2 = fm[1],
             },
             .len = dur_ms * SAMPLE_RATE / 1000,
             .gap_after = gap_ms * SAMPLE_RATE / 1000,
@@ -999,6 +1316,13 @@ test "voice knobs: each axis actually changes the audio" {
         .{ .name = "intensity", .knobs = .{ .intensity = 2.0 } },
         .{ .name = "cents up", .knobs = .{ .cents = 700 } },
         .{ .name = "cents down", .knobs = .{ .cents = -700 } },
+        // the physical layer: each of these has to actually reach the DSP
+        .{ .name = "pressure", .knobs = .{ .pressure = 2.0 } },
+        .{ .name = "tension", .knobs = .{ .tension = 2.0 } },
+        .{ .name = "resonance", .knobs = .{ .resonance = 0.0 } },
+        .{ .name = "turbulence", .knobs = .{ .turbulence = 0.0 } },
+        .{ .name = "wet", .knobs = .{ .wet = 0.0 } },
+        .{ .name = "drop", .knobs = .{ .drop = 0.0 } },
     };
     for (axes) |ax| {
         const out = try renderPhraseWavWith(alloc, "kujamba karibu", ax.knobs);
@@ -1018,6 +1342,11 @@ test "voice knobs: extremes are clamped, never NaN and never inverted" {
         .{ .attack = 1e9, .noise = 1e9, .wobble = 1e9 },
         .{ .intensity = 0.0, .cents = -1e9 },
         .{ .intensity = 1e9, .cents = 1e9, .noise = 1e9 },
+        // the physical layer at every rail at once: resonance 0 removes the
+        // formants entirely, drop 1e9 pins the pitch at its floor — neither
+        // may produce a NaN or silence
+        .{ .pressure = 1e9, .tension = 1e9, .resonance = 1e9, .turbulence = 1e9, .wet = 1e9, .drop = 1e9 },
+        .{ .pressure = 0.0, .tension = 0.0, .resonance = 0.0, .turbulence = 0.0, .wet = 0.0, .drop = 0.0 },
     };
     for (wild) |knobs| {
         const out = try renderPhraseSamplesWith(alloc, "kujamba karibu", knobs);
@@ -1099,6 +1428,17 @@ test "voice knob parsing accepts order, whitespace and rejects nonsense" {
     const dyn = try parseKnobs("intensity=2, cents=-700");
     try testing.expectEqual(@as(f32, 2.0), dyn.intensity);
     try testing.expectEqual(@as(f32, -700.0), dyn.cents);
+
+    // the physical layer parses like every other multiplier
+    const phys = try parseKnobs("pressure=1.8,tension=0.6, resonance=2, turbulence=1.5,wet=0.7, drop=3");
+    try testing.expectEqual(@as(f32, 1.8), phys.pressure);
+    try testing.expectEqual(@as(f32, 0.6), phys.tension);
+    try testing.expectEqual(@as(f32, 2.0), phys.resonance);
+    try testing.expectEqual(@as(f32, 1.5), phys.turbulence);
+    try testing.expectEqual(@as(f32, 0.7), phys.wet);
+    try testing.expectEqual(@as(f32, 3.0), phys.drop);
+    try testing.expectError(error.Negative, parseKnobs("pressure=-1"));
+    try testing.expectError(error.Negative, parseKnobs("drop=-1"));
     try testing.expectError(error.Negative, parseKnobs("intensity=-1"));
     try testing.expectError(error.NotFinite, parseKnobs("cents=nan"));
     try testing.expectError(error.UnknownKnob, parseKnobs("pitch=2"));

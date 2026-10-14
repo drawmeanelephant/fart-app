@@ -26,15 +26,24 @@ Knobs scale the existing onset classes rather than replacing their character.
 | `wobble` | Multiplier on flutter depth, not its rate | `1` |
 | `intensity` | Effort: level, noise, and stress emphasis | `1` |
 | `cents` | Vowel pitch offset; 100 cents is one semitone | `0` |
+| `pressure` | Intestinal pressure: louder, higher onset pitch, harder plosive bursts, faster venting | `1` |
+| `tension` | Sphincter tension: high is tight, squeaky and raspy; low is loose, flappy and sub-heavy | `1` |
+| `resonance` | Terminal-tract resonance: how hard the vowel formants ring; 0 is a flat splat | `1` |
+| `turbulence` | Sputtering noise bursts chopped by a slow random gate; 0 is a pure flutter tone | `1` |
+| `wet` | Slow gurgle on amplitude and pitch plus a fatter hiss; 0 is dry | `1` |
+| `drop` | Exponential pitch sag as pressure vents; 0 holds pitch, high dive-bombs | `1` |
 
 Applied attack time is clamped to 0.5–200 ms; applied noise and wobble depth
-are clamped to 0–1. Effort is clamped to 0.25–4 and pitch to ±1200 cents.
+are clamped to 0–1. Effort, pressure and tension are clamped to 0.25–4, pitch
+to ±1200 cents, resonance/turbulence/wet to 0–3 and drop to 0–4.
 These are effective synthesis bounds, not all bounds on the raw multipliers.
 Silence and invalid floating-point audio are not useful presets.
 
 `intensity=0.4` whispers; `intensity=2.5` shouts. Effort changes the penultimate
 syllable's stress emphasis too. `cents=-1200` lowers vowels one octave but does
-not transpose the randomly pitched, wordless shuzi rumble.
+not transpose the randomly pitched, wordless shuzi rumble — the shuzi does get
+a random physique per rumble, so `pressure`, `tension`, `wet` and friends
+scale its range rather than pinning it.
 
 Defaults are an identity. A preset spelling out every default reproduces the
 untuned voice in the same build.

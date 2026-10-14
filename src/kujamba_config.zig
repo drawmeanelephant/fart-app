@@ -23,6 +23,12 @@
 //!     wobble = 2
 //!     intensity = 1.5               # #15: whisper 0.25 .. shout 4
 //!     cents = -700                  # #16: shift the vowel pitches a fifth down
+//!     pressure = 1.5                # intestinal pressure: louder, higher, harder venting
+//!     tension = 0.7                 # sphincter tension: high = tight/raspy, low = flappy
+//!     resonance = 1.4               # terminal-tract formant ring
+//!     turbulence = 1.5              # sputtering noise-burst texture
+//!     wet = 1.2                     # gurgle depth: bubbly vs dry
+//!     drop = 1.5                    # exponential pitch sag as pressure vents
 //!     [map]                         # the #21 sampler: note -> sound
 //!     note60 = "kujamba karibu"     # a phrase (quotes required for spaces)
 //!     note64 = shuzi:3              # a single wordless fart by seed
@@ -199,7 +205,7 @@ pub fn parse(text_in: []const u8, diag: *Diag) ParseError!Config {
     var seen_pass = false;
     var seen_phrase = false;
     var seen_pattern = false;
-    var seen_knobs: u8 = 0; // one bit per knob, for duplicate detection
+    var seen_knobs: u16 = 0; // one bit per knob, for duplicate detection
 
     var lines = std.mem.splitScalar(u8, text, '\n');
     var line_no: usize = 0;
@@ -295,23 +301,23 @@ pub fn parse(text_in: []const u8, diag: *Diag) ParseError!Config {
             cfg.pattern = kujamba_out.parsePattern(value) catch
                 return diag.fail(line_no, error.BadPattern, "bad pattern '{s}' (want N or N+M)", .{value});
         } else if (std.mem.eql(u8, key, "voice")) {
-            return diag.fail(line_no, error.UnknownKey, "unknown key 'voice' (set [voice] attack/noise/wobble/intensity/cents)", .{});
+            return diag.fail(line_no, error.UnknownKey, "unknown key 'voice' (set [voice] attack/noise/wobble/intensity/cents/pressure/tension/resonance/turbulence/wet/drop)", .{});
         } else if (std.mem.startsWith(u8, key, "voice.")) {
             const knob = key["voice.".len..];
             if (knob.len == 0 or std.mem.indexOfScalar(u8, knob, '.') != null)
                 return diag.fail(line_no, error.UnknownKey, "unknown key '{s}'", .{key});
             try setKnob(&cfg, knob, value, line_no, &seen_knobs, diag);
         } else {
-            return diag.fail(line_no, error.UnknownKey, "unknown key '{s}' (want host, user, pass, phrase, pattern or voice.attack/noise/wobble/intensity/cents)", .{key});
+            return diag.fail(line_no, error.UnknownKey, "unknown key '{s}' (want host, user, pass, phrase, pattern or voice.attack/noise/wobble/intensity/cents/pressure/tension/resonance/turbulence/wet/drop)", .{key});
         }
     }
     return cfg;
 }
 
-const Knob = enum(u3) { attack, noise, wobble, intensity, cents };
+const Knob = enum(u4) { attack, noise, wobble, intensity, cents, pressure, tension, resonance, turbulence, wet, drop };
 
-fn knobBit(k: Knob) u8 {
-    return @as(u8, 1) << @intCast(@backingInt(k));
+fn knobBit(k: Knob) u16 {
+    return @as(u16, 1) << @intCast(@backingInt(k));
 }
 
 /// One voice knob from config text, with parseKnobs' own rules for --voice:
@@ -319,7 +325,7 @@ fn knobBit(k: Knob) u8 {
 /// offset in cents and the one knob a negative value is meaningful for. The
 /// synth clamps to the spec bounds when the knobs are applied, so no range
 /// check is needed here.
-fn setKnob(cfg: *Config, key: []const u8, value: []const u8, line_no: usize, seen: *u8, diag: *Diag) ParseError!void {
+fn setKnob(cfg: *Config, key: []const u8, value: []const u8, line_no: usize, seen: *u16, diag: *Diag) ParseError!void {
     const k: Knob = if (std.mem.eql(u8, key, "attack"))
         .attack
     else if (std.mem.eql(u8, key, "noise"))
@@ -330,8 +336,20 @@ fn setKnob(cfg: *Config, key: []const u8, value: []const u8, line_no: usize, see
         .intensity
     else if (std.mem.eql(u8, key, "cents"))
         .cents
+    else if (std.mem.eql(u8, key, "pressure"))
+        .pressure
+    else if (std.mem.eql(u8, key, "tension"))
+        .tension
+    else if (std.mem.eql(u8, key, "resonance"))
+        .resonance
+    else if (std.mem.eql(u8, key, "turbulence"))
+        .turbulence
+    else if (std.mem.eql(u8, key, "wet"))
+        .wet
+    else if (std.mem.eql(u8, key, "drop"))
+        .drop
     else
-        return diag.fail(line_no, error.UnknownKey, "unknown [voice] key '{s}' (want attack, noise, wobble, intensity or cents)", .{key});
+        return diag.fail(line_no, error.UnknownKey, "unknown [voice] key '{s}' (want attack, noise, wobble, intensity, cents, pressure, tension, resonance, turbulence, wet or drop)", .{key});
 
     const bit = knobBit(k);
     if (seen.* & bit != 0) return diag.dup(line_no, key);
@@ -350,6 +368,12 @@ fn setKnob(cfg: *Config, key: []const u8, value: []const u8, line_no: usize, see
         .wobble => cfg.knobs.wobble = v,
         .intensity => cfg.knobs.intensity = v,
         .cents => cfg.knobs.cents = v,
+        .pressure => cfg.knobs.pressure = v,
+        .tension => cfg.knobs.tension = v,
+        .resonance => cfg.knobs.resonance = v,
+        .turbulence => cfg.knobs.turbulence = v,
+        .wet => cfg.knobs.wet = v,
+        .drop => cfg.knobs.drop = v,
     }
 }
 
