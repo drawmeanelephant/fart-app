@@ -17,9 +17,9 @@ phrase = "kujamba karibu"
 pattern = "3+1"                       # 3 fart bars, then 1 rest bar
 
 # The M9 fart-off engine (#95): stock, argon4, astra, fable, gemini38,
-# mistral4, opus, sol61, sonnet, swe2. `stock` is the default until the
-# judging crowns a winner. May also be spelled `voice.engine`; a --engine
-# flag or engine=<slug> inside a --voice spec wins over this file.
+# gutphysics, mistral4, opus, sol61, sonnet, swe2. `stock` is the default
+# until the judging crowns a winner. May also be spelled `voice.engine`; a
+# --engine flag or engine=<slug> inside a --voice spec wins over this file.
 # engine = "swe2"
 
 # The #18 voice knobs as multipliers on the onset-class table (see the

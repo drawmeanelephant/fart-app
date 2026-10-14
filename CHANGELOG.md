@@ -12,7 +12,8 @@ tagged `v<version>` and published on GitHub with CI-built binaries via
 ### Added
 
 - Fart-off engine selector (#95, M9) — all nine Great Fart-Off entries ship
-  as `src/engines/<slug>.zig` modules behind one registry. `--engine SLUG`
+  as `src/engines/<slug>.zig` modules behind one registry, plus `gutphysics`
+  (the Codebuff entry absorbed from stale PR #99). `--engine SLUG`
   on `join`/`render`/`play`/`trigger`, `engine=<slug>` inside `--voice`, and
   a config `engine` key (top-level, `[voice]`, or `voice.engine`) all
   resolve through the same precedence: flag > in-spec > config > `stock`.
