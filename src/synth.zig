@@ -6,10 +6,16 @@
 //! else, so the same phrase always produces byte-identical WAV bytes. Always.
 //!
 //! One fart "phoneme" (one Swahili syllable) is:
-//!   * a low-frequency buzzy oscillator whose pitch falls 20% across the syllable
-//!   * a filtered noise burst at the attack (the "splat") plus a quiet
-//!     low-passed body hiss
-//!   * an amplitude envelope with a fast attack and a ~24-34 Hz flutter wobble
+//!   * a coupled physical reed-oscillator model driven by intestinal pressure,
+//!     sphincter tension, and terminal tract acoustic resonance
+//!   * a rich multi-harmonic + sub-bass relaxation pulse with exponential pitch
+//!     decay as intestinal pressure drops across the syllable
+//!   * a vowel-mapped dual formant resonator (F1/F2 vocal/intestinal tract
+//!     cavities) plus terminal tract resonance (cheek/bowl reflection)
+//!   * plosive onset pressure spikes (b, p, k, t, d, g, j, ch) and controllable
+//!     modulated noise-burst turbulence for wet/dry/raspy/thunderous textures
+//!   * an amplitude envelope with a fast attack, sphincter stick-slip micro-closures,
+//!     and a ~24-34 Hz mucosal flutter wobble
 //!
 //! Swahili is nearly pure CV. `Scanner` splits a word into syllables: each
 //! vowel picks the base pitch, the consonant onset picks the attack/decay
@@ -37,7 +43,8 @@ const GAP_SAMPLES: usize = GAP_MS * SAMPLE_RATE / 1000; // 1764
 const WORD_GAP_SAMPLES: usize = WORD_GAP_MS * SAMPLE_RATE / 1000; // 5292
 const BREATH_SAMPLES: usize = BREATH_MS * SAMPLE_RATE / 1000; // 3969
 
-const PITCH_DROP: f32 = 0.20; // pitch falls 20% across a syllable
+const PITCH_DROP: f32 = 0.24; // pitch falls ~24% across a syllable via exponential decay
+const PITCH_DECAY_RATE: f32 = 2.8; // exponential decay constant as pressure drops
 
 // ---------------------------------------------------------------------
 // Mapping tables (documented in README.md)
@@ -46,16 +53,87 @@ const PITCH_DROP: f32 = 0.20; // pitch falls 20% across a syllable
 /// Base frequency of the buzzy oscillator, chosen by the syllable's vowel.
 pub fn vowelBaseFreq(v: u8) ?f32 {
     return switch (v) {
-        'a' => 92.0,
-        'e' => 110.0,
-        'i' => 138.0,
-        'o' => 86.0,
-        'u' => 74.0,
+        'a' => 88.0,
+        'e' => 104.0,
+        'i' => 126.0,
+        'o' => 76.0,
+        'u' => 64.0,
         else => null,
     };
 }
 
-/// Onset character classes: consonants set the attack/decay character.
+/// Resonant formant filter specification for a vowel: dual resonant peaks
+/// (F1 lower cavity, F2 upper/cheek cavity) that shape the harmonic buzz and
+/// turbulent noise into distinct vocal-like fart vowels.
+pub const FormantSpec = struct {
+    f1_hz: f32,
+    f2_hz: f32,
+    bw1_hz: f32,
+    bw2_hz: f32,
+    f1_gain: f32,
+    f2_gain: f32,
+};
+
+/// Maps a Swahili vowel to its dual-formant resonant filter frequencies.
+pub fn vowelFormants(v: u8) FormantSpec {
+    return switch (v) {
+        'a' => .{ .f1_hz = 680.0, .f2_hz = 1180.0, .bw1_hz = 130.0, .bw2_hz = 190.0, .f1_gain = 1.00, .f2_gain = 0.65 },
+        'e' => .{ .f1_hz = 480.0, .f2_hz = 1680.0, .bw1_hz = 110.0, .bw2_hz = 210.0, .f1_gain = 0.90, .f2_gain = 0.70 },
+        'i' => .{ .f1_hz = 310.0, .f2_hz = 2050.0, .bw1_hz = 95.0, .bw2_hz = 230.0, .f1_gain = 0.85, .f2_gain = 0.75 },
+        'o' => .{ .f1_hz = 430.0, .f2_hz = 820.0, .bw1_hz = 105.0, .bw2_hz = 150.0, .f1_gain = 1.10, .f2_gain = 0.55 },
+        'u' => .{ .f1_hz = 290.0, .f2_hz = 620.0, .bw1_hz = 90.0, .bw2_hz = 130.0, .f1_gain = 1.15, .f2_gain = 0.45 },
+        else => .{ .f1_hz = 520.0, .f2_hz = 1100.0, .bw1_hz = 150.0, .bw2_hz = 220.0, .f1_gain = 0.80, .f2_gain = 0.50 },
+    };
+}
+
+/// Plosive pressure-burst profile triggered by consonant onsets (especially p, b, k, t).
+/// Models the build-up of intestinal gas behind a sealed sphincter and its sudden
+/// explosive release (pitch upward spike, transient sub-thump, and high-velocity
+/// turbulent noise jet).
+pub const PlosiveSpec = struct {
+    /// Amplitude of the sudden pressure-release impulse
+    burst_amp: f32,
+    /// Decay time constant (seconds) of the initial pressure spike
+    decay_s: f32,
+    /// Center frequency (Hz) of the plosive pop resonance
+    pop_freq_hz: f32,
+    /// Fractional upward pitch jump at t=0 from overpressure
+    pitch_spike: f32,
+};
+
+/// Maps a consonant onset string (e.g. "k", "b", "p", "mb", "sh") to its
+/// physical plosive burst profile. Bilabials (b, p) produce low, punchy cheek
+/// pops; velars (k, g) produce sharp mid-range snaps; alveolars/affricates
+/// (t, d, ch, j) produce crisp splats; prenasalized stops (mb, nd, ng, nj, mp, nk)
+/// combine nasal buildup with a wet release pop.
+pub fn onsetPlosiveSpec(onset: []const u8) PlosiveSpec {
+    if (onset.len == 0) {
+        return .{ .burst_amp = 0.12, .decay_s = 0.012, .pop_freq_hz = 160.0, .pitch_spike = 0.06 };
+    }
+    // Check prenasalized stops (mb, mp, nd, nt, ng, nk, nj) where the second char is the stop release
+    const c0 = onset[0];
+    const c_release = if (onset.len >= 2 and (c0 == 'm' or c0 == 'n') and onset[1] != 'y' and onset[1] != 'w')
+        onset[1]
+    else
+        c0;
+    const prenasal_scale: f32 = if (c_release != c0) 0.85 else 1.0;
+
+    return switch (c_release) {
+        'p' => .{ .burst_amp = 0.95 * prenasal_scale, .decay_s = 0.018, .pop_freq_hz = 135.0, .pitch_spike = 0.34 },
+        'b' => .{ .burst_amp = 0.90 * prenasal_scale, .decay_s = 0.024, .pop_freq_hz = 110.0, .pitch_spike = 0.30 },
+        'k' => .{ .burst_amp = 0.92 * prenasal_scale, .decay_s = 0.014, .pop_freq_hz = 260.0, .pitch_spike = 0.36 },
+        'g' => .{ .burst_amp = 0.80 * prenasal_scale, .decay_s = 0.020, .pop_freq_hz = 195.0, .pitch_spike = 0.26 },
+        't' => .{ .burst_amp = 0.82 * prenasal_scale, .decay_s = 0.013, .pop_freq_hz = 310.0, .pitch_spike = 0.28 },
+        'd' => .{ .burst_amp = 0.76 * prenasal_scale, .decay_s = 0.019, .pop_freq_hz = 220.0, .pitch_spike = 0.24 },
+        'c', 'j' => .{ .burst_amp = 0.78 * prenasal_scale, .decay_s = 0.022, .pop_freq_hz = 280.0, .pitch_spike = 0.25 },
+        's', 'z', 'f', 'v', 'h' => .{ .burst_amp = 0.35, .decay_s = 0.032, .pop_freq_hz = 420.0, .pitch_spike = 0.12 },
+        'm', 'n' => .{ .burst_amp = 0.18, .decay_s = 0.020, .pop_freq_hz = 130.0, .pitch_spike = 0.08 },
+        else => .{ .burst_amp = 0.25, .decay_s = 0.016, .pop_freq_hz = 180.0, .pitch_spike = 0.10 },
+    };
+}
+
+/// Onset character classes: consonants set the attack/decay character and
+/// physical baseline parameters (pressure, tension, resonance, turbulence).
 pub const VoiceClass = enum {
     none, // bare vowel onset
     stop_voiceless, // p t k ch
@@ -71,16 +149,88 @@ pub const VoiceSpec = struct {
     wobble_hz: f32,
     wobble_depth: f32,
     level: f32,
+    /// Intestinal gas pressure (bar-like normalized units, ~0.2..3.0).
+    /// Drives blow force, nonlinear wave steepening, sub-bass weight, and pitch drop.
+    pressure: f32 = 1.0,
+    /// Sphincter muscular tension (~0.2..3.0).
+    /// Controls reed stiffness, harmonic sharpness (raspy vs flabby), and stick-slip gating.
+    tension: f32 = 1.0,
+    /// Terminal tract / gluteal acoustic resonance (~0.1..3.0).
+    /// Controls resonant Q of the cavity filters and wet bubbly filter modulation.
+    resonance: f32 = 1.0,
+    /// Noise-burst turbulence (~0.0..3.0).
+    /// Controls chaotic air-jet bursts modulated by the sphincter opening cycle.
+    turbulence: f32 = 1.0,
 };
 
 pub fn voiceSpec(cls: VoiceClass) VoiceSpec {
     return switch (cls) {
-        .none => .{ .attack_s = 0.008, .noise_mix = 0.25, .wobble_hz = 28.0, .wobble_depth = 0.50, .level = 0.90 },
-        .stop_voiceless => .{ .attack_s = 0.004, .noise_mix = 0.40, .wobble_hz = 32.0, .wobble_depth = 0.55, .level = 0.95 },
-        .stop_voiced => .{ .attack_s = 0.006, .noise_mix = 0.28, .wobble_hz = 30.0, .wobble_depth = 0.50, .level = 1.00 },
-        .fricative => .{ .attack_s = 0.010, .noise_mix = 0.50, .wobble_hz = 29.0, .wobble_depth = 0.45, .level = 0.90 },
-        .nasal => .{ .attack_s = 0.025, .noise_mix = 0.12, .wobble_hz = 26.0, .wobble_depth = 0.35, .level = 0.85 },
-        .liquid => .{ .attack_s = 0.014, .noise_mix = 0.18, .wobble_hz = 28.0, .wobble_depth = 0.45, .level = 0.90 },
+        .none => .{
+            .attack_s = 0.008,
+            .noise_mix = 0.25,
+            .wobble_hz = 28.0,
+            .wobble_depth = 0.50,
+            .level = 0.90,
+            .pressure = 1.00,
+            .tension = 0.95,
+            .resonance = 1.05,
+            .turbulence = 0.90,
+        },
+        .stop_voiceless => .{
+            .attack_s = 0.004,
+            .noise_mix = 0.40,
+            .wobble_hz = 32.0,
+            .wobble_depth = 0.55,
+            .level = 0.95,
+            .pressure = 1.35,
+            .tension = 1.25,
+            .resonance = 1.00,
+            .turbulence = 1.30,
+        },
+        .stop_voiced => .{
+            .attack_s = 0.006,
+            .noise_mix = 0.28,
+            .wobble_hz = 30.0,
+            .wobble_depth = 0.50,
+            .level = 1.00,
+            .pressure = 1.40,
+            .tension = 1.05,
+            .resonance = 1.25,
+            .turbulence = 1.15,
+        },
+        .fricative => .{
+            .attack_s = 0.010,
+            .noise_mix = 0.50,
+            .wobble_hz = 29.0,
+            .wobble_depth = 0.45,
+            .level = 0.90,
+            .pressure = 1.10,
+            .tension = 1.15,
+            .resonance = 0.95,
+            .turbulence = 1.45,
+        },
+        .nasal => .{
+            .attack_s = 0.025,
+            .noise_mix = 0.12,
+            .wobble_hz = 26.0,
+            .wobble_depth = 0.35,
+            .level = 0.85,
+            .pressure = 0.95,
+            .tension = 0.80,
+            .resonance = 1.35,
+            .turbulence = 0.75,
+        },
+        .liquid => .{
+            .attack_s = 0.014,
+            .noise_mix = 0.18,
+            .wobble_hz = 28.0,
+            .wobble_depth = 0.45,
+            .level = 0.90,
+            .pressure = 1.05,
+            .tension = 0.88,
+            .resonance = 1.30,
+            .turbulence = 0.95,
+        },
     };
 }
 
@@ -117,6 +267,18 @@ pub const VoiceKnobs = struct {
     /// up, -1200 down), so a preset can pick a different "instrument". An
     /// offset, not a multiplier — negative is meaningful, not an error.
     cents: f32 = 0.0,
+    /// Scales `pressure` (intestinal gas pressure): controls blow force,
+    /// sub-bass weight, nonlinear wave steepening, and exponential pitch decay depth.
+    pressure: f32 = 1.0,
+    /// Scales `tension` (sphincter muscular tension): controls reed stiffness,
+    /// upper harmonic raspiness vs loose flabby rumble, and stick-slip gating.
+    tension: f32 = 1.0,
+    /// Scales `resonance` (terminal tract / gluteal cavity resonance): controls
+    /// formant filter Q and wet bubbly resonance modulation.
+    resonance: f32 = 1.0,
+    /// Scales `turbulence` (chaotic noise-burst turbulence): controls sputtery
+    /// air-jet bursts gated by the sphincter vibration cycle.
+    turbulence: f32 = 1.0,
 
     /// Bounds on the *resulting* spec, not on the multipliers. Each one exists
     /// because the value feeds arithmetic that breaks outside its range.
@@ -139,6 +301,16 @@ pub const VoiceKnobs = struct {
     /// #16: one octave either way. Beyond that the buzzy oscillator leaves the
     /// instrument's register (at -1200 the lowest vowel is a 37 Hz rumble).
     pub const max_abs_cents: f32 = 1200.0;
+    /// Physical parameter bounds: prevent numerical instability in SVF resonators
+    /// and pitch/saturation curves under extreme multiplier settings.
+    pub const min_pressure: f32 = 0.20;
+    pub const max_pressure: f32 = 3.00;
+    pub const min_tension: f32 = 0.20;
+    pub const max_tension: f32 = 3.00;
+    pub const min_resonance: f32 = 0.10;
+    pub const max_resonance: f32 = 3.00;
+    pub const min_turbulence: f32 = 0.00;
+    pub const max_turbulence: f32 = 3.00;
 
     /// `2^(cents/1200)` — the factor every base frequency is multiplied by,
     /// with `cents` clamped to one octave either way. The `cents == 0` branch
@@ -168,6 +340,10 @@ pub const VoiceKnobs = struct {
             .wobble_hz = spec.wobble_hz,
             .wobble_depth = std.math.clamp(spec.wobble_depth * self.wobble, 0.0, max_wobble_depth),
             .level = spec.level,
+            .pressure = std.math.clamp(spec.pressure * self.pressure, min_pressure, max_pressure),
+            .tension = std.math.clamp(spec.tension * self.tension, min_tension, max_tension),
+            .resonance = std.math.clamp(spec.resonance * self.resonance, min_resonance, max_resonance),
+            .turbulence = std.math.clamp(spec.turbulence * self.turbulence, min_turbulence, max_turbulence),
         };
     }
 };
@@ -179,7 +355,8 @@ pub const KnobsError = error{ UnknownKnob, MalformedKnob, NotFinite, Negative };
 /// identity, which is what `--voice ""` and an omitted flag both mean.
 /// `intensity` and `cents` (#15, #16) take the same spelling: `intensity` is
 /// a multiplier (>= 0), `cents` an offset in cents and the one key a negative
-/// value is meaningful for.
+/// value is meaningful for. Physical knobs (`pressure`, `tension`, `resonance`,
+/// `turbulence`) also take non-negative multipliers.
 pub fn parseKnobs(s: []const u8) KnobsError!VoiceKnobs {
     var knobs = VoiceKnobs{};
     var it = std.mem.splitScalar(u8, s, ',');
@@ -202,6 +379,14 @@ pub fn parseKnobs(s: []const u8) KnobsError!VoiceKnobs {
             knobs.intensity = v;
         } else if (std.mem.eql(u8, key, "cents")) {
             knobs.cents = v;
+        } else if (std.mem.eql(u8, key, "pressure")) {
+            knobs.pressure = v;
+        } else if (std.mem.eql(u8, key, "tension")) {
+            knobs.tension = v;
+        } else if (std.mem.eql(u8, key, "resonance")) {
+            knobs.resonance = v;
+        } else if (std.mem.eql(u8, key, "turbulence")) {
+            knobs.turbulence = v;
         } else return error.UnknownKnob;
     }
     return knobs;
@@ -231,6 +416,12 @@ const VoiceParams = struct {
     wobble_depth: f32,
     level: f32,
     glide: f32,
+    pressure: f32 = 1.0,
+    tension: f32 = 1.0,
+    resonance: f32 = 1.0,
+    turbulence: f32 = 1.0,
+    formants: FormantSpec = vowelFormants('a'),
+    plosive: PlosiveSpec = onsetPlosiveSpec(""),
 };
 
 /// #15: one syllable's spec under vocal effort `eff`. Level and noise mix
@@ -252,43 +443,204 @@ fn stressBoost(eff: f32) f32 {
 
 /// Renders one fart phoneme into `out` (mono i16). Deterministic: the only
 /// randomness comes from `prng`, whose seed is fixed per render.
+///
+/// Physical synthesis architecture:
+///  1. Intestinal Pressure & Exponential Pitch Decay:
+///     Gas pressure starts high (boosted by plosive onset build-up) and decays
+///     exponentially across the syllable (`exp(-decay_rate * u)`), causing pitch
+///     to drop naturally like a real decompressing bowel.
+///  2. Sphincter Tension & Stick-Slip Reed Pulse:
+///     Models the anal sphincter as a nonlinear mucosal reed. Higher tension
+///     shifts pitch upward, sharpens upper harmonics (raspy/tight), and tightens
+///     stick-slip micro-closures; lower tension yields a loose, flabby, sub-heavy
+///     slap.
+///  3. Plosive Pressure Bursts:
+///     Stop consonants (b, p, k, t, g, d, j, ch) inject an explosive initial
+///     pressure spike, pitch jump, and resonant cheek-pop thump.
+///  4. Noise-Burst Turbulence:
+///     Chaotic air-jet turbulence modulated by the instantaneous reed opening
+///     (`max(0, sin(phase))`) and bubble/flutter micro-bursts.
+///  5. Vowel Formant Filters & Terminal Tract Resonance:
+///     A dual 2-pole Chamberlin state-variable bandpass resonator (F1/F2) tuned
+///     to each Swahili vowel, coupled with a low-frequency terminal tract cavity
+///     resonator whose cutoff wobbles with mucosal flutter for wet/bubbly or
+///     thunderous acoustic character.
 fn synthInto(out: []i16, p: VoiceParams, prng: *std.Random.DefaultPrng) void {
     const dt: f32 = 1.0 / @as(f32, SAMPLE_RATE);
     const tau: f32 = std.math.tau;
     var phase: f32 = 0;
+    var sub_phase: f32 = 0;
+    var pop_phase: f32 = 0;
+
     var lp_body: f32 = 0;
     var lp_burst: f32 = 0;
-    const alpha_body: f32 = 1.0 - @exp(-tau * 700.0 * dt);
-    const alpha_burst: f32 = 1.0 - @exp(-tau * 1900.0 * dt);
+    var lp_turb: f32 = 0;
+    var turb_grain: f32 = 0;
+
+    // State-variable filter (SVF) states for F1, F2, and terminal tract resonance
+    var f1_lp: f32 = 0;
+    var f1_bp: f32 = 0;
+    var f2_lp: f32 = 0;
+    var f2_bp: f32 = 0;
+    var tract_lp: f32 = 0;
+    var tract_bp: f32 = 0;
+
     const wobble_phase: f32 = prng.random().float(f32) * tau;
     const wobble_hz: f32 = p.wobble_hz * (0.9 + 0.2 * prng.random().float(f32));
+    const bubble_phase: f32 = prng.random().float(f32) * tau;
+    const bubble_hz: f32 = wobble_hz * 2.35 + 7.0;
+
+    const pressure = std.math.clamp(p.pressure, VoiceKnobs.min_pressure, VoiceKnobs.max_pressure);
+    const tension = std.math.clamp(p.tension, VoiceKnobs.min_tension, VoiceKnobs.max_tension);
+    const resonance = std.math.clamp(p.resonance, VoiceKnobs.min_resonance, VoiceKnobs.max_resonance);
+    const turbulence = std.math.clamp(p.turbulence, VoiceKnobs.min_turbulence, VoiceKnobs.max_turbulence);
+
+    const alpha_body: f32 = 1.0 - @exp(-tau * (580.0 + 220.0 * tension) * dt);
+    const alpha_burst: f32 = 1.0 - @exp(-tau * (1700.0 + 500.0 * pressure) * dt);
+    const alpha_turb: f32 = 1.0 - @exp(-tau * (1100.0 + 700.0 * tension) * dt);
+    const alpha_grain: f32 = 1.0 - @exp(-tau * 85.0 * dt);
+
+    // Tension scales base pitch slightly (tight sphincter = higher pitch, loose = lower)
+    const tension_pitch_scale: f32 = 0.82 + 0.18 * tension;
+    const base_f0: f32 = std.math.clamp(p.f0 * tension_pitch_scale, 28.0, 420.0);
+
+    // Exponential pitch decay rate scales with pressure
+    const exp_rate: f32 = PITCH_DECAY_RATE * (0.75 + 0.35 * pressure);
+    const exp_norm: f32 = 1.0 / (1.0 - @exp(-exp_rate));
+    const total_drop: f32 = std.math.clamp(p.glide * (0.85 + 0.30 * pressure), 0.05, 0.58);
+
+    // Formant filter damping (inverse Q): higher resonance = narrower bandwidth (wetter/squelchier)
+    const q_scale: f32 = std.math.clamp(0.65 + 0.55 * resonance, 0.35, 2.5);
+    const damp1: f32 = std.math.clamp((p.formants.bw1_hz / @max(100.0, p.formants.f1_hz)) / q_scale, 0.08, 0.85);
+    const damp2: f32 = std.math.clamp((p.formants.bw2_hz / @max(200.0, p.formants.f2_hz)) / q_scale, 0.08, 0.85);
+    const tract_damp: f32 = std.math.clamp(0.42 / q_scale, 0.10, 0.90);
+
     const n = out.len;
     for (0..n) |i| {
         const fi: f32 = @floatFromInt(i);
         const t = fi * dt;
         const u = fi / @as(f32, @floatFromInt(n));
 
-        // Buzzy low-frequency oscillator, pitch gliding down ~20%.
-        const f = p.f0 * (1.0 - p.glide * u);
+        // 1. Exponentially decaying intestinal pressure & pitch contour
+        const exp_decay = (1.0 - @exp(-exp_rate * u)) * exp_norm;
+        const plosive_env = @exp(-t / @max(0.002, p.plosive.decay_s));
+        const pitch_burst = 1.0 + p.plosive.pitch_spike * plosive_env * (0.7 + 0.3 * pressure);
+
+        // Instantaneous mucosal flutter modulation
+        const wob_lfo = @sin(tau * wobble_hz * t + wobble_phase);
+        const bubble_lfo = @sin(tau * bubble_hz * t + bubble_phase);
+        const pitch_fm = 1.0 + 0.035 * p.wobble_depth * wob_lfo + 0.018 * resonance * bubble_lfo;
+
+        const f = std.math.clamp(base_f0 * (1.0 - total_drop * exp_decay) * pitch_burst * pitch_fm, 24.0, 800.0);
         phase += tau * f * dt;
         if (phase >= tau) phase -= tau;
-        const carrier = (@sin(phase) + 0.55 * @sin(2.0 * phase) + 0.30 * @sin(3.0 * phase) + 0.12 * @sin(4.0 * phase)) * 0.42;
+        sub_phase += tau * (0.5 * f) * dt;
+        if (sub_phase >= tau) sub_phase -= tau;
 
-        // Filtered noise: a decaying attack burst + a quiet body hiss.
+        // 2. Nonlinear mucosal reed oscillator (harmonics + sub-harmonic + stick-slip pulse)
+        const s1 = @sin(phase);
+        const s2 = @sin(2.0 * phase + 0.35);
+        const s3 = @sin(3.0 * phase + 0.70);
+        const s4 = @sin(4.0 * phase + 1.05);
+        const s5 = @sin(5.0 * phase + 1.40);
+        const s6 = @sin(6.0 * phase + 1.75);
+        const sub = @sin(sub_phase);
+
+        // Reed sharpness: high tension boosts upper harmonics (3..6); low tension boosts sub & fundamental
+        const hi_scale = std.math.clamp(0.55 + 0.45 * tension, 0.25, 1.8);
+        const sub_scale = std.math.clamp(0.42 * pressure / (0.65 + 0.35 * tension), 0.10, 0.75);
+
+        // Stick-slip reed opening pulse: models periodic seal-and-pop of the sphincter
+        const reed_open = @max(0.0, s1);
+        const reed_slap = reed_open * reed_open * (0.45 + 0.35 * pressure);
+
+        const raw_osc = (s1 * 0.95 +
+            sub * sub_scale +
+            0.62 * s2 +
+            (0.40 * s3 + 0.24 * s4 + 0.14 * s5 + 0.08 * s6) * hi_scale +
+            reed_slap * (0.65 * s2 - 0.35 * s3)) * 0.3592;
+
+        // Soft pressure saturation (waveshaping x / (1 + k|x|)) for warm brassy harmonics
+        const drive = 1.0 + 0.55 * pressure * (1.0 - 0.45 * u);
+        const driven = raw_osc * drive;
+        const carrier = driven / (1.0 + 0.42 * @abs(driven));
+
+        // 3. Plosive pressure-release pop & turbulent noise bursts
         const wn_body = prng.random().float(f32) * 2.0 - 1.0;
         lp_body += alpha_body * (wn_body - lp_body);
         const wn_burst = prng.random().float(f32) * 2.0 - 1.0;
         lp_burst += alpha_burst * (wn_burst - lp_burst);
-        const burst_env = @exp(-t / 0.045);
-        const noise = lp_body * 0.35 + lp_burst * 0.9 * burst_env;
 
-        // Envelope: fast attack, decay to zero, fluttering at ~24-34 Hz.
+        // Chaotic grain envelope for sputtery turbulence
+        turb_grain += alpha_grain * (wn_burst * wn_body * 2.2 - turb_grain);
+        lp_turb += alpha_turb * (wn_burst - lp_turb);
+
+        // Plosive sub-pop oscillator (decays quickly after consonant release)
+        const pop_f = p.plosive.pop_freq_hz * (0.65 + 0.35 * plosive_env);
+        pop_phase += tau * pop_f * dt;
+        if (pop_phase >= tau) pop_phase -= tau;
+        const plosive_pop = (@sin(pop_phase) * 0.55 + lp_burst * 0.85) * p.plosive.burst_amp * plosive_env;
+
+        // Turbulence is gated by reed opening (air jets through when sphincter parts)
+        // plus stochastic micro-splats (`turb_grain`)
+        const reed_gate = 0.25 + 0.75 * reed_open * (0.7 + 0.3 * @max(0.0, bubble_lfo));
+        const burst_env = @exp(-t / 0.048);
+        const turb_signal = lp_turb * reed_gate * (1.0 + 1.4 * @abs(turb_grain)) * turbulence * (0.42 + 0.45 * burst_env);
+        const base_noise = lp_body * 0.32 + lp_burst * 0.75 * burst_env + turb_signal;
+
+        // Excitation signal combining reed buzz, modulated noise, and plosive burst
+        const excitation = carrier + p.noise_mix * base_noise + plosive_pop * (0.35 + 0.65 * p.noise_mix);
+
+        // 4. Dual Vowel Formant Resonators (F1, F2) + Terminal Tract Cavity
+        // Dynamic formant sweep: formants dip slightly as pressure drops and wobble with wet resonance
+        const wet_mod = 1.0 + 0.14 * resonance * (0.6 * wob_lfo + 0.4 * bubble_lfo) - 0.12 * exp_decay;
+        const f1_cut = std.math.clamp(p.formants.f1_hz * wet_mod, 140.0, 1400.0);
+        const f2_cut = std.math.clamp(p.formants.f2_hz * wet_mod, 350.0, 2900.0);
+        const tract_cut = std.math.clamp((155.0 + 55.0 * pressure) * (1.0 + 0.10 * wob_lfo), 85.0, 420.0);
+
+        const svf_f1 = @min(0.45, 2.0 * @sin(std.math.pi * f1_cut * dt));
+        const f1_hp = excitation - f1_lp - damp1 * f1_bp;
+        f1_bp += svf_f1 * f1_hp;
+        f1_lp += svf_f1 * f1_bp;
+
+        const svf_f2 = @min(0.65, 2.0 * @sin(std.math.pi * f2_cut * dt));
+        const f2_hp = excitation - f2_lp - damp2 * f2_bp;
+        f2_bp += svf_f2 * f2_hp;
+        f2_lp += svf_f2 * f2_bp;
+
+        const svf_tract = @min(0.30, 2.0 * @sin(std.math.pi * tract_cut * dt));
+        const tract_hp = excitation - tract_lp - tract_damp * tract_bp;
+        tract_bp += svf_tract * tract_hp;
+        tract_lp += svf_tract * tract_bp;
+
+        const formant_out = (f1_bp * p.formants.f1_gain + f2_bp * p.formants.f2_gain) * 0.34 * (0.55 + 0.45 * resonance);
+        const tract_out = (tract_lp * 0.48 + tract_bp * 0.42 * resonance) * (0.65 + 0.35 * pressure);
+        const dry_mix = std.math.clamp(0.62 - 0.12 * resonance, 0.25, 0.75);
+
+        const shaped = excitation * dry_mix + formant_out + tract_out;
+
+        // 5. Amplitude Envelope & Sphincter Flutter Gating
+        // Must be 0 at t=0 (i=0) and decay cleanly to 0 at u=1 so loop wraps stay click-free (#17).
         const attack = @min(1.0, t / p.attack_s);
-        const decay = std.math.pow(f32, 1.0 - u, 1.3);
-        const env = attack * decay;
-        const wob = 1.0 - p.wobble_depth * (0.5 + 0.5 * @sin(tau * wobble_hz * t + wobble_phase));
+        // Pressure sustains the body of the fart before a sputtering tail decay
+        const sustain_shape = (1.0 - u) * std.math.pow(f32, 1.0 - u, 0.35 / std.math.clamp(0.75 + 0.25 * pressure, 0.65, 1.35));
+        const env = attack * sustain_shape;
 
-        var x = (carrier + p.noise_mix * noise) * env * wob * p.level;
+        // Flutter wobble with tension-controlled stick-slip gating
+        const flutter_wave = 0.5 + 0.5 * wob_lfo;
+        const shaped_flutter = if (tension > 1.0)
+            flutter_wave * (0.75 + 0.25 * flutter_wave)
+        else
+            flutter_wave;
+        const wob = 1.0 - p.wobble_depth * shaped_flutter;
+
+        var x = shaped * env * wob * p.level;
+        // Smooth soft-clipper near ceiling so high-pressure/shout farts stay fat without harsh digital brickwalling
+        if (@abs(x) > 0.75) {
+            const sign: f32 = if (x >= 0) 1.0 else -1.0;
+            const excess = @abs(x) - 0.75;
+            x = sign * (0.75 + 0.20 * (excess / (0.20 + excess)));
+        }
         if (x > 0.95) x = 0.95;
         if (x < -0.95) x = -0.95;
         out[i] = @intFromFloat(@round(x * 32767.0));
@@ -303,11 +655,36 @@ fn renderSyllableInto(out: []i16, syl: *const Syll, stressed: bool, prng: *std.R
         // Consonant-only tail: a short whisper, not a buzz. The knobs reach this
         // literal too, so `--voice noise=0` means "no noise anywhere" rather
         // than "no noise except on the rare breath syllable".
-        const spec = knobs.apply(.{ .attack_s = 0.006, .noise_mix = 0.85, .wobble_hz = 31.0, .wobble_depth = 0.30, .level = 0.65 });
-        p = .{ .f0 = 88.0 * pitch, .attack_s = spec.attack_s, .noise_mix = spec.noise_mix, .wobble_hz = spec.wobble_hz, .wobble_depth = spec.wobble_depth, .level = spec.level, .glide = 0.15 };
+        const spec = knobs.apply(.{
+            .attack_s = 0.006,
+            .noise_mix = 0.85,
+            .wobble_hz = 31.0,
+            .wobble_depth = 0.30,
+            .level = 0.65,
+            .pressure = 0.75,
+            .tension = 0.85,
+            .resonance = 0.80,
+            .turbulence = 1.25,
+        });
+        p = .{
+            .f0 = 84.0 * pitch,
+            .attack_s = spec.attack_s,
+            .noise_mix = spec.noise_mix,
+            .wobble_hz = spec.wobble_hz,
+            .wobble_depth = spec.wobble_depth,
+            .level = spec.level,
+            .glide = 0.18,
+            .pressure = spec.pressure,
+            .tension = spec.tension,
+            .resonance = spec.resonance,
+            .turbulence = spec.turbulence,
+            .formants = vowelFormants(0),
+            .plosive = onsetPlosiveSpec(syl.onset()),
+        };
         applyEffort(&p, eff);
     } else {
-        const spec = knobs.apply(voiceSpec(classify(syl.onset())));
+        const onset_str = syl.onset();
+        const spec = knobs.apply(voiceSpec(classify(onset_str)));
         p = .{
             .f0 = vowelBaseFreq(syl.vowel).? * pitch,
             .attack_s = spec.attack_s,
@@ -316,12 +693,21 @@ fn renderSyllableInto(out: []i16, syl: *const Syll, stressed: bool, prng: *std.R
             .wobble_depth = spec.wobble_depth,
             .level = spec.level,
             .glide = PITCH_DROP,
+            .pressure = spec.pressure,
+            .tension = spec.tension,
+            .resonance = spec.resonance,
+            .turbulence = spec.turbulence,
+            .formants = vowelFormants(syl.vowel),
+            .plosive = onsetPlosiveSpec(onset_str),
         };
         applyEffort(&p, eff);
         // Swahili stresses the penultimate syllable of a word. The emphasis
         // rides on effort (#15): a shout pushes it past the stock 1.2, and a
         // whisper flatlines it — a whispered word has no dynamic shape.
-        if (stressed) p.level *= stressBoost(eff);
+        if (stressed) {
+            p.level *= stressBoost(eff);
+            p.pressure = std.math.clamp(p.pressure * 1.12, VoiceKnobs.min_pressure, VoiceKnobs.max_pressure);
+        }
     }
     // Per-syllable jitter, still a pure function of (phrase, syllable index).
     const r = prng.random();
@@ -602,11 +988,21 @@ pub fn renderShuziWavWith(allocator: std.mem.Allocator, seed: u64, knobs: VoiceK
     while (i < n_syl) : (i += 1) {
         const dur_ms: usize = (16 + r.uintLessThan(usize, 19)) * 10; // 160..340 ms
         const classes = [_]VoiceClass{ .stop_voiced, .stop_voiceless, .fricative, .nasal, .liquid };
-        const spec = knobs.apply(voiceSpec(classes[r.uintLessThan(usize, classes.len)]));
+        const cls = classes[r.uintLessThan(usize, classes.len)];
+        const spec = knobs.apply(voiceSpec(cls));
         const gap_ms: usize = if (i + 1 < n_syl) (3 + r.uintLessThan(usize, 5)) * 10 else 0; // 30..70 ms
+        const shuzi_vowels = [_]u8{ 'u', 'o', 'a', 'e', 'i' };
+        const shuzi_onsets = [_][]const u8{ "b", "p", "sh", "mb", "r" };
+        const cls_idx: usize = switch (cls) {
+            .stop_voiced => 0,
+            .stop_voiceless => 1,
+            .fricative => 2,
+            .nasal => 3,
+            .liquid, .none => 4,
+        };
         segs[i] = .{
             .params = .{
-                .f0 = 70.0 + 40.0 * r.float(f32),
+                .f0 = 64.0 + 42.0 * r.float(f32),
                 .attack_s = spec.attack_s,
                 // no clamp: this path's +0.10 already sits past the class
                 // table's 1.0 cap, and clamping it now would move today's
@@ -616,6 +1012,12 @@ pub fn renderShuziWavWith(allocator: std.mem.Allocator, seed: u64, knobs: VoiceK
                 .wobble_depth = 0.45 + 0.15 * r.float(f32),
                 .level = 1.0 * eff,
                 .glide = PITCH_DROP,
+                .pressure = spec.pressure,
+                .tension = spec.tension,
+                .resonance = spec.resonance,
+                .turbulence = spec.turbulence,
+                .formants = vowelFormants(shuzi_vowels[cls_idx]),
+                .plosive = onsetPlosiveSpec(shuzi_onsets[cls_idx]),
             },
             .len = dur_ms * SAMPLE_RATE / 1000,
             .gap_after = gap_ms * SAMPLE_RATE / 1000,
@@ -999,6 +1401,10 @@ test "voice knobs: each axis actually changes the audio" {
         .{ .name = "intensity", .knobs = .{ .intensity = 2.0 } },
         .{ .name = "cents up", .knobs = .{ .cents = 700 } },
         .{ .name = "cents down", .knobs = .{ .cents = -700 } },
+        .{ .name = "pressure", .knobs = .{ .pressure = 1.8 } },
+        .{ .name = "tension", .knobs = .{ .tension = 1.8 } },
+        .{ .name = "resonance", .knobs = .{ .resonance = 1.8 } },
+        .{ .name = "turbulence", .knobs = .{ .turbulence = 1.8 } },
     };
     for (axes) |ax| {
         const out = try renderPhraseWavWith(alloc, "kujamba karibu", ax.knobs);
@@ -1264,4 +1670,40 @@ test "cents reaches the consonant-only breath syllable too" {
         if (a != b) diffs += 1;
     }
     try testing.expect(diffs > n / 2);
+}
+
+test "physical parameters and phrase-to-synthesis mapping produce distinct deterministic textures" {
+    const alloc = testing.allocator;
+
+    // 1. Physical knobs parse and produce distinct audible textures (wet, dry, raspy, thunderous)
+    const wet = try renderPhraseWavWith(alloc, "kujamba karibu", try parseKnobs("pressure=1.6,tension=0.6,resonance=2.2,turbulence=1.8"));
+    defer alloc.free(wet);
+    const dry_raspy = try renderPhraseWavWith(alloc, "kujamba karibu", try parseKnobs("pressure=1.1,tension=2.2,resonance=0.3,turbulence=0.4"));
+    defer alloc.free(dry_raspy);
+    const thunderous = try renderPhraseWavWith(alloc, "kujamba karibu", try parseKnobs("pressure=2.5,tension=0.5,resonance=1.8,turbulence=2.2,cents=-500"));
+    defer alloc.free(thunderous);
+
+    try testing.expect(!std.mem.eql(u8, wet, dry_raspy));
+    try testing.expect(!std.mem.eql(u8, wet, thunderous));
+    try testing.expect(!std.mem.eql(u8, dry_raspy, thunderous));
+    try expectNotSilence(wet);
+    try expectNotSilence(dry_raspy);
+    try expectNotSilence(thunderous);
+
+    // 2. Plosives (k, b, p) produce distinct pressure burst profiles
+    const p_k = onsetPlosiveSpec("k");
+    const p_b = onsetPlosiveSpec("b");
+    const p_p = onsetPlosiveSpec("p");
+    const p_m = onsetPlosiveSpec("m");
+    try testing.expect(p_p.burst_amp > p_m.burst_amp);
+    try testing.expect(p_b.burst_amp > p_m.burst_amp);
+    try testing.expect(p_k.burst_amp > p_m.burst_amp);
+    try testing.expect(p_k.pop_freq_hz != p_b.pop_freq_hz);
+
+    // 3. Vowels map to distinct formant filter specs (F1/F2)
+    const fa = vowelFormants('a');
+    const fi = vowelFormants('i');
+    const fu = vowelFormants('u');
+    try testing.expect(fa.f1_hz > fi.f1_hz);
+    try testing.expect(fi.f2_hz > fu.f2_hz);
 }

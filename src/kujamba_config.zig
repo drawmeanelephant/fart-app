@@ -199,7 +199,7 @@ pub fn parse(text_in: []const u8, diag: *Diag) ParseError!Config {
     var seen_pass = false;
     var seen_phrase = false;
     var seen_pattern = false;
-    var seen_knobs: u8 = 0; // one bit per knob, for duplicate detection
+    var seen_knobs: u16 = 0; // one bit per knob, for duplicate detection
 
     var lines = std.mem.splitScalar(u8, text, '\n');
     var line_no: usize = 0;
@@ -308,10 +308,10 @@ pub fn parse(text_in: []const u8, diag: *Diag) ParseError!Config {
     return cfg;
 }
 
-const Knob = enum(u3) { attack, noise, wobble, intensity, cents };
+const Knob = enum(u4) { attack, noise, wobble, intensity, cents, pressure, tension, resonance, turbulence };
 
-fn knobBit(k: Knob) u8 {
-    return @as(u8, 1) << @intCast(@backingInt(k));
+fn knobBit(k: Knob) u16 {
+    return @as(u16, 1) << @intCast(@backingInt(k));
 }
 
 /// One voice knob from config text, with parseKnobs' own rules for --voice:
@@ -319,7 +319,7 @@ fn knobBit(k: Knob) u8 {
 /// offset in cents and the one knob a negative value is meaningful for. The
 /// synth clamps to the spec bounds when the knobs are applied, so no range
 /// check is needed here.
-fn setKnob(cfg: *Config, key: []const u8, value: []const u8, line_no: usize, seen: *u8, diag: *Diag) ParseError!void {
+fn setKnob(cfg: *Config, key: []const u8, value: []const u8, line_no: usize, seen: *u16, diag: *Diag) ParseError!void {
     const k: Knob = if (std.mem.eql(u8, key, "attack"))
         .attack
     else if (std.mem.eql(u8, key, "noise"))
@@ -330,8 +330,16 @@ fn setKnob(cfg: *Config, key: []const u8, value: []const u8, line_no: usize, see
         .intensity
     else if (std.mem.eql(u8, key, "cents"))
         .cents
+    else if (std.mem.eql(u8, key, "pressure"))
+        .pressure
+    else if (std.mem.eql(u8, key, "tension"))
+        .tension
+    else if (std.mem.eql(u8, key, "resonance"))
+        .resonance
+    else if (std.mem.eql(u8, key, "turbulence"))
+        .turbulence
     else
-        return diag.fail(line_no, error.UnknownKey, "unknown [voice] key '{s}' (want attack, noise, wobble, intensity or cents)", .{key});
+        return diag.fail(line_no, error.UnknownKey, "unknown [voice] key '{s}' (want attack, noise, wobble, intensity, cents, pressure, tension, resonance or turbulence)", .{key});
 
     const bit = knobBit(k);
     if (seen.* & bit != 0) return diag.dup(line_no, key);
@@ -350,6 +358,10 @@ fn setKnob(cfg: *Config, key: []const u8, value: []const u8, line_no: usize, see
         .wobble => cfg.knobs.wobble = v,
         .intensity => cfg.knobs.intensity = v,
         .cents => cfg.knobs.cents = v,
+        .pressure => cfg.knobs.pressure = v,
+        .tension => cfg.knobs.tension = v,
+        .resonance => cfg.knobs.resonance = v,
+        .turbulence => cfg.knobs.turbulence = v,
     }
 }
 
