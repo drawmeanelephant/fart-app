@@ -105,9 +105,12 @@ fn printUsage(io: std.Io) void {
         \\    --seed N           determinism seed: ids + payloads derive from it
         \\    --pattern P        bar pattern, e.g. 3+1 = 3 fart bars + 1 rest bar
         \\                       (default 3+1)
-        \\    --voice SPEC       synth voice knobs (#18), e.g. "noise=0,wobble=2".
+        \\    --voice SPEC       synth voice knobs, e.g. "noise=0,wobble=2".
         \\                       Multipliers on each onset class's attack, noise mix
-        \\                       and wobble depth; 1 is today's sound exactly.
+        \\                       and wobble depth, plus the physical model:
+        \\                       pressure, tension, resonance, decay, turbulence,
+        \\                       intensity, cents. 1 (0 for cents) is the stock
+        \\                       sound exactly.
         \\    --play MODE        how the phrase maps onto bars:
         \\                       repeat  restart at every fart bar (default)
         \\                       loop    play continuously, wrapping at the end
@@ -405,7 +408,7 @@ fn cmdJoin(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: [
             i += 1;
         } else if (std.mem.eql(u8, a, "--voice")) {
             s.knobs = synth.parseKnobs(next orelse fail(io, "--voice needs a value", .{})) catch |e|
-                fail(io, "bad --voice '{s}': {s} (want attack=N,noise=N,wobble=N)", .{ next.?, @errorName(e) });
+                fail(io, "bad --voice '{s}': {s} (want attack=N,noise=N,wobble=N,intensity=N,cents=N,pressure=N,tension=N,resonance=N,decay=N,turbulence=N)", .{ next.?, @errorName(e) });
             i += 1;
         } else if (std.mem.eql(u8, a, "--user")) {
             s.user = next orelse fail(io, "--user needs a value", .{});
@@ -702,7 +705,7 @@ fn cmdRender(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv:
             i += 1;
         } else if (std.mem.eql(u8, a, "--voice")) {
             knobs = synth.parseKnobs(next orelse fail(io, "--voice needs a value", .{})) catch |e|
-                fail(io, "bad --voice '{s}': {s} (want attack=N,noise=N,wobble=N)", .{ next.?, @errorName(e) });
+                fail(io, "bad --voice '{s}': {s} (want attack=N,noise=N,wobble=N,intensity=N,cents=N,pressure=N,tension=N,resonance=N,decay=N,turbulence=N)", .{ next.?, @errorName(e) });
             i += 1;
         } else if (std.mem.eql(u8, a, "--pattern")) {
             const v = next orelse fail(io, "--pattern needs a value", .{});
@@ -813,7 +816,7 @@ fn cmdPlay(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: [
             i += 1;
         } else if (std.mem.eql(u8, a, "--voice")) {
             knobs = synth.parseKnobs(next orelse fail(io, "--voice needs a value", .{})) catch |e|
-                fail(io, "bad --voice '{s}': {s} (want attack=N,noise=N,wobble=N)", .{ next.?, @errorName(e) });
+                fail(io, "bad --voice '{s}': {s} (want attack=N,noise=N,wobble=N,intensity=N,cents=N,pressure=N,tension=N,resonance=N,decay=N,turbulence=N)", .{ next.?, @errorName(e) });
             i += 1;
         } else if (std.mem.eql(u8, a, "--pattern")) {
             const v = next orelse fail(io, "--pattern needs a value", .{});

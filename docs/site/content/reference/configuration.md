@@ -35,6 +35,11 @@ pattern = "3+1"
 attack = 1.0
 noise = 0.5
 wobble = 1.0
+pressure = 1.3
+tension = 0.75
+resonance = 1.35
+decay = 1.0
+turbulence = 1.8
 intensity = 0.8
 cents = -100
 
@@ -49,7 +54,7 @@ note61 = "shuzi:3"
 | `pattern` | Bar pattern such as `"3+1"` |
 | `host` | Room address, including optional port |
 | `user`, `pass` | Join-only credentials |
-| `[voice]` | `attack`, `noise`, `wobble`, `intensity`, `cents` |
+| `[voice]` | `attack`, `noise`, `wobble`, `pressure`, `tension`, `resonance`, `decay`, `turbulence`, `intensity`, `cents` |
 | `[map]` | `noteN` bindings to phrase text or `"shuzi:SEED"` |
 
 Connection keys are ignored by offline rendering. The note map is used by

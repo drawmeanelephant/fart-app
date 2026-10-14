@@ -25,3 +25,9 @@ noise = 1.0                           # e.g. 0    = clean, no attack splat
 wobble = 1.0                          # e.g. 2    = twice the flutter depth
 intensity = 1.0                       # #15: 0.25..4 — whisper to shout
 cents = 0                             # #16: ±1200 — shift every vowel pitch
+# Physical-model knobs: 1 on every axis is the stock sound exactly.
+pressure = 1.0                        # gut squeeze: level, pitch, sputter, punch
+tension = 1.0                         # sphincter: buzz brightness, noise aperture
+resonance = 1.0                       # terminal tract ring (formant Q)
+decay = 1.0                           # pitch-drop rate; 0 holds the pitch flat
+turbulence = 1.0                      # noise-burst sputter through the syllable

@@ -7,8 +7,11 @@ summary: Tune the voice, choose a bar pattern, and keep rests honest.
 
 # Find your inner bassoon
 
-The voice is a buzzy oscillator, an attack splat, and a fluttering decay.
-Knobs scale the existing onset classes rather than replacing their character.
+The voice is a small physical model: intestinal pressure vents exponentially
+across the syllable, a tension-tilted harmonic buzz is colored by a
+two-formant terminal tract, and filtered noise adds the splat, the body hiss,
+and a sputtering turbulence train. Knobs scale the existing onset classes
+rather than replacing their character.
 
 ## Tune the voice
 
@@ -17,6 +20,8 @@ Knobs scale the existing onset classes rather than replacing their character.
   --voice "intensity=2.5"
 ./zig-out/bin/kujamba render --phrase "kujamba karibu" --out low.wav \
   --voice "cents=-1200,noise=0.4,wobble=0.5"
+./zig-out/bin/kujamba render --phrase "kujamba karibu" --out thunder.wav \
+  --voice "pressure=1.3,tension=0.75,resonance=1.35,turbulence=1.8,decay=1.3"
 ```
 
 | Knob | What it changes | Default |
@@ -26,15 +31,30 @@ Knobs scale the existing onset classes rather than replacing their character.
 | `wobble` | Multiplier on flutter depth, not its rate | `1` |
 | `intensity` | Effort: level, noise, and stress emphasis | `1` |
 | `cents` | Vowel pitch offset; 100 cents is one semitone | `0` |
+| `pressure` | Gut squeeze: level, pitch lift, sputter, plosive punch | `1` |
+| `tension` | Sphincter tightness: buzz brightness, noise aperture | `1` |
+| `resonance` | Terminal tract ring: formant Q and color | `1` |
+| `decay` | Pitch-drop rate; 0 freezes the pitch flat | `1` |
+| `turbulence` | Noise-burst sputter through the syllable | `1` |
 
 Applied attack time is clamped to 0.5–200 ms; applied noise and wobble depth
 are clamped to 0–1. Effort is clamped to 0.25–4 and pitch to ±1200 cents.
-These are effective synthesis bounds, not all bounds on the raw multipliers.
-Silence and invalid floating-point audio are not useful presets.
+Pressure is clamped to 0.25–4, tension to 0–2, resonance to 0–3, the pitch
+decay rate to 0–8, and turbulence to 0–4. These are effective synthesis
+bounds, not all bounds on the raw multipliers. Silence and invalid
+floating-point audio are not useful presets.
 
 `intensity=0.4` whispers; `intensity=2.5` shouts. Effort changes the penultimate
 syllable's stress emphasis too. `cents=-1200` lowers vowels one octave but does
 not transpose the randomly pitched, wordless shuzi rumble.
+
+The physical knobs shape texture rather than just level: `pressure` squeezes
+the gut louder, sharper and sputterier (and lifts the pitch a little);
+`tension=0.2` is loose and wet, `tension=1.8` tight and raspy; `resonance`
+rings the tract — low is dry and flat, high is boomy; `decay=2` drops the
+pitch hard as the pressure vents, `decay=0` holds it flat; `turbulence=3`
+sputters noise bursts through the body of the syllable, `turbulence=0` is a
+clean toot.
 
 Defaults are an identity. A preset spelling out every default reproduces the
 untuned voice in the same build.

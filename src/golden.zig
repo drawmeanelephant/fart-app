@@ -87,20 +87,29 @@ pub const Fingerprint = struct {
 };
 
 /// The baseline. Any change here is a deliberate, reviewable act.
+///
+/// Re-baselined for the physical-model synth (intestinal pressure, sphincter
+/// tension, terminal tract resonance, exponential pitch decay, noise-burst
+/// turbulence, plosive pressure bursts): the default sound is deliberately
+/// different — fatter, louder and more varied than the four-harmonic buzz it
+/// replaces. Timing is unchanged, so `items` and `samples` still match the
+/// old table; the level, spectral and envelope fields moved on purpose.
+/// The synth also renders through pure-arithmetic sine/exp now, so these
+/// fingerprints are bit-identical across optimization modes, not just close.
 pub const expected = [_]Fingerprint{
     // the phrase the demo, the docs and the readme all use
-    .{ .name = "kujamba karibu", .kind = .phrase, .input = "kujamba karibu", .items = 6, .samples = 79380, .peak = 22007, .zero_crossings = 720, .rms_milli = 4173837, .envelope_sha256 = "b689f1368324e2b7abe414e01bdb121730f0bb6e7ffd0bd9a9defcb752f234d1", .wav_sha256 = "21c6faa26eb63b958968a6dfe2fcf33073182be7f34c0cef416894c84b045f3d" },
+    .{ .name = "kujamba karibu", .kind = .phrase, .input = "kujamba karibu", .items = 6, .samples = 79380, .peak = 31129, .zero_crossings = 1756, .rms_milli = 5243722, .envelope_sha256 = "57f267d9788c7400704098df1eef0364e73331dae8c0654249f7135d26a240b1", .wav_sha256 = "f6fb3adea136335e07a217c0e3d39b94f28968f11ffffca612d96fa375fdb28c" },
     // longer, so the fingerprint covers stress placement across several words
-    .{ .name = "asante sana kijiji", .kind = .phrase, .input = "asante sana kijiji", .items = 8, .samples = 109368, .peak = 25998, .zero_crossings = 1134, .rms_milli = 4164752, .envelope_sha256 = "a6b896d1bc43543a6827465d36223fa91cf49cefe4b44460fe7a0272efa55a13", .wav_sha256 = "5973bbb55e662d2d47fdef82c2d4ee4b2ba059aa3d760e7801060e1af1d80c07" },
+    .{ .name = "asante sana kijiji", .kind = .phrase, .input = "asante sana kijiji", .items = 8, .samples = 109368, .peak = 31129, .zero_crossings = 2822, .rms_milli = 4656114, .envelope_sha256 = "30850e485c58eca4f81561336a4700ea4eb7380329fcae4dd33dc99ab902c643", .wav_sha256 = "dde14edac86d7514ab3f19315dd4e73fc567801b584fce70570f5d31e80f7113" },
     // one syllable: the shortest render that still has an onset
-    .{ .name = "single syllable", .kind = .phrase, .input = "a", .items = 1, .samples = 10584, .peak = 15986, .zero_crossings = 114, .rms_milli = 3958198, .envelope_sha256 = "3c5018bab5a904216360d5629d715d4a23098c8197d13f4331cb7f0a5580b8fe", .wav_sha256 = "a62ad430e53741188447d842344e26e4fdc72bf86793fb5b84143ab0421f80f9" },
+    .{ .name = "single syllable", .kind = .phrase, .input = "a", .items = 1, .samples = 10584, .peak = 25208, .zero_crossings = 260, .rms_milli = 3840524, .envelope_sha256 = "8a4b1908391f95b2a6b3cbc6ff43e7c673076c3e8ced8185ebb34ae2dda7f7eb", .wav_sha256 = "41d183ab9af1851a1be12e23dc5def9a0674316f551bb8b145739f2ce37adee7" },
     // digits and punctuation are not word characters, so the word splitter
     // has to skip them and still place the syllables correctly
-    .{ .name = "punctuation and digits", .kind = .phrase, .input = "kujamba 123 karibu!", .items = 6, .samples = 79380, .peak = 21565, .zero_crossings = 766, .rms_milli = 4192678, .envelope_sha256 = "46981dc90e5a44a07254e7e492b90d2c99a0675eac67a0c5efcb7177c7a7c245", .wav_sha256 = "ca7703195aa4a5e34da7c7eae0eb1bdfa0b096e206d1f489ec96074077172093" },
+    .{ .name = "punctuation and digits", .kind = .phrase, .input = "kujamba 123 karibu!", .items = 6, .samples = 79380, .peak = 31129, .zero_crossings = 1842, .rms_milli = 5300514, .envelope_sha256 = "221ed6a893f7b335dfc6b00aeb77d6349b74050cdca557fc1eb05506e89a1993", .wav_sha256 = "46b4d5429c264457ec8fa174a75c013554acdb35b1b47a41a4e09d3c854767a6" },
     // wordless farts: no plan, and the noise/wobble path M6 will touch
-    .{ .name = "shuzi seed 0", .kind = .shuzi, .input = "0", .items = 0, .samples = 10143, .peak = 18461, .zero_crossings = 180, .rms_milli = 4662515, .envelope_sha256 = "ff3acaee614295f74be4eec9ae8f1ced7e0d9542a5bfb90cf79c18e5e9068f4c", .wav_sha256 = "7e763663eadf675a0c5a26b05f460af57cb89566d68df11fd10b57796556fa8a" },
-    .{ .name = "shuzi seed 42", .kind = .shuzi, .input = "42", .items = 0, .samples = 34839, .peak = 21395, .zero_crossings = 486, .rms_milli = 4081417, .envelope_sha256 = "effa4312bb20886b185c43f4cada609baebbba77b539af351f7d839e71f38a17", .wav_sha256 = "4c0500f416ca522f8bda17db9a1bb3a11f107be23fda353d6e66268d3e44c46a" },
-    .{ .name = "shuzi seed 1234567", .kind = .shuzi, .input = "1234567", .items = 0, .samples = 10584, .peak = 19089, .zero_crossings = 104, .rms_milli = 4564000, .envelope_sha256 = "369cd4bd42022e93224eb9fb93ba0c0eac937e9f78dfd29a8e6e269498d343eb", .wav_sha256 = "fccfb948356d4697f6bf941a6b5f9dc59fcf712d3438f92919804de9724c20da" },
+    .{ .name = "shuzi seed 0", .kind = .shuzi, .input = "0", .items = 0, .samples = 10143, .peak = 26048, .zero_crossings = 254, .rms_milli = 5107948, .envelope_sha256 = "ce9dbec8263ba6f8aa1fd1ddbad612039496089cc5eb0d8d48d72dc4c3a5d424", .wav_sha256 = "635d0297d1e7c1b5c1a71495b8c430dfdb26e68ab51ca3461eb45d953f8d790e" },
+    .{ .name = "shuzi seed 42", .kind = .shuzi, .input = "42", .items = 0, .samples = 37044, .peak = 31129, .zero_crossings = 1338, .rms_milli = 4647417, .envelope_sha256 = "48359d60eb55a09a82cec0decccc1ebc83dc3c407eb7da58d92fc0d3221f4ed4", .wav_sha256 = "1441a65990877452746367b8a147542b5e7f2083b5dd50a25d9b9cfe81b5414c" },
+    .{ .name = "shuzi seed 1234567", .kind = .shuzi, .input = "1234567", .items = 0, .samples = 10584, .peak = 21506, .zero_crossings = 126, .rms_milli = 4711179, .envelope_sha256 = "3fa067bf7746a7f7cbc0456144c9e634c766c3ccb40e361729f608a68bc53751", .wav_sha256 = "19bc7017ea11659fbe8ac9a3a98411edbdd2f733036a491ab2bd91d1a44ad833" },
 };
 
 /// A fingerprint as measured right now, ready to paste into `expected`.
