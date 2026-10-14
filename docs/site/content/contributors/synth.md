@@ -11,8 +11,20 @@ summary: Syllables, oscillator/noise envelopes, timing, and measured determinism
 It renders mono 44.1 kHz PCM; WAV output is 16-bit. The instrument converts
 that synthesis into float samples for its shared phrase-to-bar path.
 
-One syllable combines a low buzzy oscillator with falling pitch, a noisy
-attack splat, and a fluttering decay. A small parser groups Swahili vowels,
+One syllable combines asymmetric valve pulses, a bass fundamental and a wet
+subharmonic. Intestinal pressure empties exponentially: pitch follows
+`f0 * register * (0.48 + 0.80 * exp(-decay * u))`, where `u` runs from 0 to 1
+and the register depends on pressure and sphincter tension. A short stop
+release adds a temporary pressure/pitch surge.
+
+A seeded 250 Hz control stream drives irregular flutter and short noise
+bursts. Low tension alternates valve pulses and adds subharmonic body; high
+tension narrows pulses and adds rasp. Two parallel bandpass biquads supply
+vowel formants, a third supplies the terminal tract's bass cavity. DC removal,
+a cosine release tail and smooth saturation keep boundaries quiet and peaks
+bounded. Filter state is local to each syllable, never shared between renders.
+
+A small parser groups Swahili vowels,
 digraphs, and consonant onsets; it is not a general linguistic model.
 
 ## Vowel pitch
@@ -24,6 +36,21 @@ digraphs, and consonant onsets; it is not a general linguistic model.
 | i | 138 Hz |
 | o | 86 Hz |
 | u | 74 Hz |
+
+These are reference pitches, not fixed output pitches. Pressure, tension,
+exponential decay and per-syllable seeded variation shape the actual pitch.
+
+| Vowel | First formant | Second formant |
+|---|---|---|
+| a | 520 Hz | 1150 Hz |
+| e | 410 Hz | 1650 Hz |
+| i | 290 Hz | 2150 Hz |
+| o | 360 Hz | 820 Hz |
+| u | 250 Hz | 600 Hz |
+
+`resonance` blends these filters into the unfiltered bass source, raises their
+Q, and slightly lowers cavity/formant frequencies. At zero the tract is dry;
+formant frequencies do not transpose with `cents`.
 
 `cents` multiplies these by `2^(cents/1200)`. The breath tail's 88 Hz carrier
 follows that shift. Shuzi has randomly selected pitch keyed by its seed.
@@ -41,6 +68,10 @@ follows that shift. Shuzi has randomly selected pitch keyed by its seed.
 
 Voice knobs scale those classes. Effort scales level/noise/stress; wobble
 controls depth rather than rate. See [[guides/voice|the user-facing controls]].
+Plosives additionally release stored pressure: `p` has the strongest pop,
+`k/t/ch` a sharp crack, and `b/d/g/j` a softer release. The scanner retains
+onset classes, but the release lookup examines the whole cluster, so `mb`
+also gets a pressure burst.
 
 ## Timing
 

@@ -7,8 +7,9 @@ summary: Tune the voice, choose a bar pattern, and keep rests honest.
 
 # Find your inner bassoon
 
-The voice is a buzzy oscillator, an attack splat, and a fluttering decay.
-Knobs scale the existing onset classes rather than replacing their character.
+The voice is a pressure-driven valve pulse with deep bass, irregular flutter,
+intermittent splats, and resonant vowel colors. Onset multipliers preserve each
+consonant's character; physical controls shape the source and terminal tract.
 
 ## Tune the voice
 
@@ -26,11 +27,19 @@ Knobs scale the existing onset classes rather than replacing their character.
 | `wobble` | Multiplier on flutter depth, not its rate | `1` |
 | `intensity` | Effort: level, noise, and stress emphasis | `1` |
 | `cents` | Vowel pitch offset; 100 cents is one semitone | `0` |
+| `pressure` | Intestinal pressure, 0.25–3: higher is weightier, louder, with stronger release transients and higher initial pitch | `1` |
+| `tension` | Sphincter tension, 0–1: low is wet, loose, subharmonic and irregular; high is tight, higher-pitched, dry and raspy | `0.45` |
+| `resonance` | Terminal tract resonance, 0–1: blends in a bass cavity and vowel formants; high is deeper, hollower, more resonant | `0.65` |
+| `turbulence` | Noise-burst turbulence, 0–1: low is cleaner; high adds irregular splats and sputters throughout the body | `0.45` |
+| `decay` | Exponential pressure loss per syllable, 0–8: 0 holds pitch; high dives quickly into a low rumble | `2.6` |
 
 Applied attack time is clamped to 0.5–200 ms; applied noise and wobble depth
 are clamped to 0–1. Effort is clamped to 0.25–4 and pitch to ±1200 cents.
 These are effective synthesis bounds, not all bounds on the raw multipliers.
 Silence and invalid floating-point audio are not useful presets.
+Physical controls are clamped to their table ranges. `noise=0` removes all
+noise, including turbulence and stop attacks. `turbulence=0` removes body
+turbulence but keeps the consonants' short pressure-release splats.
 
 `intensity=0.4` whispers; `intensity=2.5` shouts. Effort changes the penultimate
 syllable's stress emphasis too. `cents=-1200` lowers vowels one octave but does
@@ -38,6 +47,24 @@ not transpose the randomly pitched, wordless shuzi rumble.
 
 Defaults are an identity. A preset spelling out every default reproduces the
 untuned voice in the same build.
+
+## Wet, dry, raspy, thunderous
+
+```bash
+./zig-out/bin/kujamba render --phrase "paka kubwa shuzi" --out wet.wav \
+  --voice "pressure=1.8,tension=0.12,resonance=0.85,turbulence=0.8"
+./zig-out/bin/kujamba render --phrase "paka kubwa shuzi" --out dry.wav \
+  --voice "tension=0.9,turbulence=0.1,resonance=0.25"
+./zig-out/bin/kujamba render --phrase "paka kubwa shuzi" --out raspy.wav \
+  --voice "tension=0.95,turbulence=1,noise=1.5"
+./zig-out/bin/kujamba render --phrase "paka kubwa shuzi" --out thunder.wav \
+  --voice "pressure=2.5,tension=0.2,resonance=1,cents=-500,decay=1.8"
+```
+
+All controls also work in a config file's `[voice]` table. Vowels now select
+two real resonant filters as well as pitch. `k`, `p`, and `b` release stored
+pressure at the onset, including clusters such as `kw` and `mb`. The same
+pressure, valve and turbulence controls shape seeded wordless shuzi.
 
 ## Map a phrase onto bars
 
