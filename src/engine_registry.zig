@@ -5,7 +5,8 @@
 //! exponential pitch sag, formant vowels, plosive bursts — deterministic,
 //! headless-safe, pure Zig. A tenth, `gutphysics` (MiMo Pro 2.6 under the
 //! Codebuff agent), arrived as PR #99 on a branch too stale to merge and was
-//! absorbed the same way. All ten
+//! absorbed the same way. Grok 4.7 and Kimi K3 joined as entries 11 and 12
+//! under the same protocol. All twelve
 //! are keepers, so their DSP lives here as `src/engines/<slug>.zig` (each
 //! file is that branch's `synth.zig` verbatim) and this module dispatches
 //! between them.
@@ -39,7 +40,9 @@ const argon4 = @import("engines/argon4.zig");
 const astra = @import("engines/astra.zig");
 const fable = @import("engines/fable.zig");
 const gemini38 = @import("engines/gemini38.zig");
+const grok47 = @import("engines/grok47.zig");
 const gutphysics = @import("engines/gutphysics.zig");
+const kimi3 = @import("engines/kimi3.zig");
 const mistral4 = @import("engines/mistral4.zig");
 const opus = @import("engines/opus.zig");
 const sol61 = @import("engines/sol61.zig");
@@ -64,6 +67,12 @@ pub const Id = enum {
     /// Absorbed from an unmergeable stale-branch PR: same brief, different
     /// contestant.
     gutphysics,
+    /// Grok 4.7 (late entry #11) — 0..1 amounts, not multipliers; + wetness,
+    /// decay. "I bear down, I sag, and I do not apologize for the rasp."
+    grok47,
+    /// Kimi K3 (late entry #12) — + formant; collapsing-pressure gut model
+    /// with an SVF tract boom. "Every fart I make has eaten."
+    kimi3,
     /// Mistral Large 4 — + decay; bit-identical across build modes
     mistral4,
     /// Claude Opus 5.5 — + tract, wetness, droop, classic
@@ -109,6 +118,8 @@ fn engineModule(comptime id: Id) type {
         .fable => fable,
         .gemini38 => gemini38,
         .gutphysics => gutphysics,
+        .grok47 => grok47,
+        .kimi3 => kimi3,
         .mistral4 => mistral4,
         .opus => opus,
         .sol61 => sol61,
@@ -129,6 +140,8 @@ pub const Knobs = union(Id) {
     fable: fable.VoiceKnobs,
     gemini38: gemini38.VoiceKnobs,
     gutphysics: gutphysics.VoiceKnobs,
+    grok47: grok47.VoiceKnobs,
+    kimi3: kimi3.VoiceKnobs,
     mistral4: mistral4.VoiceKnobs,
     opus: opus.VoiceKnobs,
     sol61: sol61.VoiceKnobs,

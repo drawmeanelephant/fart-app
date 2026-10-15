@@ -126,8 +126,9 @@ fn printUsage(io: std.Io) void {
         \\                       entry parses its own spec, and "engine=<slug>" may
         \\                       appear inside the spec itself.
         \\    --engine SLUG      fart-off engine (M9, #95) — one of:
-        \\                       stock argon4 astra fable gemini38 gutphysics
-        \\                       mistral4 opus sol61 sonnet swe2.
+        \\                       stock argon4 astra fable gemini38 grok47
+        \\                       gutphysics kimi3 mistral4 opus sol61
+        \\                       sonnet swe2.
         \\                       Absent = stock.
         \\    --play MODE        how the phrase maps onto bars:
         \\                       repeat  restart at every fart bar (default)
