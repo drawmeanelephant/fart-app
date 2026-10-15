@@ -332,6 +332,55 @@ pub const PhraseBank = struct {
         self.rendered += samples.len;
     }
 
+    /// Adopt an already-rendered (or already-loaded) buffer as a bank entry —
+    /// the `--wav` path (#98), where nothing is synthesized but the same
+    /// budget applies. Ownership moves to the bank the moment this is called:
+    /// on success `deinit` frees the buffer, on failure it is freed here.
+    pub fn addBuffer(self: *PhraseBank, name: []const u8, samples: []const f32) !void {
+        errdefer self.alloc.free(samples);
+        if (self.rendered + samples.len > self.budget) return error.BankTooLarge;
+        try self.entries.append(self.alloc, .{ .name = name, .samples = samples });
+        self.rendered += samples.len;
+    }
+
+    /// Swap entry `idx`'s audio for `samples` — the `--wav-reload` path (#98).
+    /// The budget is charged the *net* change (`rendered - old + new`), so
+    /// reloading a file of the same size can never trip it, and an over-budget
+    /// replacement is rejected with `BankTooLarge` exactly like a phrase.
+    ///
+    /// The entry's play cursor resets to 0: a new file is a fresh sound, and
+    /// in `once` a kept (already exhausted) cursor would mute the reload
+    /// entirely. `fill` keeps a live source valid across the swap:
+    /// `Fill.bind` deliberately treats a same-pointer rebind as a no-op, so a
+    /// fill bound to this entry would keep reading the freed buffer without
+    /// this fixup. The entry and the bound fill are repointed BEFORE the old
+    /// buffer is freed, so `fill.samples` never holds a dangling pointer at
+    /// any single step. Pass null when no fill is bound to this entry.
+    ///
+    /// `samples` belongs to the bank either way: adopted on success, freed on
+    /// failure (the old audio stays in place).
+    pub fn replaceBuffer(self: *PhraseBank, idx: usize, samples: []const f32, fill: ?*Fill) !void {
+        errdefer self.alloc.free(samples);
+        const entry = &self.entries.items[idx];
+        // `rendered` only counts buffers the bank owns; a borrowed entry's old
+        // buffer costs nothing and its replacement is what starts costing.
+        const counted: usize = if (entry.owned) entry.samples.len else 0;
+        if (self.rendered - counted + samples.len > self.budget) return error.BankTooLarge;
+        const old = entry.samples;
+        const was_owned = entry.owned;
+        entry.samples = samples;
+        entry.owned = true;
+        entry.cursor = 0;
+        self.rendered = self.rendered - counted + samples.len;
+        if (fill) |f| {
+            if (f.bound == entry) {
+                f.samples = samples;
+                f.cursor = 0;
+            }
+        }
+        if (was_owned) self.alloc.free(old);
+    }
+
     /// Parse a bank file: one phrase per line, `#` comments and blank lines
     /// skipped, CRLF tolerated. Deliberately *not* TOML — the config file
     /// (#22) is a settings overlay, and a phrase list is a different shape
@@ -440,6 +489,20 @@ pub const PlanAdapter = struct {
     /// force a rest bar (silence markers); false = force a play bar. Set by a
     /// `!kujamba play|rest` chat command and consumed at the next bar boundary.
     rest: ?bool = null,
+    /// Optional work to run at every bar boundary, invoked by
+    /// `broadcastForFn` after the ordinary selection is applied — after
+    /// `bank.active()` has consumed a pending switch and `fill.bind` has
+    /// loaded the entry's playhead — and before the engine generates any
+    /// audio for the bar, on rest bars and tempo-change re-anchors too.
+    /// The `--wav-reload` driver hangs here (#98): it is the one place a file
+    /// re-read lands exactly on the bar, never mid-bar. The hook may re-point
+    /// the bound fill; see `PhraseBank.replaceBuffer` for the safe way.
+    boundary_hook: ?BoundaryHook = null,
+
+    pub const BoundaryHook = struct {
+        ctx: *anyopaque,
+        run: *const fn (ctx: *anyopaque, fill: ?*Fill) void,
+    };
 
     /// Application-only selection; the shared session never sees phrase/mode.
     pub fn selectForFn(ctx: *anyopaque, interval_idx: u64) Selection {
@@ -457,9 +520,29 @@ pub const PlanAdapter = struct {
         const self: *PlanAdapter = @ptrCast(@alignCast(ctx));
         const selected = selectForFn(ctx, grid);
         if (self.fill) |fill| fill.bind(selected.mode, selected.phrase);
+        if (self.boundary_hook) |h| h.run(h.ctx, self.fill);
         return selected.broadcast;
     }
 };
+
+/// Length of the linear fade-out baked into the tail of every buffer the
+/// session can loop, in samples: 8 ms at the session rate. One constant so a
+/// synth render and a loaded `--wav` file fade identically (#98) — the wrap
+/// point and the interval tail land on (near-)silence instead of clicking.
+pub const tail_fade_samples: usize = synth.SAMPLE_RATE * 8 / 1000;
+
+/// Ramp the last `tail_fade_samples` of `out` linearly toward zero, in place.
+/// The ramp reaches 1/N at the final sample rather than exactly zero; buffers
+/// whose tails are already silent (the synth's own decay envelope) end at a
+/// literal 0 either way.
+pub fn applyTailFade(out: []f32) void {
+    const fade: usize = @min(out.len, tail_fade_samples);
+    if (fade == 0) return;
+    const start = out.len - fade;
+    for (out[start..], 0..) |*o, k| {
+        o.* *= @as(f32, @floatFromInt(fade - k)) / @as(f32, @floatFromInt(fade));
+    }
+}
 
 /// Render a Swahili phrase with the Flatlophone synth into mono f32 samples
 /// at `synth.SAMPLE_RATE`, with a short linear fade-out so phrase tails and
@@ -480,13 +563,7 @@ pub fn renderPhraseF32With(
     defer alloc.free(pcm16);
     const out = try alloc.alloc(f32, pcm16.len);
     for (pcm16, out) |v, *o| o.* = @as(f32, @floatFromInt(v)) / 32768.0;
-    const fade: usize = @min(out.len, synth.SAMPLE_RATE * 8 / 1000); // 8 ms
-    if (fade > 0) {
-        const start = out.len - fade;
-        for (out[start..], 0..) |*o, k| {
-            o.* *= @as(f32, @floatFromInt(fade - k)) / @as(f32, @floatFromInt(fade));
-        }
-    }
+    applyTailFade(out);
     return out;
 }
 

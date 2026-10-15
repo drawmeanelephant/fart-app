@@ -16,6 +16,8 @@ test {
     _ = @import("kujamba_main.zig");
     std.testing.refAllDecls(@import("kujamba_config.zig"));
     _ = @import("kujamba_config.zig");
+    std.testing.refAllDecls(@import("kujamba_wav.zig"));
+    _ = @import("kujamba_wav.zig");
     _ = @import("proto_fuzz.zig");
     _ = @import("kujamba_backpressure.zig");
     _ = @import("kujamba_session_tests.zig");

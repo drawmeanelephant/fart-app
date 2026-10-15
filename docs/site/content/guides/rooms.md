@@ -62,6 +62,29 @@ Do not combine `--phrase` and `--phrases`. Each phrase is rendered once at
 startup. The bank has a 64 MiB rendered-audio budget, roughly six minutes at
 the instrument's sample rate.
 
+## Play a pre-rendered WAV
+
+`--wav FILE` uploads a file instead of a synthesized phrase:
+
+```bash
+./zig-out/bin/kujamba join --host 127.0.0.1:20531 \
+  --user YOUR_USER --pass YOUR_ROOM_PASSWORD \
+  --wav take.wav --wav-reload
+```
+
+The input must be RIFF/WAVE PCM s16 at 44.1 kHz, mono or stereo (stereo is
+downmixed). It becomes the bank's single entry, so `--pattern`, `--play`, and
+the chat controls below all work the same — `kujamba rest` still rests on the
+bar grid. `--phrase`/`--phrases` conflict with it; `--voice`/`--engine` do
+not apply (a warning says so) because nothing is synthesized.
+
+With `--wav-reload`, the file is re-stat at every bar boundary and re-read
+when it changed — replace it **atomically** (write a temp file, rename over
+the path) so the boundary check never meets a half-written file. A failed
+re-read keeps the previous audio and is counted as `wav_reload_failed` in the
+`RESULT` line. Without the flag the file is read once at startup. See
+[[reference/cli|the CLI reference]] for the full input rules.
+
 ## Conduct from room chat
 
 Send ordinary room messages **without a leading `!`**:

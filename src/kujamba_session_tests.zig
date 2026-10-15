@@ -13,6 +13,8 @@ const netmod = @import("ninjam/net.zig");
 const clock = @import("ninjam/clock.zig");
 const vorbis = @import("ninjam/vorbis.zig");
 const kujamba_out = @import("ninjam_out.zig");
+const kujamba_wav = @import("kujamba_wav.zig");
+const synth = @import("synth.zig");
 const registry = @import("engine_registry.zig");
 
 test "multi-channel live capture shares one block per step (channels stay aligned)" {
@@ -1153,4 +1155,388 @@ test "kujamba: switching phrases does not re-render, so payloads stay byte-ident
     bank_a.request("2");
     _ = bank_a.active();
     try std.testing.expectEqual(stored, bank_a.entries.items[1].samples.ptr);
+}
+
+// ---- #98 --wav / --wav-reload ------------------------------------------------
+
+/// Write a constant-tone mono s16 WAV through the repo's own writer, so the
+/// bytes under test are the canonical shape `kujamba render` would produce.
+fn writeConstWav(dir: std.Io.Dir, io: std.Io, name: []const u8, value: i16, count: usize) !void {
+    const alloc = std.testing.allocator;
+    const pcm = try alloc.alloc(i16, count);
+    defer alloc.free(pcm);
+    @memset(pcm, value);
+    const bytes = try synth.writeWavBytes(alloc, pcm, 44100);
+    defer alloc.free(bytes);
+    const f = try dir.createFile(io, name, .{});
+    defer f.close(io);
+    try f.writeStreamingAll(io, bytes);
+}
+
+/// The session shape --wav drives: one bank entry adopted from a real file,
+/// a fill bound to it, and the plan's boundary hook pointing at a Reloader.
+/// Mirrors cmdJoin's wiring so the test covers the same path the flag does.
+const WavSession = struct {
+    bank: kujamba_out.PhraseBank,
+    fill: kujamba_out.Fill,
+    adapter: kujamba_out.PlanAdapter,
+    reloader: kujamba_wav.Reloader,
+    pattern: kujamba_out.Pattern,
+
+    /// Initialize in place: the adapter, fill and reloader all hold pointers
+    /// into `self`, so the struct can never be returned by value — the wired
+    /// pointers must point at the caller's storage from the start.
+    fn init(
+        self: *WavSession,
+        alloc: std.mem.Allocator,
+        io: std.Io,
+        dir: std.Io.Dir,
+        path: []const u8,
+        mode: kujamba_out.Mode,
+    ) !void {
+        var diag = kujamba_wav.Diag{};
+        const loaded = try kujamba_wav.loadFile(alloc, io, dir, path, &diag);
+        self.bank = kujamba_out.PhraseBank.init(alloc);
+        errdefer self.bank.deinit();
+        try self.bank.addBuffer(path, loaded.samples);
+        self.fill = .{ .mode = mode };
+        self.fill.bind(mode, self.bank.active());
+        self.pattern = try kujamba_out.parsePattern("1");
+        self.adapter = .{ .pattern = &self.pattern, .mode = mode, .bank = &self.bank, .fill = &self.fill };
+        self.reloader = .{ .alloc = alloc, .io = io, .dir = dir, .path = path, .bank = &self.bank, .index = 0, .stamp = loaded.stamp };
+        self.adapter.boundary_hook = .{ .ctx = @ptrCast(&self.reloader), .run = kujamba_wav.Reloader.boundaryHook };
+    }
+
+    fn deinit(self: *WavSession) void {
+        self.bank.deinit();
+    }
+};
+
+test "kujamba --wav-reload: a changed file lands at the next bar boundary, and the room hears it" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeConstWav(tmp.dir, io, "v.wav", 2000, 2048);
+
+    var ws: WavSession = undefined;
+    try ws.init(alloc, io, tmp.dir, "v.wav", .repeat);
+    defer ws.deinit();
+
+    var s = try Session.init(alloc, io, .{
+        .srate = @intCast(kujamba_out.sample_rate),
+        .channel_names = &.{"kujamba"},
+        .source = ws.fill.source(),
+        .id_seed = 42,
+        .plan = .{ .ctx = @ptrCast(&ws.adapter), .selectFor = kujamba_out.PlanAdapter.broadcastForFn },
+    });
+    defer s.deinit();
+    s.log.quiet = true;
+    ws.reloader.log = &s.log;
+
+    // Bar 0 starts: the stat says unchanged, so nothing was re-read.
+    s.index.grid = 0;
+    try Session.Testing.startIntervalEncoders(&s);
+    try std.testing.expectEqual(@as(u32, 0), ws.reloader.reads);
+    const before_ptr = ws.fill.samples.ptr;
+    try std.testing.expectApproxEqAbs(@as(f32, 2000.0 / 32768.0), ws.fill.samples[0], 1e-6);
+
+    // The file is replaced mid-bar: the instrument keeps playing the old
+    // audio — a reload can only land on a boundary, never mid-bar.
+    try writeConstWav(tmp.dir, io, "v.wav", 5000, 4096);
+    try std.testing.expectApproxEqAbs(@as(f32, 2000.0 / 32768.0), ws.fill.samples[0], 1e-6);
+
+    // Bar 1: the boundary hook re-reads the file and the fill is repointed.
+    s.index.grid = 1;
+    try Session.Testing.startIntervalEncoders(&s);
+    try std.testing.expectEqual(@as(u32, 1), ws.reloader.reads);
+    try std.testing.expectEqual(@as(u32, 1), ws.reloader.reloads);
+    try std.testing.expectEqual(@as(u32, 0), ws.reloader.reload_failed);
+    // The old buffer was freed; the fill must not dangle — it points at the
+    // new allocation (replaceBuffer's repoint-before-free contract).
+    try std.testing.expect(ws.fill.samples.ptr != before_ptr);
+    try std.testing.expectEqual(@as(usize, 4096), ws.fill.samples.len);
+    try std.testing.expectApproxEqAbs(@as(f32, 5000.0 / 32768.0), ws.fill.samples[0], 1e-6);
+
+    // And the new audio really is what the source hands the encoder.
+    var block: [4]f32 = undefined;
+    ws.fill.copyInto(0, block[0..4]);
+    for (block) |v| try std.testing.expectApproxEqAbs(@as(f32, 5000.0 / 32768.0), v, 1e-6);
+}
+
+test "kujamba --wav-reload: a corrupt replacement keeps the old audio and counts a failure" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeConstWav(tmp.dir, io, "v.wav", 3000, 2048);
+
+    var ws: WavSession = undefined;
+    try ws.init(alloc, io, tmp.dir, "v.wav", .repeat);
+    defer ws.deinit();
+
+    // a transcript file, so "one line per failed reload" is observable
+    const tpath = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/transcript.log", .{&tmp.sub_path});
+    defer alloc.free(tpath);
+    var s = try Session.init(alloc, io, .{
+        .srate = @intCast(kujamba_out.sample_rate),
+        .channel_names = &.{"kujamba"},
+        .source = ws.fill.source(),
+        .id_seed = 42,
+        .transcript_path = tpath,
+        .plan = .{ .ctx = @ptrCast(&ws.adapter), .selectFor = kujamba_out.PlanAdapter.broadcastForFn },
+    });
+    defer s.deinit();
+    s.log.quiet = true;
+    ws.reloader.log = &s.log;
+
+    s.index.grid = 0;
+    try Session.Testing.startIntervalEncoders(&s);
+    const before_ptr = ws.fill.samples.ptr;
+    const before_len = ws.fill.samples.len;
+
+    // Replace it with garbage that is not a WAV at all.
+    {
+        const f = try tmp.dir.createFile(io, "v.wav", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "this is not a riff file");
+    }
+
+    // The next bar keeps the previous buffer and counts the failure —
+    // the interval is never dropped.
+    s.index.grid = 1;
+    try Session.Testing.startIntervalEncoders(&s);
+    try std.testing.expectEqual(@as(u32, 1), ws.reloader.reads);
+    try std.testing.expectEqual(@as(u32, 0), ws.reloader.reloads);
+    try std.testing.expectEqual(@as(u32, 1), ws.reloader.reload_failed);
+    try std.testing.expectEqual(before_ptr, ws.fill.samples.ptr);
+    try std.testing.expectEqual(before_len, ws.fill.samples.len);
+    try std.testing.expectApproxEqAbs(@as(f32, 3000.0 / 32768.0), ws.fill.samples[0], 1e-6);
+
+    // the failure was announced on the transcript
+    const log_bytes = try tmp.dir.readFileAlloc(io, "transcript.log", alloc, .limited(64 * 1024));
+    defer alloc.free(log_bytes);
+    try std.testing.expect(std.mem.indexOf(u8, log_bytes, "wav reload failed v.wav") != null);
+
+    // A healthy replacement on a later bar still takes over.
+    try writeConstWav(tmp.dir, io, "v.wav", 7000, 1024);
+    s.index.grid = 2;
+    try Session.Testing.startIntervalEncoders(&s);
+    try std.testing.expectEqual(@as(u32, 1), ws.reloader.reloads);
+    try std.testing.expectApproxEqAbs(@as(f32, 7000.0 / 32768.0), ws.fill.samples[0], 1e-6);
+}
+
+test "kujamba --wav-reload: an unchanged file costs one stat per bar; a vanished file fails loud" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeConstWav(tmp.dir, io, "v.wav", 2000, 2048);
+
+    var ws: WavSession = undefined;
+    try ws.init(alloc, io, tmp.dir, "v.wav", .repeat);
+    defer ws.deinit();
+
+    var s = try Session.init(alloc, io, .{
+        .srate = @intCast(kujamba_out.sample_rate),
+        .channel_names = &.{"kujamba"},
+        .source = ws.fill.source(),
+        .id_seed = 42,
+        .plan = .{ .ctx = @ptrCast(&ws.adapter), .selectFor = kujamba_out.PlanAdapter.broadcastForFn },
+    });
+    defer s.deinit();
+    s.log.quiet = true;
+
+    // Three bars of an untouched file: three stats, zero re-reads.
+    for (0..3) |g| {
+        s.index.grid = g;
+        try Session.Testing.startIntervalEncoders(&s);
+    }
+    try std.testing.expectEqual(@as(u32, 0), ws.reloader.reads);
+    try std.testing.expectEqual(@as(u32, 0), ws.reloader.reloads);
+    try std.testing.expectEqual(@as(u32, 0), ws.reloader.reload_failed);
+
+    // Deleting the file mid-set is a failed reload, not a crash: the old
+    // audio stays and the counter says why.
+    try tmp.dir.deleteFile(io, "v.wav");
+    s.index.grid = 3;
+    try Session.Testing.startIntervalEncoders(&s);
+    try std.testing.expectEqual(@as(u32, 1), ws.reloader.reload_failed);
+    try std.testing.expectEqual(@as(u32, 0), ws.reloader.reads);
+    try std.testing.expectApproxEqAbs(@as(f32, 2000.0 / 32768.0), ws.fill.samples[0], 1e-6);
+}
+
+test "kujamba --wav-reload: an over-budget replacement keeps the old audio" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeConstWav(tmp.dir, io, "v.wav", 2000, 2048);
+
+    var ws: WavSession = undefined;
+    try ws.init(alloc, io, tmp.dir, "v.wav", .repeat);
+    defer ws.deinit();
+
+    var s = try Session.init(alloc, io, .{
+        .srate = @intCast(kujamba_out.sample_rate),
+        .channel_names = &.{"kujamba"},
+        .source = ws.fill.source(),
+        .id_seed = 42,
+        .plan = .{ .ctx = @ptrCast(&ws.adapter), .selectFor = kujamba_out.PlanAdapter.broadcastForFn },
+    });
+    defer s.deinit();
+    s.log.quiet = true;
+
+    s.index.grid = 0;
+    try Session.Testing.startIntervalEncoders(&s);
+
+    // Shrink the bank's own ceiling: the 2048-sample file in it fits, but a
+    // 4096-sample replacement costs rendered - 2048 + 4096 = 4096 > 3000.
+    ws.bank.budget = 3000;
+    try writeConstWav(tmp.dir, io, "v.wav", 5000, 4096);
+    s.index.grid = 1;
+    try Session.Testing.startIntervalEncoders(&s);
+    try std.testing.expectEqual(@as(u32, 1), ws.reloader.reads);
+    try std.testing.expectEqual(@as(u32, 0), ws.reloader.reloads);
+    try std.testing.expectEqual(@as(u32, 1), ws.reloader.reload_failed);
+    try std.testing.expectEqual(@as(usize, 2048), ws.fill.samples.len);
+
+    // Net accounting goes both ways: a *smaller* file fits the same budget.
+    try writeConstWav(tmp.dir, io, "v.wav", 5000, 1024);
+    s.index.grid = 2;
+    try Session.Testing.startIntervalEncoders(&s);
+    try std.testing.expectEqual(@as(u32, 1), ws.reloader.reloads);
+    try std.testing.expectEqual(@as(usize, 1024), ws.fill.samples.len);
+    try std.testing.expectEqual(@as(usize, 1024), ws.bank.rendered);
+}
+
+test "kujamba --wav: the same file and seed encode byte-identical payloads" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeConstWav(tmp.dir, io, "v.wav", 4000, 2500);
+
+    // Two independent decodes of the same file must be bit-identical, and the
+    // encoded interval built from them must be byte-identical for the same
+    // serial — that is the --seed determinism contract (#98) observed end to
+    // end on the wav path.
+    var diag = kujamba_wav.Diag{};
+    const a = try kujamba_wav.loadFile(alloc, io, tmp.dir, "v.wav", &diag);
+    defer alloc.free(a.samples);
+    const b = try kujamba_wav.loadFile(alloc, io, tmp.dir, "v.wav", &diag);
+    defer alloc.free(b.samples);
+    try std.testing.expectEqualSlices(f32, a.samples, b.samples);
+
+    const encode = struct {
+        fn run(gpa: std.mem.Allocator, samples: []const f32, serial: u32, len: usize) ![]u8 {
+            const enc = try vorbis.Encoder.create(gpa, 44100, 0.0, serial);
+            defer enc.destroy();
+            var ogg: std.ArrayList(u8) = .empty;
+            errdefer ogg.deinit(gpa);
+            try enc.writeHeaders(&ogg);
+            var fill = kujamba_out.Fill{ .mode = .repeat, .samples = samples };
+            var block: [960]f32 = undefined;
+            var off: usize = 0;
+            while (off < len) {
+                const n = @min(block.len, len - off);
+                fill.copyInto(off, block[0..n]);
+                try enc.encode(block[0..n], &ogg);
+                off += n;
+            }
+            try enc.flush(&ogg);
+            return ogg.toOwnedSlice(gpa);
+        }
+    }.run;
+
+    const serial = @import("ninjam/instrument.zig").deriveSerial(42, 0, 0);
+    const len: usize = 960 * 4; // a 4-block interval, longer than the wav: repeat pads
+    const one = try encode(alloc, a.samples, serial, len);
+    defer alloc.free(one);
+    const two = try encode(alloc, b.samples, serial, len);
+    defer alloc.free(two);
+    try std.testing.expectEqualSlices(u8, one, two);
+    try std.testing.expect(one.len > 200); // real payload, not a stub
+}
+
+test "kujamba --wav: repeat pads a short wav and truncates a long one; loop wraps" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // 512 samples: long enough that the 352-sample tail fade leaves the head
+    // untouched, short enough to wrap inside a readable block. Head samples
+    // are distinguishable; the rest is silence.
+    {
+        var pcm: [512]i16 = @splat(0);
+        pcm[0] = 1000;
+        pcm[1] = 2000;
+        pcm[2] = 3000;
+        const bytes = try synth.writeWavBytes(alloc, &pcm, 44100);
+        defer alloc.free(bytes);
+        const f = try tmp.dir.createFile(io, "tiny.wav", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, bytes);
+    }
+    var diag = kujamba_wav.Diag{};
+    const loaded = try kujamba_wav.loadFile(alloc, io, tmp.dir, "tiny.wav", &diag);
+    var bank = kujamba_out.PhraseBank.init(alloc);
+    defer bank.deinit();
+    try bank.addBuffer("tiny.wav", loaded.samples);
+    try std.testing.expectEqual(@as(usize, 512), bank.entries.items[0].samples.len);
+    try std.testing.expectEqual(@as(usize, 512), bank.rendered); // counts toward the budget
+
+    // repeat over a 6-sample interval read: the wav's head plays then pads
+    var fill = kujamba_out.Fill{ .mode = .repeat };
+    fill.bind(.repeat, bank.active());
+    var block: [6]f32 = undefined;
+    fill.copyInto(0, &block);
+    try std.testing.expectApproxEqAbs(@as(f32, 1000.0 / 32768.0), block[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 3000.0 / 32768.0), block[2], 1e-6);
+    try std.testing.expectEqual(@as(f32, 0.0), block[4]);
+    try std.testing.expectEqual(@as(f32, 0.0), block[5]);
+
+    // a read longer than the wav truncates at its end — the tail fades to
+    // (near-)zero and everything past it is silence
+    var long: [520]f32 = undefined;
+    fill.copyInto(0, &long);
+    try std.testing.expectApproxEqAbs(@as(f32, 1000.0 / 32768.0), long[0], 1e-6);
+    try std.testing.expectEqual(@as(f32, 0.0), long[519]);
+
+    // loop wraps the buffer continuously: sample 512 is sample 0 again
+    fill.bind(.loop, bank.active());
+    fill.cursor = 0;
+    var wrapped: [515]f32 = undefined;
+    fill.copyInto(0, &wrapped); // the interval offset is ignored in loop mode
+    try std.testing.expectApproxEqAbs(wrapped[0], wrapped[512], 1e-7);
+    try std.testing.expectApproxEqAbs(wrapped[1], wrapped[513], 1e-7);
+    try std.testing.expectApproxEqAbs(wrapped[2], wrapped[514], 1e-7);
+
+    // once: a single pass, then silence — the exhausted cursor is why a
+    // reload must reset it (a kept exhausted cursor would mute the reload)
+    fill.bind(.once, bank.active());
+    fill.cursor = 0;
+    var once_blk: [520]f32 = undefined;
+    fill.copyInto(0, &once_blk);
+    try std.testing.expectEqual(@as(f32, 0.0), once_blk[519]);
+    const exhausted = fill.cursor;
+    try std.testing.expectEqual(@as(u64, 520), exhausted);
 }

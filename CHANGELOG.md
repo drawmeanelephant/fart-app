@@ -11,6 +11,16 @@ tagged `v<version>` and published on GitHub with CI-built binaries via
 
 ### Added
 
+- `kujamba join --wav FILE` (#98) — upload a pre-rendered WAV on the interval
+  grid instead of a synthesized phrase: RIFF/WAVE PCM s16le at 44.1 kHz, mono
+  or stereo downmixed `(L+R)/2`, decoded once into the phrase bank so
+  `--pattern`, `--play`, and chat controls work unchanged. `--wav-reload`
+  re-stats the file at every bar boundary and swaps in a changed file's audio
+  mid-set (callers replace atomically via temp+rename); failed re-reads keep
+  the previous audio and are counted as `wav_reload_failed` on the `RESULT`
+  line, alongside new `source=synth|wav` and `wav_reloads` fields. `--wav` is
+  mutually exclusive with `--phrase`/`--phrases`; `--voice`/`--engine` warn
+  rather than fail, since nothing is synthesized.
 - Fart-off engine selector (#95, M9) — all nine Great Fart-Off entries ship
   as `src/engines/<slug>.zig` modules behind one registry, plus `gutphysics`
   (the MiMo Pro 2.6 / Codebuff entry absorbed from stale PR #99). `--engine
