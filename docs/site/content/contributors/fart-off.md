@@ -15,11 +15,13 @@ code is real, their tests pass, and every entry renders a deterministic WAV
 you can rebuild byte-for-byte. Judging is by ear, because a fart is not a
 specification.
 
-A tenth entry arrived late, by a different route: [PR
+Three late entries arrived by different routes. [PR
 #99](https://github.com/drawmeanelephant/fart-app/pull/99) was MiMo Pro 2.6
 running under the Codebuff agent — same physics brief (#23), opened on a
-branch too stale to merge. Its synth was absorbed into the selector as
-`gutphysics` and its competition renders are in the tables below.
+branch too stale to merge, absorbed as `gutphysics`. **Grok 4.7** and
+**Kimi K3** then ran the same protocol in isolated worktrees as entries
+11 and 12 — `grok47` and `kimi3`. All three sets of competition renders
+are in the tables below.
 
 ## The rules
 
@@ -82,6 +84,8 @@ knobs, judged against every other entry. The showcase is freestyle.
 | opus | Claude Opus 5.5 | `fartoff/opus` | `pressure`, `tension`, `wetness`, `tract`, `droop` (+ `classic`) | Wet, rumbling physical-model farts that sputter out as the gas runs dry |
 | mistral4 | Mistral Large 4 | `fartoff/mistral4` | `pressure`, `tension`, `resonance`, `turbulence`, `decay` | A wet, thunderous brrrap that drops pitch like a disappointed trombone |
 | gutphysics | MiMo Pro 2.6 (Codebuff) | PR #99 → `src/engines/` | `pressure`, `tension`, `tract`, `turbulence` | A pressure-driven body where the pitch sags as the gas runs out and grainy pops ride the buzz |
+| grok47 | Grok 4.7 | `fartoff/grok47` | `pressure`, `tension`, `resonance`, `turbulence`, `wetness`, `decay` (0–1 amounts) | "I bear down, I sag, and I do not apologize for the rasp on the way out" |
+| kimi3 | Kimi K3 | `fartoff/kimi3` | `pressure`, `tension`, `resonance`, `turbulence`, `formant` | "The whole digestive tract rendered honestly: pressure that collapses, a sphincter that flaps, a pipe that booms" |
 
 ## The one decision everyone made the same way
 
@@ -120,6 +124,8 @@ phrase, same seed, no knobs — and the showcase is freestyle.
 | opus | Claude Opus 5.5 | <audio controls preload="none" src="fart-off.assets/opus-baseline1.m4a"></audio> |
 | mistral4 | Mistral Large 4 | <audio controls preload="none" src="fart-off.assets/mistral4-baseline1.m4a"></audio> |
 | gutphysics | MiMo Pro 2.6 (Codebuff) | <audio controls preload="none" src="fart-off.assets/gutphysics-baseline1.m4a"></audio> |
+| grok47 | Grok 4.7 | <audio controls preload="none" src="fart-off.assets/grok47-baseline1.m4a"></audio> |
+| kimi3 | Kimi K3 | <audio controls preload="none" src="fart-off.assets/kimi3-baseline1.m4a"></audio> |
 
 ### Baseline 2 · "shuzi kubwa sana" · default voice · seed 42
 
@@ -135,6 +141,8 @@ phrase, same seed, no knobs — and the showcase is freestyle.
 | opus | Claude Opus 5.5 | <audio controls preload="none" src="fart-off.assets/opus-baseline2.m4a"></audio> |
 | mistral4 | Mistral Large 4 | <audio controls preload="none" src="fart-off.assets/mistral4-baseline2.m4a"></audio> |
 | gutphysics | MiMo Pro 2.6 (Codebuff) | <audio controls preload="none" src="fart-off.assets/gutphysics-baseline2.m4a"></audio> |
+| grok47 | Grok 4.7 | <audio controls preload="none" src="fart-off.assets/grok47-baseline2.m4a"></audio> |
+| kimi3 | Kimi K3 | <audio controls preload="none" src="fart-off.assets/kimi3-baseline2.m4a"></audio> |
 
 ### Showcase · freestyle, flags unlimited
 
@@ -150,6 +158,8 @@ phrase, same seed, no knobs — and the showcase is freestyle.
 | opus | Claude Opus 5.5 | <audio controls preload="none" src="fart-off.assets/opus-showcase.m4a"></audio> | `pressure=2,tension=0.7,wetness=1.6,tract=1.4,droop=1.4,intensity=0.8` |
 | mistral4 | Mistral Large 4 | <audio controls preload="none" src="fart-off.assets/mistral4-showcase.m4a"></audio> | `pressure=1.3,tension=0.75,resonance=1.35,turbulence=1.8,decay=1.3,intensity=1.1` |
 | gutphysics | MiMo Pro 2.6 (Codebuff) | <audio controls preload="none" src="fart-off.assets/gutphysics-showcase.m4a"></audio> | `pressure=3,tension=1.2,tract=0.6` (its own "thunderous" preset) |
+| grok47 | Grok 4.7 | <audio controls preload="none" src="fart-off.assets/grok47-showcase.m4a"></audio> | `po po po` with `pressure=1,tension=0.3,resonance=0.8,turbulence=0.3,wetness=0.15,decay=0.85,intensity=1.3` |
+| kimi3 | Kimi K3 | <audio controls preload="none" src="fart-off.assets/kimi3-showcase.m4a"></audio> | `kujamba mkubwa kabisa` with `pressure=2.6,tension=0.55,resonance=2.8,turbulence=2.2,formant=1.2,cents=-150` |
 
 Ballots go on
 [#95](https://github.com/drawmeanelephant/fart-app/issues/95) — say which
@@ -157,7 +167,7 @@ entry owns baseline and which owns showcase.
 
 ## Play every entry from one binary
 
-All ten engines shipped into the tree as `src/engines/<slug>.zig` behind an
+All twelve engines shipped into the tree as `src/engines/<slug>.zig` behind an
 `--engine` selector (#95). Nothing was crowned: `stock` is still the default
 voice until judging closes.
 
