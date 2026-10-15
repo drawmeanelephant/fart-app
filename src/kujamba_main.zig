@@ -31,6 +31,7 @@ const synth = @import("synth.zig");
 const registry = @import("engine_registry.zig");
 const kujamba_out = @import("ninjam_out.zig");
 const kujamba_config = @import("kujamba_config.zig");
+const kujamba_wav = @import("kujamba_wav.zig");
 const builtin = @import("builtin");
 // libc only for the posix signal install path — Windows stops through the
 // console control handler below, and both sides sleep on the Io clock now
@@ -103,6 +104,18 @@ fn printUsage(io: std.Io) void {
         \\                       rendered once at startup, so switching is instant
         \\                       -- and so the whole bank is resident in memory at
         \\                       once (64 MiB of audio, ~6 min, is the ceiling)
+        \\    --wav FILE         play a pre-rendered WAV instead of a synthesized
+        \\                       phrase (#98): RIFF/WAVE PCM s16le at 44.1 kHz,
+        \\                       mono or stereo (downmixed to mono). Same audio
+        \\                       budget ceiling as --phrases. Mutually exclusive
+        \\                       with --phrase/--phrases; --voice and --engine do
+        \\                       not apply (a warning says so) since nothing is
+        \\                       synthesized
+        \\    --wav-reload       re-stat the wav at every bar boundary and re-read
+        \\                       it when mtime/size changed; a failed re-read
+        \\                       keeps the previous audio and is counted in the
+        \\                       RESULT line. Replace the file atomically
+        \\                       (temp + rename), never in place
         \\    --seed N           determinism seed: ids + payloads derive from it
         \\    --pattern P        bar pattern, e.g. 3+1 = 3 fart bars + 1 rest bar
         \\                       (default 3+1)
@@ -357,6 +370,14 @@ const JoinSettings = struct {
     /// --phrases FILE: a phrase bank to pick from live (#8). Mutually exclusive
     /// with --phrase, and the flag wins over a config-file phrase (#22's rule).
     phrases_file: ?[]const u8 = null,
+    /// --wav FILE (#98): a pre-rendered WAV to play instead of a synthesized
+    /// phrase. Mutually exclusive with --phrase/--phrases; there is no config
+    /// key, so the flag-vs-flag rule is the whole story.
+    wav_file: ?[]const u8 = null,
+    /// --wav-reload (#98): re-stat the wav at every bar boundary and re-read
+    /// it when it changed. Off by default — without it the file is read once
+    /// at startup and never touched again.
+    wav_reload: bool = false,
 
     /// Lay the config file's values over the defaults. Runs BEFORE the flag
     /// loop, which overwrites the same fields — that ordering *is* the
@@ -379,6 +400,39 @@ const JoinSettings = struct {
         return registry.parseKnobs(self.voice_spec orelse "", self.engine_flag, self.engine);
     }
 };
+
+/// Flag-vs-flag conflicts, checked once after the flag loop. The check is
+/// split out of cmdJoin (which exits via fail) so tests can see the decision.
+fn joinFlagConflict(s: *const JoinSettings, phrase_flag: bool) ?[]const u8 {
+    // --phrase and --phrases are two ways to fill the same slot (which phrases
+    // the instrument can play), so giving both on one command line is a
+    // mistake worth reporting rather than silently resolving. This is the
+    // "flag-over-file precedence" question #8's body flagged: against the
+    // *config* file the usual rule applies unchanged (a flag wins), and only
+    // a flag-vs-flag collision is an error.
+    if (s.phrases_file != null and phrase_flag)
+        return "--phrase and --phrases both given: pick one";
+    // --wav replaces the synth entirely, so it conflicts with both ways of
+    // naming a phrase — the same class of mistake as --phrase + --phrases.
+    if (s.wav_file != null and (phrase_flag or s.phrases_file != null))
+        return "--wav cannot be combined with --phrase or --phrases";
+    if (s.wav_reload and s.wav_file == null)
+        return "--wav-reload needs --wav";
+    return null;
+}
+
+/// Which synth-voice settings --wav would silently drop (#98). --wav never
+/// renders, so engine/voice selections — flag or config file — are no-ops.
+/// The caller warns rather than fails: a preset shared between synth and wav
+/// runs keeps working.
+fn wavIgnoredSettings(s: *const JoinSettings) struct { engine: bool, voice: bool } {
+    return .{
+        // engine= inside a --voice spec lands in voice_spec, so the voice
+        // warning covers it
+        .engine = s.engine_flag != null or s.engine != registry.default_id,
+        .voice = s.voice_spec != null,
+    };
+}
 
 /// Apply a `!kujamba <verb>` command from room chat to the plan (#9, #8).
 /// Mode/rest/phrase changes reshape the plan here; the session picks them up at
@@ -504,6 +558,11 @@ fn cmdJoin(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: [
         } else if (std.mem.eql(u8, a, "--phrases")) {
             s.phrases_file = next orelse fail(io, "--phrases needs a value", .{});
             i += 1;
+        } else if (std.mem.eql(u8, a, "--wav")) {
+            s.wav_file = next orelse fail(io, "--wav needs a value", .{});
+            i += 1;
+        } else if (std.mem.eql(u8, a, "--wav-reload")) {
+            s.wav_reload = true;
         } else {
             fail(io, "unknown option '{s}'", .{a});
         }
@@ -512,43 +571,68 @@ fn cmdJoin(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: [
     // The synth is the capture device: render every phrase once, up front, then
     // read them out interval by interval. With no --phrases that is a bank of
     // one, so a live switch and the single-phrase case are the same code path
-    // (#8).
-    if (s.phrases_file != null and phrase_flag)
-        fail(io, "--phrase and --phrases both given: pick one", .{});
-
-    const voice = s.resolveVoice() catch |e|
-        voiceFail(io, s.voice_spec, s.engine_flag, s.engine, e);
+    // (#8). --wav (#98) swaps the synth for a file but keeps the bank: the wav
+    // lands as a single already-rendered entry.
+    if (joinFlagConflict(&s, phrase_flag)) |msg| fail(io, "{s}", .{msg});
 
     var bank = kujamba_out.PhraseBank.init(gpa);
     defer bank.deinit();
-    if (s.phrases_file) |path| {
-        const text = readTextFile(io, arena, path) catch |e| switch (e) {
-            error.OutOfMemory => fail(io, "out of memory reading {s}", .{path}),
-            error.Rejected => fail(io, "refusing to read {s} as a phrase bank", .{path}),
-            error.ReadFailed => fail(io, "cannot read phrases file '{s}'", .{path}),
-        };
-        bank.parse(text, voice.knobs) catch |e| switch (e) {
-            // The budget is on rendered audio, not file size, so this is the
-            // one failure a user reaches by having *too many good phrases* —
-            // worth saying what to do about it rather than naming an error set.
-            error.BankTooLarge => fail(io, "phrase bank '{s}' renders to more than {d} MiB of audio across {d} phrases — split the file or drop some", .{
+    var reloader: ?kujamba_wav.Reloader = null;
+    if (s.wav_file) |path| {
+        // Nothing is synthesized on this path, so voice/engine selections are
+        // no-ops — warned rather than failed, so a preset shared between synth
+        // and wav runs keeps working (#98 picks warn for the config keys too).
+        const ignored = wavIgnoredSettings(&s);
+        if (ignored.engine)
+            warnLine("join: --engine/engine= has no effect with --wav (nothing is synthesized)", .{});
+        if (ignored.voice)
+            warnLine("join: --voice/[voice] has no effect with --wav (nothing is synthesized)", .{});
+        var diag = kujamba_wav.Diag{};
+        const loaded = kujamba_wav.loadFile(gpa, io, std.Io.Dir.cwd(), path, &diag) catch |e|
+            fail(io, "bad --wav '{s}': {s}", .{ path, kujamba_wav.describe(&diag, e) });
+        bank.addBuffer(path, loaded.samples) catch |e| switch (e) {
+            error.OutOfMemory => fail(io, "out of memory", .{}),
+            // Over-budget is the same startup error --phrases gets, worded for
+            // a file: the wav counts against the 16 Mi-sample bank ceiling.
+            error.BankTooLarge => fail(io, "--wav '{s}' decodes to more than {d} MiB of audio — the bank budget", .{
                 path,
-                // Ceiling division: a budget that is not a whole number of MiB
-                // would otherwise floor to "0 MiB" and name no limit at all.
                 (kujamba_out.max_bank_samples * @sizeOf(f32) + 1024 * 1024 - 1) / (1024 * 1024),
-                bank.entries.items.len,
             }),
-            // Anything else is attributable to a line, the same way a config
-            // error is: `file:line: why` is the convention the loader sets.
-            else => if (bank.fail_line) |ln|
-                fail(io, "{s}:{d}: {s}", .{ path, ln, @errorName(e) })
-            else
-                fail(io, "phrase bank '{s}' failed: {s}", .{ path, @errorName(e) }),
         };
-        if (bank.entries.items.len == 0)
-            fail(io, "phrases file '{s}' has no phrases (only comments or blank lines?)", .{path});
+        if (s.wav_reload)
+            reloader = .{ .alloc = gpa, .io = io, .dir = std.Io.Dir.cwd(), .path = path, .bank = &bank, .index = 0, .stamp = loaded.stamp };
     } else {
-        bank.add(s.phrase, voice.knobs) catch |e| fail(io, "phrase render failed: {s}", .{@errorName(e)});
+        const voice = s.resolveVoice() catch |e|
+            voiceFail(io, s.voice_spec, s.engine_flag, s.engine, e);
+        if (s.phrases_file) |path| {
+            const text = readTextFile(io, arena, path) catch |e| switch (e) {
+                error.OutOfMemory => fail(io, "out of memory reading {s}", .{path}),
+                error.Rejected => fail(io, "refusing to read {s} as a phrase bank", .{path}),
+                error.ReadFailed => fail(io, "cannot read phrases file '{s}'", .{path}),
+            };
+            bank.parse(text, voice.knobs) catch |e| switch (e) {
+                // The budget is on rendered audio, not file size, so this is the
+                // one failure a user reaches by having *too many good phrases* —
+                // worth saying what to do about it rather than naming an error set.
+                error.BankTooLarge => fail(io, "phrase bank '{s}' renders to more than {d} MiB of audio across {d} phrases — split the file or drop some", .{
+                    path,
+                    // Ceiling division: a budget that is not a whole number of MiB
+                    // would otherwise floor to "0 MiB" and name no limit at all.
+                    (kujamba_out.max_bank_samples * @sizeOf(f32) + 1024 * 1024 - 1) / (1024 * 1024),
+                    bank.entries.items.len,
+                }),
+                // Anything else is attributable to a line, the same way a config
+                // error is: `file:line: why` is the convention the loader sets.
+                else => if (bank.fail_line) |ln|
+                    fail(io, "{s}:{d}: {s}", .{ path, ln, @errorName(e) })
+                else
+                    fail(io, "phrase bank '{s}' failed: {s}", .{ path, @errorName(e) }),
+            };
+            if (bank.entries.items.len == 0)
+                fail(io, "phrases file '{s}' has no phrases (only comments or blank lines?)", .{path});
+        } else {
+            bank.add(s.phrase, voice.knobs) catch |e| fail(io, "phrase render failed: {s}", .{@errorName(e)});
+        }
     }
 
     // The first phrase is live before the first bar; bind it into the fill so
@@ -559,6 +643,10 @@ fn cmdJoin(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: [
     // the mode and phrase the session should bind each bar. A live switch just
     // updates the adapter; the session picks it up at the next bar boundary.
     var adapter = kujamba_out.PlanAdapter{ .pattern = &s.pattern, .mode = s.play_mode, .bank = &bank, .fill = &fill };
+    // #98: a reload lands on the same boundary as every other plan decision,
+    // so the new file is what the whole next bar plays.
+    if (reloader) |*r|
+        adapter.boundary_hook = .{ .ctx = @ptrCast(r), .run = kujamba_wav.Reloader.boundaryHook };
 
     var opts = session.Options{
         .host = s.host,
@@ -587,6 +675,8 @@ fn cmdJoin(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: [
 
     var sess = session.Session.init(gpa, io, opts) catch |e| fail(io, "init failed: {s}", .{@errorName(e)});
     defer sess.deinit();
+    // the reloader's transcript lines go where every other session line does
+    if (reloader) |*r| r.log = &sess.log;
 
     const stats = sess.run() catch sess.stats;
 
@@ -602,7 +692,7 @@ fn cmdJoin(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: [
     var out_buf: [2048]u8 = undefined;
     const line = std.fmt.bufPrint(
         &out_buf,
-        "RESULT ok={} err=\"{s}\" seed={d} play={s} phrases={d} phrase={d} phrase_switches={d} phrase_rejected={d} intervals_uploaded={d} intervals_broadcast={d} silence_markers={d} payload_dumps={d} upload_chunks={d} upload_bytes={d} intervals_downloaded={d} msgs_sent={d} msgs_recv={d} intervals_dropped={d} intervals_backpressured={d} upload_bytes_dropped={d} upload_stall_ms={d} drift_ms={d} max_drift_ms={d} clock_corrections={d} reconnects={d} outage_ms={d}\n",
+        "RESULT ok={} err=\"{s}\" seed={d} play={s} phrases={d} phrase={d} phrase_switches={d} phrase_rejected={d} intervals_uploaded={d} intervals_broadcast={d} silence_markers={d} payload_dumps={d} upload_chunks={d} upload_bytes={d} intervals_downloaded={d} msgs_sent={d} msgs_recv={d} intervals_dropped={d} intervals_backpressured={d} upload_bytes_dropped={d} upload_stall_ms={d} drift_ms={d} max_drift_ms={d} clock_corrections={d} reconnects={d} outage_ms={d} source={s} wav_reloads={d} wav_reload_failed={d}\n",
         .{
             ok,
             err_text,
@@ -636,6 +726,12 @@ fn cmdJoin(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, argv: [
             // everything the audience actually missed, backoff included.
             stats.reconnects,
             stats.outage_ms,
+            // #98: what fed the bank, and how the reload lane went. A wav
+            // bank is one entry, so phrase={d} above prints 0 — the same
+            // 0-based convention phrases=1/phrase=0 has always used.
+            if (s.wav_file != null) "wav" else "synth",
+            if (reloader) |*r| r.reloads else 0,
+            if (reloader) |*r| r.reload_failed else 0,
         },
     ) catch return;
     std.Io.File.stdout().writeStreamingAll(io, line) catch {};
@@ -1521,4 +1617,57 @@ test "a config host port survives a flag that names a bare host" {
     try std.testing.expectEqual(@as(?u16, null), p);
     try std.testing.expectEqualStrings("127.0.0.1", s.host);
     try std.testing.expectEqual(@as(u16, 20531), s.port);
+}
+
+test "join flag conflicts: --wav vs phrase sources, --wav-reload alone (#98)" {
+    // --phrase + --phrases keeps its existing message; --wav conflicts with
+    // either of them, and --wav-reload without a file is nonsense too.
+    var s = JoinSettings{};
+    try std.testing.expectEqual(@as(?[]const u8, null), joinFlagConflict(&s, false));
+
+    s.phrases_file = "bank.txt";
+    try std.testing.expectEqualStrings(
+        "--phrase and --phrases both given: pick one",
+        joinFlagConflict(&s, true).?,
+    );
+    // --phrases alone is fine; a *config* phrase does not collide with the
+    // flag — flags-vs-file is precedence, not a conflict
+    try std.testing.expectEqual(@as(?[]const u8, null), joinFlagConflict(&s, false));
+
+    s = JoinSettings{ .wav_file = "take.wav" };
+    try std.testing.expectEqualStrings(
+        "--wav cannot be combined with --phrase or --phrases",
+        joinFlagConflict(&s, true).?,
+    );
+    s.phrases_file = "bank.txt";
+    try std.testing.expect(joinFlagConflict(&s, false) != null);
+    try std.testing.expect(joinFlagConflict(&s, true) != null);
+
+    s = JoinSettings{ .wav_reload = true };
+    try std.testing.expectEqualStrings("--wav-reload needs --wav", joinFlagConflict(&s, false).?);
+    s.wav_file = "take.wav";
+    try std.testing.expectEqual(@as(?[]const u8, null), joinFlagConflict(&s, false));
+}
+
+test "wav ignored settings: --voice/--engine warn-and-proceed under --wav (#98)" {
+    // Nothing selected: nothing to warn about.
+    var s = JoinSettings{};
+    var ignored = wavIgnoredSettings(&s);
+    try std.testing.expect(!ignored.engine and !ignored.voice);
+
+    // a config-file engine alone still counts — [voice] and `engine=` in the
+    // config are warned the same as the flags, per #98's "pick warn"
+    s.engine = .fable;
+    ignored = wavIgnoredSettings(&s);
+    try std.testing.expect(ignored.engine);
+
+    s = JoinSettings{ .voice_spec = "noise=0" };
+    ignored = wavIgnoredSettings(&s);
+    try std.testing.expect(ignored.voice);
+
+    // engine= inside a --voice spec is covered by the voice warning
+    s = JoinSettings{ .voice_spec = "engine=opus,attack=2" };
+    ignored = wavIgnoredSettings(&s);
+    try std.testing.expect(ignored.voice);
+    try std.testing.expect(!ignored.engine);
 }
