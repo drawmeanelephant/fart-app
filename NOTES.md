@@ -2,7 +2,7 @@
 
 The old synth was a falling buzz, a noise splat, and a flutter. Same shape on every vowel, pitch down a flat 20%, texture only by how much noise you mixed in. This one is a short gut event. Pressure drives the body and the pitch. Tension decides whether the exit flutters or rasps. The vowel is a cavity, not a pitch label. A plosive is a held breath and a crack.
 
-Deterministic: same phrase, same seed, same bytes. `--seed`, `--phrase`, `--out` are untouched. New axes go through the existing `--voice` parser. `src/ninjam/*` is untouched. The judged default is this voice with no flags; `src/golden.zig` is re-baselined for it. Phrase timing (syllable counts, durations, gaps) is unchanged, so the plan fingerprints still match on `items` and `samples`.
+Deterministic: same phrase, same seed, same bytes, in Debug and in ReleaseSafe. The sample loop does not call `@sin`, `@exp` or `std.math.pow` — those lower differently per optimization mode, and the noise/wobble accumulation was enough to push a rounded 10 ms RMS window across an integer (`shuzi seed 1234567`, windows 11 and 12). Sine comes from a comptime table, exp from a comptime table of `exp(-x)`, both interpolated with plain f32 arithmetic. `src/golden.zig` was re-baselined for that: peak and duration held, RMS moved by a few parts in a thousand. `--seed`, `--phrase`, `--out` are untouched. New axes go through the existing `--voice` parser. `src/ninjam/*` is untouched. The judged default is this voice with no flags; `src/golden.zig` is re-baselined for it. Phrase timing (syllable counts, durations, gaps) is unchanged, so the plan fingerprints still match on `items` and `samples`.
 
 ## Character
 
@@ -44,3 +44,15 @@ Old keys (`attack`, `noise`, `wobble`, `intensity`, `cents`) behave as before. O
 ```
 
 Three voiceless pops, loose sphincter, long tract, a dry edge, and a deep sag. The judged baselines are the same binary with no `--voice` at all.
+
+## Determinism fix
+
+The polyfill rounds differently from the Debug libm the competition WAVs were rendered with, so those bytes moved. Re-rendered in Debug to `/tmp/fartoff/grok47/`. Same commands, same lengths, peak unchanged on all three.
+
+| file | command | before | after |
+|---|---|---|---|
+| baseline1.wav | `--phrase "kujamba karibu" --seed 42` | `6e66e05c4273d7997ad16c22fd4141e23f065556d74d7d3ce55769c10fc19162` | `fe85069eada533f51fd4d8068a35b5f7289066c9946e51ad107416c32da0c686` |
+| baseline2.wav | `--phrase "shuzi kubwa sana" --seed 42` | shipped Debug render | `3e27d435f0d0e53c14ecbbea2150ff344be1224dd1e5fd14039996fb51274ae6` |
+| showcase.wav | `--phrase "po po po" --seed 42 --voice "pressure=1,tension=0.3,resonance=0.8,turbulence=0.3,wetness=0.15,decay=0.85,intensity=1.3"` | `915bcdc135ee932938786a9fba6cdfc12679b3f0a4cf142fad9132c196933a7b` | `4a2b0e9e64c2a567641c193a728b2760cd314d6c1eac4cb9fb424b27633dbb10` |
+
+Peak held (0.847, and 0.853 on the showcase) and duration held (1.800 s, 1.920 s, 0.960 s). The new bytes are identical in Debug and ReleaseSafe, which the shipped ones were not.

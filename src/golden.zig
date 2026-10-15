@@ -37,9 +37,8 @@
 //!   | `rms_milli`       | within +/-2 of 1e-3 RMS          | coarse level check         |
 //!
 //! `envelope_sha256` is the strong one: SHA-256 over the per-10ms-window RMS
-//! energy, each window rounded to a whole unit. A window that lands within
-//! 0.02 of an integer is snapped to it first, so a last-ULP wobble that
-//! straddles x.5 cannot flip the hash between Debug and ReleaseSafe. A real
+//! energy, each window truncated to a whole unit. The sample loop no longer
+//! calls libm, so Debug and ReleaseSafe produce the same windows. A real
 //! change (a reseeded noise generator, a moved vowel table, a 10 ms timing
 //! change) still moves many windows by whole units.
 //!
@@ -90,19 +89,21 @@ pub const Fingerprint = struct {
 pub const expected = [_]Fingerprint{
     // the phrase the demo, the docs and the readme all use.
     // re-baselined for the gut-physics voice (pressure/tension/tract): the
-    // plan is unchanged (items, samples), the waveform is not.
-    .{ .name = "kujamba karibu", .kind = .phrase, .input = "kujamba karibu", .items = 6, .samples = 79380, .peak = 27751, .zero_crossings = 2294, .rms_milli = 4715607, .envelope_sha256 = "f97a2ea71ff5c185a52e6a6a8db1c4fe0850e3b1b2f9f2f0e304713f175da6ee", .wav_sha256 = "37a2db906c7cb456238c4758beddd8fd0e892e742ad2485102bbb1a3ed88ddbe" },
+    // plan is unchanged (items, samples), the waveform is not. Re-baselined
+    // again when the sample loop dropped libm: peak and duration held, the
+    // envelope moved by a fraction of a percent.
+    .{ .name = "kujamba karibu", .kind = .phrase, .input = "kujamba karibu", .items = 6, .samples = 79380, .peak = 27751, .zero_crossings = 2294, .rms_milli = 4715630, .envelope_sha256 = "8da6958de17ed58ff6681a38b271ccb5aa036fcae2b6486638efc6283a2b78d4", .wav_sha256 = "3e0805bf6314de12822dff0c0197fdb3a2860cdd9bd3b10a2b29a873095f6141" },
     // longer, so the fingerprint covers stress placement across several words
-    .{ .name = "asante sana kijiji", .kind = .phrase, .input = "asante sana kijiji", .items = 8, .samples = 109368, .peak = 27651, .zero_crossings = 3552, .rms_milli = 4323232, .envelope_sha256 = "32d28b3e45dff2c24de3683237f5ab4f06096b9025f61bd619b3faa1d4c7d30a", .wav_sha256 = "cbb0916c36b4231cf9464eb3221b123fa30594e91cfedd7bfdb98d54c98f2d37" },
+    .{ .name = "asante sana kijiji", .kind = .phrase, .input = "asante sana kijiji", .items = 8, .samples = 109368, .peak = 27651, .zero_crossings = 3554, .rms_milli = 4323263, .envelope_sha256 = "1f80a897f2ccb0499ba9197c319b7c1ad0f4fe543340f148f1383ce551b22094", .wav_sha256 = "30e4ebecde04a5ef3182cca86e6e75fd0d426db49de906da352c64c3db92a8fb" },
     // one syllable: the shortest render that still has an onset
-    .{ .name = "single syllable", .kind = .phrase, .input = "a", .items = 1, .samples = 10584, .peak = 11579, .zero_crossings = 292, .rms_milli = 3334155, .envelope_sha256 = "5d729780768389910773873ff769e5bc30385a7b61b27ca1fda965a2f02f00c5", .wav_sha256 = "4eeaee51db419442b3485927723ac0a3c7792dbc9dab4c8e5a349fa0303d3f9c" },
+    .{ .name = "single syllable", .kind = .phrase, .input = "a", .items = 1, .samples = 10584, .peak = 11579, .zero_crossings = 292, .rms_milli = 3334161, .envelope_sha256 = "5d729780768389910773873ff769e5bc30385a7b61b27ca1fda965a2f02f00c5", .wav_sha256 = "d7f9cbbdbcc721ff6f75868770d95a8058f7235d4c116984bc17c423ad2d936d" },
     // digits and punctuation are not word characters, so the word splitter
     // has to skip them and still place the syllables correctly
-    .{ .name = "punctuation and digits", .kind = .phrase, .input = "kujamba 123 karibu!", .items = 6, .samples = 79380, .peak = 27055, .zero_crossings = 2414, .rms_milli = 4688484, .envelope_sha256 = "a04f52366057db02061f0510f7ae44ba1a4d5cef36d9ac619f74a8610648aff6", .wav_sha256 = "04860aa78c315a3361ff456865bd5bda3d9ad23a577c3001c2985d24695fc920" },
+    .{ .name = "punctuation and digits", .kind = .phrase, .input = "kujamba 123 karibu!", .items = 6, .samples = 79380, .peak = 27055, .zero_crossings = 2416, .rms_milli = 4688506, .envelope_sha256 = "bf6248a05a0fcf8b23ebb10d8d313f4fcbfc19316326e405e336979e1fa0c0db", .wav_sha256 = "c0f63a86e435e9a9c7e1be7aacddc9c09e2643551c2327964a2ad18e0e421abd" },
     // wordless farts: no plan. sample counts are the seed's, unchanged.
-    .{ .name = "shuzi seed 0", .kind = .shuzi, .input = "0", .items = 0, .samples = 10143, .peak = 25858, .zero_crossings = 448, .rms_milli = 5602380, .envelope_sha256 = "a35189728c4d2c88f46f9dc010cbfe1a9166c651dc8d61eacf8583f9066937ed", .wav_sha256 = "ba037e36e86a1184eafad0d7af44d47aef083c276d0bb8a350bbb572ff661633" },
-    .{ .name = "shuzi seed 42", .kind = .shuzi, .input = "42", .items = 0, .samples = 34839, .peak = 27168, .zero_crossings = 1094, .rms_milli = 4280219, .envelope_sha256 = "bcbd0a87f87df24d9499286c6095d8ddbcbba1ee36232ef9aac397188d5ee972", .wav_sha256 = "c5de671869ddf1df83adf7680ab902dcae12a436bcd72c0706d472bf5d9d420c" },
-    .{ .name = "shuzi seed 1234567", .kind = .shuzi, .input = "1234567", .items = 0, .samples = 10584, .peak = 18252, .zero_crossings = 398, .rms_milli = 4097943, .envelope_sha256 = "1a1d8e867be9d164b0bb54910ef883b0c62de3fae4c940858dde047f281bea6a", .wav_sha256 = "69432186641bb6fd586564693b804c39520a0c62fa82bdf09d2c9f7935dd8317" },
+    .{ .name = "shuzi seed 0", .kind = .shuzi, .input = "0", .items = 0, .samples = 10143, .peak = 25858, .zero_crossings = 448, .rms_milli = 5602405, .envelope_sha256 = "a35189728c4d2c88f46f9dc010cbfe1a9166c651dc8d61eacf8583f9066937ed", .wav_sha256 = "678329f3e2169c809de55eda965954497ce39f4f6fa21ac5d041f5d2f711acf9" },
+    .{ .name = "shuzi seed 42", .kind = .shuzi, .input = "42", .items = 0, .samples = 34839, .peak = 27168, .zero_crossings = 1094, .rms_milli = 4280234, .envelope_sha256 = "45bde9b62892fb9e35b533b257268dd4e359f2b144939e22a2d8e7cef74db60f", .wav_sha256 = "f6cd87c0769a40f0bc2aef29043f268152861895f5f1a4a53a5d7c3b0794677b" },
+    .{ .name = "shuzi seed 1234567", .kind = .shuzi, .input = "1234567", .items = 0, .samples = 10584, .peak = 18252, .zero_crossings = 398, .rms_milli = 4097970, .envelope_sha256 = "a91324608110fbc4d73e764acf6bc697735efe93f18bfb181e558f81a4dc7337", .wav_sha256 = "5ac58c6a329e8e3eda8c2ed52dc29bae4bc7932806c17e707075e1956dfc37cc" },
 };
 
 /// A fingerprint as measured right now, ready to paste into `expected`.
@@ -184,13 +185,8 @@ fn envelopeHash(alloc: std.mem.Allocator, data: []const u8) !struct { hex: [64]u
             const f: f64 = @floatFromInt(sampleAt(data, off + k));
             acc += f * f;
         }
-        // Snap a window that lands within 0.02 of an integer onto it. Debug
-        // and ReleaseSafe can disagree by 0.001 around x.5, and a bare
-        // `@intFromFloat` then hashes differently. Measured on shuzi seed
-        // 1234567. A real synth change still moves windows by whole units.
         const w = std.math.sqrt(acc / @as(f64, @floatFromInt(count)));
-        const snapped = if (@abs(w - @round(w)) < 0.02) @round(w) else w;
-        try env.append(alloc, @intFromFloat(snapped));
+        try env.append(alloc, @intFromFloat(w));
         off += count;
     }
     return .{

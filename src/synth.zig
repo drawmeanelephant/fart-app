@@ -25,8 +25,102 @@
 //! are documented on `VoiceKnobs`.
 //!
 //! Vocabulary note: kujamba = to fart, shuzi = a fart. Use them proudly.
+//!
+//! The sample loop evaluates its own sine and exp (`detSin`, `detExp`) from
+//! plain IEEE arithmetic. `@sin` and `@exp` lower differently in Debug and
+//! ReleaseSafe, and the noise/wobble accumulation was enough to push a
+//! rounded 10 ms RMS window across an integer. These do not.
 
 const std = @import("std");
+
+// ---------------------------------------------------------------------
+// Deterministic math
+//
+// `@sin`, `@exp` and `std.math.pow` do not produce the same bits in Debug
+// and ReleaseSafe: LLVM lowers them differently per optimization level, and
+// the per-sample noise and wobble accumulate that last-ULP wobble until a
+// 10 ms integer-RMS window crosses a boundary. The sample loop therefore
+// never calls them. Sine and the decaying exp come from comptime tables
+// (baked once, so the knots do not depend on the build mode) and a linear
+// interpolation in plain f32, which is the same bits everywhere. `2^x` for
+// the cents transpose is a short series plus an exponent-bit shift. Pure
+// Zig, no libc.
+// ---------------------------------------------------------------------
+
+const SIN_BITS = 16;
+const SIN_LEN = 1 << SIN_BITS;
+const SIN_SCALE: f32 = @as(f32, @floatFromInt(SIN_LEN)) / std.math.tau;
+
+/// One period of sine, baked at comptime from `@sin`. Comptime evaluation
+/// does not depend on the runtime optimization mode, so the table is the
+/// same bits in Debug and ReleaseSafe, and a lerp off it never calls libm.
+const SIN_TABLE: [SIN_LEN]f32 = blk: {
+    @setEvalBranchQuota(1_000_000);
+    var t: [SIN_LEN]f32 = undefined;
+    for (&t, 0..) |*e, k| {
+        e.* = @sin(@as(f32, @floatFromInt(k)) * (std.math.tau / @as(f32, SIN_LEN)));
+    }
+    break :blk t;
+};
+
+/// sin of any phase: reduce with `@mod`, then linearly interpolate the
+/// comptime table. The interpolation error is about 2e-7, far below one
+/// i16 step, and the reduction is the same bits in every build mode.
+fn detSin(phase: f32) f32 {
+    var x = @mod(phase, std.math.tau);
+    if (x < 0.0) x += std.math.tau;
+    const scaled = x * SIN_SCALE;
+    var i: usize = @intFromFloat(scaled);
+    if (i >= SIN_LEN) i = 0;
+    const frac = scaled - @as(f32, @floatFromInt(i));
+    const a = SIN_TABLE[i];
+    const b = SIN_TABLE[(i + 1) % SIN_LEN];
+    return a + (b - a) * frac;
+}
+
+/// 2^x for the one call site outside the sample loop (`pitchFactor`).
+/// Integer part by an exponent-bit shift, fraction by a short series.
+/// Relative error about 1e-6, and the `cents == 0` path never calls it.
+fn detExp2(x: f32) f32 {
+    if (x < -125.0) return 0.0;
+    const xc = @min(x, 127.0);
+    const n = @floor(xc);
+    const f = xc - n;
+    const p = 1.0 + f * (0.69314718056 + f * (0.24022650695 + f * (0.05550410866 + f * (0.00961812911 + f * (0.00133335581 + f * (1.54035304e-4 + f * 1.52527338e-5))))));
+    const bits: u32 = @as(u32, @intCast(@as(i32, @intFromFloat(n)) + 127)) << 23;
+    return p * @as(f32, @bitCast(bits));
+}
+
+// exp(-x) for x in [0, 16]. The sample loop only evaluates exp of a
+// non-positive argument. Baked at comptime, so the knots do not depend on
+// the optimization mode.
+const EXP_BITS = 12;
+const EXP_LEN = 1 << EXP_BITS;
+const EXP_XMAX: f32 = 16.0;
+const EXP_SCALE: f32 = @as(f32, @floatFromInt(EXP_LEN - 1)) / EXP_XMAX;
+
+const EXP_TABLE: [EXP_LEN]f32 = blk: {
+    @setEvalBranchQuota(100_000);
+    var t: [EXP_LEN]f32 = undefined;
+    for (&t, 0..) |*e, k| {
+        e.* = @exp(-@as(f32, @floatFromInt(k)) / EXP_SCALE);
+    }
+    break :blk t;
+};
+
+/// e^x for the non-positive arguments the sample loop feeds it, from the
+/// comptime table. Same bits in every build mode.
+fn detExp(x: f32) f32 {
+    if (x >= 0.0) return 1.0;
+    const mag = -x;
+    if (mag >= EXP_XMAX) return 0.0;
+    const scaled = mag * EXP_SCALE;
+    const i: usize = @min(@as(usize, @intFromFloat(scaled)), EXP_LEN - 2);
+    const frac = scaled - @as(f32, @floatFromInt(i));
+    const a = EXP_TABLE[i];
+    const b = EXP_TABLE[i + 1];
+    return a + (b - a) * frac;
+}
 
 pub const SAMPLE_RATE: u32 = 44100;
 
@@ -221,7 +315,7 @@ pub const VoiceKnobs = struct {
     pub fn pitchFactor(self: VoiceKnobs) f32 {
         if (self.cents == 0) return 1.0;
         const c = std.math.clamp(self.cents, -max_abs_cents, max_abs_cents);
-        return std.math.pow(f32, 2.0, c / 1200.0);
+        return detExp2(c / 1200.0);
     }
 
     /// The effort value the renderer actually applies: `intensity` clamped
@@ -361,7 +455,7 @@ fn stressBoost(eff: f32) f32 {
 /// (or a zero) cannot produce a NaN coefficient.
 fn onePoleAlpha(fc: f32, dt: f32) f32 {
     const f = std.math.clamp(fc, 20.0, 8000.0);
-    return 1.0 - @exp(-std.math.tau * f * dt);
+    return 1.0 - detExp(-std.math.tau * f * dt);
 }
 
 /// Resonant bandpass: a lowpass minus a slightly lower lowpass, with `q`
@@ -473,7 +567,7 @@ fn synthInto(out: []i16, p: VoiceParams, prng: *std.Random.DefaultPrng) void {
         // default the tank is still half full halfway through, and empty by
         // the end. The floor keeps the tail a leak instead of a hard mute.
         const tau_p: f32 = 0.42 + 0.55 * (1.0 - decay_amt);
-        const p_env = @exp(-u / tau_p);
+        const p_env = detExp(-u / tau_p);
         // Exponential pitch drop, as a fraction of f0, on its own clock from
         // the amplitude. At decay=0 this is the old linear 20% glide. At the
         // default the fundamental falls by a little over half an octave and
@@ -482,7 +576,7 @@ fn synthInto(out: []i16, p: VoiceParams, prng: *std.Random.DefaultPrng) void {
         const sag: f32 = if (decay_amt <= 0.0)
             p.glide * u
         else
-            (0.28 + 0.42 * decay_amt) * (1.0 - @exp(-u * (1.6 + 1.8 * decay_amt)));
+            (0.28 + 0.42 * decay_amt) * (1.0 - detExp(-u * (1.6 + 1.8 * decay_amt)));
         const sag_c = std.math.clamp(sag, 0.0, 0.72);
         const f = p.f0 * (1.0 - sag_c);
 
@@ -498,7 +592,7 @@ fn synthInto(out: []i16, p: VoiceParams, prng: *std.Random.DefaultPrng) void {
         const sub_w: f32 = (0.04 + 0.16 * pressure) * (0.30 + 0.70 * p_env);
         const harm2: f32 = 0.42 + 0.28 * tension; // a tight exit is brighter
         const harm3: f32 = 0.18 + 0.22 * pressure;
-        const carrier = (@sin(phase) + harm2 * @sin(2.0 * phase) + harm3 * @sin(3.0 * phase) + 0.08 * @sin(4.0 * phase) + sub_w * @sin(phase_sub)) * 0.36;
+        const carrier = (detSin(phase) + harm2 * detSin(2.0 * phase) + harm3 * detSin(3.0 * phase) + 0.08 * detSin(4.0 * phase) + sub_w * detSin(phase_sub)) * 0.36;
 
         // Filtered noise first: the tract is excited by the buzz *and* by the
         // noise, the way a real tube is. A bandpass on a smooth sine barely
@@ -511,7 +605,8 @@ fn synthInto(out: []i16, p: VoiceParams, prng: *std.Random.DefaultPrng) void {
         lp_wet += alpha_wet * (wn_body - lp_wet);
         lp_dry += alpha_dry * (wn_burst - lp_dry);
 
-        const glottal = if (@sin(phase) > 0.85) (@sin(phase) - 0.85) * 8.0 else 0.0;
+        const s_phase = detSin(phase);
+        const glottal = if (s_phase > 0.85) (s_phase - 0.85) * 8.0 else 0.0;
         const tract_in = carrier * 0.65 + glottal + lp_burst * (0.35 + 0.40 * resonance) + lp_body * 0.25;
         const r1 = f1.tick(tract_in, f1_hz, q1, dt);
         const r2 = f2.tick(tract_in, f2_hz, q2, dt);
@@ -525,16 +620,16 @@ fn synthInto(out: []i16, p: VoiceParams, prng: *std.Random.DefaultPrng) void {
         const voiced = carrier * (1.0 - 0.55 * resonance * tract_open) + cavity * (0.45 + 0.85 * resonance) * tract_open;
 
         const burst_tau: f32 = 0.018 + 0.012 * (1.0 - @as(f32, @floatFromInt(@min(p.plosive, 2))) * 0.35);
-        const burst_env = @exp(-t / burst_tau);
+        const burst_env = detExp(-t / burst_tau);
         var turb: f32 = 0;
         for (bursts[0..n_bursts]) |b| {
             const dt_b = t - b.at * @as(f32, @floatFromInt(n)) * dt;
             if (dt_b >= 0.0 and dt_b < 0.060) {
-                turb += b.amp * @exp(-dt_b / 0.018);
+                turb += b.amp * detExp(-dt_b / 0.018);
             }
         }
         // Wet turbulence gurgles (low, irregular); dry turbulence hisses.
-        const wet_n = lp_wet * (0.55 + 0.45 * @sin(tau * (7.0 + 5.0 * wetness) * t + chatter_phase));
+        const wet_n = lp_wet * (0.55 + 0.45 * detSin(tau * (7.0 + 5.0 * wetness) * t + chatter_phase));
         const dry_n = lp_dry;
         const tex = wet_n * wetness + dry_n * (1.0 - wetness);
         const noise = lp_body * (0.10 + 0.10 * (1.0 - tension)) * (0.25 + 0.75 * p_env) + lp_burst * (0.55 + 0.30 * @as(f32, @floatFromInt(p.plosive))) * burst_env + tex * turbulence * (0.30 + 0.70 * p_env) * (0.30 + 0.70 * turb);
@@ -553,7 +648,7 @@ fn synthInto(out: []i16, p: VoiceParams, prng: *std.Random.DefaultPrng) void {
                 const rel_s: f32 = if (p.plosive == 2) 0.012 else 0.020;
                 const rel = (t - plosive_hold) / rel_s;
                 const pop_gain: f32 = if (p.plosive == 2) 1.35 else 0.85;
-                if (rel < 6.0) pop = @exp(-rel) * (0.55 + 0.85 * pressure) * pop_gain;
+                if (rel < 6.0) pop = detExp(-rel) * (0.55 + 0.85 * pressure) * pop_gain;
             }
         }
 
@@ -576,9 +671,9 @@ fn synthInto(out: []i16, p: VoiceParams, prng: *std.Random.DefaultPrng) void {
         // loose path does not have. A loose one only wobbles.
         const loose = 1.0 - tension;
         const wob_depth = std.math.clamp(p.wobble_depth * (0.55 + 0.70 * loose), 0.0, 1.0);
-        const wob = 1.0 - wob_depth * (0.5 + 0.5 * @sin(tau * wobble_hz * t + wobble_phase));
-        const c1 = @sin(tau * chatter_hz * t + chatter_phase);
-        const c2 = @sin(tau * chatter_hz2 * t + chatter_phase2);
+        const wob = 1.0 - wob_depth * (0.5 + 0.5 * detSin(tau * wobble_hz * t + wobble_phase));
+        const c1 = detSin(tau * chatter_hz * t + chatter_phase);
+        const c2 = detSin(tau * chatter_hz2 * t + chatter_phase2);
         // Tension closes the aperture. At 0 the gate is fully open. At 1 it
         // spends part of each cycle shut. The shut part is not silence: air
         // still forces through a slit, which is the rasp (high, gated noise).
