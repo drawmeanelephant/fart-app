@@ -204,4 +204,6 @@ each branch.
 ## Verdict
 
 Judging is open. The winner — and how the keepers land — will be recorded
-here.
+here. For a full breakdown of the `src/golden.zig` telemetry, DSP architectures,
+and tier ratings across all twelve engines, see
+[[contributors/fart-off-analysis|Fart-Off DSP & Acoustic Analysis]].

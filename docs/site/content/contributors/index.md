@@ -24,7 +24,8 @@ The main app has three binaries and a shared instrument layer:
 - [[contributors/vendoring|Vendoring]] records source ownership and pins.
 - [[contributors/audit|Audit utility]] explains what its warnings do and do not prove.
 - [[contributors/fart-off|The Great Fart-Off]] records the nine-model bake-off that
-  rewrote the voice.
+  rewrote the voice, and [[contributors/fart-off-analysis|Fart-Off DSP & Acoustic Analysis]]
+  rates and dissects all twelve engines.
 
 The repository's [roadmap](https://github.com/drawmeanelephant/fart-app/blob/main/ROADMAP.md)
 and [issue map](https://github.com/drawmeanelephant/fart-app/blob/main/ISSUES.md)
